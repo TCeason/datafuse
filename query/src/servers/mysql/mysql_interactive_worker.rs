@@ -259,11 +259,25 @@ impl<W: std::io::Write> InteractiveWorkerBase<W> {
             "(?i)^(SET AUTOCOMMIT(.*))",
             "(?i)^(SET sql_mode(.*))",
             "(?i)^(SET @@(.*))",
+            "(?i)^(SHOW VARIABLES(.*))",
             "(?i)^(SET SESSION TRANSACTION ISOLATION LEVEL(.*))",
             // Just compatibility for jdbc
             "(?i)^(/\\* mysql-connector-java(.*))",
+            // Just compatibility for DBeaver
+            "(?i)^(SHOW WARNINGS)",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW WARNINGS)",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW PLUGINS)",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW COLLATION)",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW CHARSET)",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW ENGINES)",
+            "(?i)^(/\\* ApplicationName=(.*)SELECT @@(.*))",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW @@(.*))",
+            "(?i)^(/\\* ApplicationName=(.*)SET net_write_timeout(.*))",
+            "(?i)^(/\\* ApplicationName=(.*)SET SQL_SELECT_LIMIT(.*))",
+            "(?i)^(/\\* ApplicationName=(.*)SHOW VARIABLES(.*))",
         ])
         .unwrap();
+        tracing::debug!("the query is {}", query);
         expr.is_match(query)
     }
 

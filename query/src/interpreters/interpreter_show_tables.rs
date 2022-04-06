@@ -40,18 +40,35 @@ impl ShowTablesInterpreter {
 
     fn build_query(&self) -> Result<String> {
         let database = self.ctx.get_current_database();
+        let showfull = self.plan.showfull;
         return match &self.plan.kind {
             PlanShowKind::All => {
-                Ok(format!("SELECT name FROM system.tables WHERE database = '{}' ORDER BY database, name", database))
+                if showfull == true {
+                    Ok(format!("SELECT table_name as Table_in_{}, 'BASE TABLE' as Table_type FROM information_schema.TABLES WHERE table_schema = '{}' ORDER BY table_schema, table_name", database, database))
+                } else {
+                    Ok(format!("SELECT table_name FROM information_schema.TABLES WHERE table_schema = '{}' ORDER BY table_schema, table_name", database))
+                }
             }
             PlanShowKind::Like(v) => {
-                Ok(format!("SELECT name FROM system.tables WHERE database = '{}' AND name LIKE {} ORDER BY database, name", database, v))
+                if showfull == true {
+                    Ok(format!("SELECT table_name as Table_in_{}, table_type as Table_type FROM information_schema.TABLES WHERE table_schema = '{}' AND table_name LIKE {} ORDER BY table_schema, table_name", database, database, v))
+                } else {
+                    Ok(format!("SELECT table_name FROM information_schema.TABLES WHERE table_schema = '{}' AND table_name LIKE {} ORDER BY table_schema, table_name", database, v))
+                }
             }
             PlanShowKind::Where(v) => {
-                Ok(format!("SELECT name FROM system.tables WHERE database = '{}' AND ({}) ORDER BY database, name", database, v))
+                if showfull == true {
+                    Ok(format!("SELECT table_name as Table_in_{}, table_type as Table_type FROM information_schema.TABLES WHERE table_schema = '{}' AND ({}) ORDER BY table_schema, table_name", database, database, v))
+                } else {
+                    Ok(format!("SELECT table_name FROM information_schema.TABLES WHERE table_schema = '{}' AND ({}) ORDER BY table_schema, table_name", database, v))
+                }
             }
             PlanShowKind::FromOrIn(v) => {
-                Ok(format!("SELECT name FROM system.tables WHERE database = '{}' ORDER BY database, name", v))
+                if showfull == true {
+                    Ok(format!("SELECT table_name as Table_in_{}, table_type as Table_type FROM information_schema.TABLES WHERE table_schema = '{}' ORDER BY table_schema, table_name", database, v))
+                } else {
+                    Ok(format!("SELECT table_name FROM information_schema.TABLES WHERE table_schema = '{}' ORDER BY table_schema, table_name", v))
+                }
             }
         };
     }
