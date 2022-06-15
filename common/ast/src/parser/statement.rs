@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use common_meta_types::AuthType;
+use common_meta_types::PrincipalIdentity;
 use common_meta_types::UserIdentity;
 use nom::branch::alt;
 use nom::combinator::map;
@@ -371,6 +372,18 @@ pub fn statement(i: Input) -> IResult<Statement> {
             user,
         },
     );
+    //GRANT { ROLE <role_name> | {schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level>} } TO { [ROLE <role_name>] | [USER <user>] }
+    let grant_priv = map(
+        rule! {
+            GRANT ~ #grant_source ~ TO ~ #grant_option
+        },
+        |(_, source, _, grant_option)| {
+            Statement::GrantPriv(GrantPrivilegeStatement {
+                source,
+                principal: grant_option,
+            })
+        },
+    );
     let create_udf = map(
         rule! {
             CREATE ~ FUNCTION ~ ( IF ~ NOT ~ EXISTS )?
@@ -569,6 +582,8 @@ pub fn statement(i: Input) -> IResult<Statement> {
             | #list_stage: "`LIST @<stage_name> [pattern = '<pattern>']`"
             | #drop_stage: "`DROP STAGE <stage_name>`"
         ),
+        rule!(//| #grant_priv : "`GRANT <grant_source> ON <grant_level> TO <grant_option>`"
+            #grant_priv : "`GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER <user>] }`"),
     ))(i)
 }
 
@@ -640,6 +655,97 @@ pub fn insert_source(i: Input) -> IResult<InsertSource> {
         #streaming
         | #values
         | #query
+    )(i)
+}
+
+//{ ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> }
+pub fn grant_source(i: Input) -> IResult<GrantSource> {
+    let role = map(
+        rule! {
+            ROLE ~ #literal_string
+        },
+        |(_, role_name)| GrantSource::Role { role: role_name },
+    );
+    let privs = map(
+        rule! {
+            #comma_separated_list1(literal_string) ~ ON ~ #grant_level
+        },
+        |(privs, _, level)| GrantSource::Privs {
+            privileges: privs,
+            level,
+        },
+    );
+    let all = map(
+        rule! { ALL ~ PRIVILEGES? ~ ON ~ #grant_level },
+        |(_, _, _, level)| GrantSource::ALL { all: true, level },
+    );
+
+    rule!(
+        #role
+        | #privs
+        | #all
+    )(i)
+}
+
+// privileges_level ::=
+//     *.*
+//   | db_name.*
+//   | *
+//   | db_name.tbl_name
+pub fn grant_level(i: Input) -> IResult<GrantLevel> {
+    // *.*
+    let global = map(rule! { "*.*" }, |_| GrantLevel::Global);
+    // db.*
+    // "*": as current db or "table" with current db
+    let db = map(
+        rule! {
+            ( #literal_string ~ "." )? ~ "*"
+        },
+        |(database_name, _)| {
+            if database_name.is_none() {
+                GrantLevel::Database(None)
+            } else {
+                GrantLevel::Database(Some(
+                    database_name
+                        .map(|(db_name, _)| db_name)
+                        .unwrap_or_default(),
+                ))
+            }
+        },
+    );
+    // db.table
+    let table = map(
+        rule! {
+            #literal_string ~ "." ~ #literal_string
+        },
+        |(database_name, _, table_name)| GrantLevel::Table(Some(database_name), table_name),
+    );
+
+    rule!(
+        #global
+        | #db
+        | #table
+    )(i)
+}
+
+pub fn grant_option(i: Input) -> IResult<PrincipalIdentity> {
+    let role = map(
+        rule! {
+            ROLE ~ #literal_string
+        },
+        |(_, role_name)| PrincipalIdentity::Role(role_name),
+    );
+
+    let user = map(
+        rule! {
+            USER? ~ #user_identity
+        },
+        |(_, user)| PrincipalIdentity::User(user),
+    );
+
+    rule!(
+        #role
+        | #user
     )(i)
 }
 

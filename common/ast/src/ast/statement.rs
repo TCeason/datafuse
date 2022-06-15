@@ -15,11 +15,17 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::ptr::write;
+use std::sync::Arc;
 
 use common_meta_types::AuthType;
+use common_meta_types::GrantObject;
+use common_meta_types::PrincipalIdentity;
 use common_meta_types::UserIdentity;
 use common_meta_types::UserOption;
 use common_meta_types::UserOptionFlag;
+use common_meta_types::UserPrivilegeSet;
+use common_meta_types::UserPrivilegeType;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -166,6 +172,7 @@ pub enum Statement<'a> {
         if_exists: bool,
         user: UserIdentity,
     },
+    GrantPriv(GrantPrivilegeStatement),
 
     // UDF
     CreateUDF {
@@ -383,6 +390,56 @@ pub enum RoleOption {
     ConfigReload,
     NoConfigReload,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantPrivilegeStatement {
+    pub source: GrantSource,
+    pub principal: PrincipalIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantSource {
+    Role {
+        role: String,
+    },
+    Privs {
+        privileges: Vec<String>,
+        level: GrantLevel,
+    },
+    ALL {
+        all: bool,
+        level: GrantLevel,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantLevel {
+    Global,
+    Database(Option<String>),
+    Table(Option<String>, String),
+}
+//
+// impl GrantLevel {
+//     pub fn convert_to_grant_object(&self, ctx: Arc<QueryContext>) -> GrantObject {
+//         // TODO fetch real catalog
+//         let catalog_name = ctx.get_current_catalog();
+//         match self {
+//             GrantLevel::Global => GrantObject::Global,
+//             GrantLevel::Table(database_name, table_name) => {
+//                 let database_name = database_name
+//                     .clone()
+//                     .unwrap_or_else(|| ctx.get_current_database());
+//                 GrantObject::Table(catalog_name, database_name, table_name.clone())
+//             }
+//             GrantLevel::Database(database_name) => {
+//                 let database_name = database_name
+//                     .clone()
+//                     .unwrap_or_else(|| ctx.get_current_database());
+//                 GrantObject::Database(catalog_name, database_name)
+//             }
+//         }
+//     }
+// }
 
 impl RoleOption {
     pub fn apply(&self, option: &mut UserOption) {
@@ -869,6 +926,60 @@ impl<'a> Display for Statement<'a> {
                     write!(f, " IF EXISTS")?;
                 }
                 write!(f, " {user}")?;
+            }
+            Statement::GrantPriv(GrantPrivilegeStatement { source, principal }) => {
+                write!(f, "GRANT")?;
+                match source {
+                    GrantSource::Role { role } => write!(f, " ROLE {role}")?,
+                    GrantSource::Privs { privileges, level } => {
+                        write!(
+                            f,
+                            " {}",
+                            privileges
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )?;
+                        write!(f, " ON")?;
+                        match level {
+                            GrantLevel::Global => write!(f, " *.*")?,
+                            GrantLevel::Database(database_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.*")?;
+                                }
+                            }
+                            GrantLevel::Table(database_name, table_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.{table_name}")?;
+                                }
+                            }
+                        }
+                    }
+                    GrantSource::ALL { level, .. } => {
+                        write!(f, "ALL PRIVILEGES")?;
+                        write!(f, " ON")?;
+                        match level {
+                            GrantLevel::Global => write!(f, " *.*")?,
+                            GrantLevel::Database(database_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.*")?;
+                                }
+                            }
+                            GrantLevel::Table(database_name, table_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.{table_name}")?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                write!(f, " TO")?;
+                match principal {
+                    PrincipalIdentity::User(user) => write!(f, "USER {user}")?,
+                    PrincipalIdentity::Role(role) => write!(f, " ROLE {role}")?,
+                }
             }
             Statement::CreateUDF {
                 if_not_exists,

@@ -25,6 +25,7 @@ use common_exception::Result;
 use common_planners::DescribeUserStagePlan;
 use common_planners::DropUserPlan;
 use common_planners::DropUserStagePlan;
+use common_tracing::tracing;
 
 use self::subquery::SubqueryRewriter;
 use super::plans::Plan;
@@ -174,6 +175,10 @@ impl<'a> Binder {
                 };
                 Ok(Plan::DropUser(Box::new(plan)))
             }
+
+            Statement::GrantPriv(query) => Err(ErrorCode::UnImplement(format!(
+                "UnImplemented stmt {stmt} in binder"
+            ))),
 
             _ => Err(ErrorCode::UnImplement(format!(
                 "UnImplemented stmt {stmt} in binder"

@@ -117,6 +117,14 @@ fn test_statement() {
         r#"alter user 'test-e'@'localhost' identified by 'new-password';"#,
         r#"ALTER TABLE t CLUSTER BY(c1);"#,
         r#"ALTER TABLE t DROP CLUSTER KEY;"#,
+        r#"GRANT 'SELECT' ON * TO 'test-grant'@'localhost';"#,
+        r#"GRANT ALL ON * TO 'test-grant'@'localhost';"#,
+        r#"GRANT ALL PRIVILEGES ON * TO 'test-grant'@'localhost';"#,
+        r#"GRANT ROLE 'test' TO 'test-user';"#,
+        // r#"GRANT SELECT ON * TO 'test-grant1'@'localhost';"#,
+        // r#"GRANT SELECT, CREATE ON * TO 'test-grant'@'localhost';"#,
+        // r#"GRANT SELECT ON db01.* TO 'test-grant'@'localhost';"#,
+        // r#"GRANT SELECT ON db01.tb1 TO 'test-grant'@'localhost';"#,
     ];
 
     for case in cases {

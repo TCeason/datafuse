@@ -59,6 +59,11 @@ impl InterpreterFactoryV2 {
                 | DfStatement::ShowSettings(_)
                 | DfStatement::CreateDatabase(_)
                 | DfStatement::DropDatabase(_)
+                | DfStatement::CreateUser(_)
+                | DfStatement::DropUser(_)
+                | DfStatement::AlterUser(_)
+                | DfStatement::CreateRole(_)
+                | DfStatement::DropRole(_)
         )
     }
 
