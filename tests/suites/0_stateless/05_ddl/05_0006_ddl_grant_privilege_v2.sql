@@ -3,7 +3,7 @@ DROP USER IF EXISTS 'test-grant'@'localhost';
 DROP DATABASE IF EXISTS `db01`;
 DROP ROLE IF EXISTS 'test-grant-role';
 CREATE DATABASE IF NOT EXISTS `db01`;
-CREATE TABLE IF NOT EXISTS `db01`.`tb1` (id int);
+CREATE TABLE IF NOT EXISTS `db01`.`tb1`;
 
 CREATE USER 'test-grant'@'localhost' IDENTIFIED BY 'password';
 

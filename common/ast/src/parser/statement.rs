@@ -825,7 +825,7 @@ pub fn grant_level(i: Input) -> IResult<GrantLevel> {
             ( #ident ~ "." )? ~ "*"
         },
         |(database, _)| GrantLevel::Database(database.map(|(database, _)| database.name)),
-    );
+   );
     // db.table
     let table = map(
         rule! {

@@ -172,9 +172,14 @@ error:
   --> SQL:1:12
   |
 1 | GRANT ROLE test TO ROLE 'test-user';
+<<<<<<< HEAD
   | ----- ---- ^^^^ expected <QuotedString>
   | |     |     
   | |     while parsing ROLE <role_name>
+=======
+  | -----      ^^^^ expected <QuotedString>
+  | |           
+>>>>>>> migrate grant to planner v2
   | while parsing `GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`
 
 
@@ -197,6 +202,7 @@ error:
   --> SQL:1:15
   |
 1 | GRANT SELECT, ALL PRIVILEGES, CREATE ON * TO 'test-grant'@'localhost';
+<<<<<<< HEAD
   | ----- ------  ^^^ expected `USAGE`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, or 5 more ...
   | |     |        
   | |     while parsing <privileges> ON <privileges_level>
@@ -212,6 +218,10 @@ error:
 1 | GRANT SELECT, CREATE ON *.c TO 'test-grant'@'localhost';
   | -----                     ^ expected `TO` or `*`
   | |                          
+=======
+  | -----         ^^^ expected `USAGE`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, or 5 more ...
+  | |              
+>>>>>>> migrate grant to planner v2
   | while parsing `GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`
 
 
