@@ -125,6 +125,7 @@ pub enum Statement<'a> {
     ShowGrants {
         principal: Option<PrincipalIdentity>,
     },
+    Revoke(GrantStatement),
 
     // UDF
     CreateUDF {
@@ -1132,6 +1133,60 @@ impl<'a> Display for Statement<'a> {
                         PrincipalIdentity::User(user) => write!(f, " USER {user}")?,
                         PrincipalIdentity::Role(role) => write!(f, " ROLE {role}")?,
                     }
+                }
+            }
+            Statement::Revoke(GrantStatement { source, principal }) => {
+                write!(f, "REVOKE")?;
+                match source {
+                    GrantSource::Role { role } => write!(f, " ROLE {role}")?,
+                    GrantSource::Privs { privileges, level } => {
+                        write!(
+                            f,
+                            " {}",
+                            privileges
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )?;
+                        write!(f, " ON")?;
+                        match level {
+                            GrantLevel::Global => write!(f, " *.*")?,
+                            GrantLevel::Database(database_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.*")?;
+                                }
+                            }
+                            GrantLevel::Table(database_name, table_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.{table_name}")?;
+                                }
+                            }
+                        }
+                    }
+                    GrantSource::ALL { level, .. } => {
+                        write!(f, " ALL PRIVILEGES")?;
+                        write!(f, " ON")?;
+                        match level {
+                            GrantLevel::Global => write!(f, " *.*")?,
+                            GrantLevel::Database(database_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.*")?;
+                                }
+                            }
+                            GrantLevel::Table(database_name, table_name) => {
+                                if let Some(database_name) = database_name {
+                                    write!(f, " {database_name}.{table_name}")?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                write!(f, " FROM")?;
+                match principal {
+                    PrincipalIdentity::User(user) => write!(f, " USER {user}")?,
+                    PrincipalIdentity::Role(role) => write!(f, " ROLE {role}")?,
                 }
             }
             Statement::CreateUDF {

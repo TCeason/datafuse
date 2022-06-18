@@ -87,6 +87,8 @@ impl Plan {
             Plan::GrantRole(grant_role) => Ok(format!("{:?}", grant_role)),
             Plan::GrantPriv(grant_priv) => Ok(format!("{:?}", grant_priv)),
             Plan::ShowGrants(show_grants) => Ok(format!("{:?}", show_grants)),
+            Plan::RevokePriv(revoke_priv) => Ok(format!("{:?}", revoke_priv)),
+            Plan::RevokeRole(revoke_role) => Ok(format!("{:?}", revoke_role)),
         }
     }
 }

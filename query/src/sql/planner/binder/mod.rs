@@ -198,6 +198,8 @@ impl<'a> Binder {
                 principal: principal.clone(),
             })),
 
+            Statement::Revoke(stmt) => self.bind_revoke(stmt).await?,
+
             _ => {
                 return Err(ErrorCode::UnImplement(format!(
                     "UnImplemented stmt {stmt} in binder"

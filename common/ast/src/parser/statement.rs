@@ -434,7 +434,7 @@ pub fn statement(i: Input) -> IResult<Statement> {
             role_name,
         },
     );
-    let grant_priv = map(
+    let grant = map(
         rule! {
             GRANT ~ #grant_source ~ TO ~ #grant_option
         },
@@ -451,6 +451,17 @@ pub fn statement(i: Input) -> IResult<Statement> {
         },
         |(_, _, opt_principal)| Statement::ShowGrants {
             principal: opt_principal.map(|(_, principal)| principal),
+        },
+    );
+    let revoke = map(
+        rule! {
+            REVOKE ~ #grant_source ~ FROM ~ #grant_option
+        },
+        |(_, source, _, grant_option)| {
+            Statement::Revoke(GrantStatement {
+                source,
+                principal: grant_option,
+            })
         },
     );
     let create_udf = map(
@@ -663,8 +674,9 @@ pub fn statement(i: Input) -> IResult<Statement> {
             | #drop_stage: "`DROP STAGE <stage_name>`"
         ),
         rule!(
-            #grant_priv : "`GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`"
+            #grant : "`GRANT { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } TO { [ROLE <role_name>] | [USER] <user> }`"
             | #show_grants : "`SHOW GRANTS [FOR  { ROLE <role_name> | [USER] <user> }]`"
+            | #revoke : "`REVOKE { ROLE <role_name> | schemaObjectPrivileges | ALL [ PRIVILEGES ] ON <privileges_level> } FROM { [ROLE <role_name>] | [USER] <user> }`"
         ),
     ));
 
@@ -825,7 +837,7 @@ pub fn grant_level(i: Input) -> IResult<GrantLevel> {
             ( #ident ~ "." )? ~ "*"
         },
         |(database, _)| GrantLevel::Database(database.map(|(database, _)| database.name)),
-   );
+    );
     // db.table
     let table = map(
         rule! {

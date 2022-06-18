@@ -3355,11 +3355,7 @@ CreateTable(
 ---------- Input ----------
 GRANT SELECT, CREATE ON * TO 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT, CREATE ON TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT, CREATE ON TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3385,11 +3381,7 @@ Grant(
 ---------- Input ----------
 GRANT SELECT, CREATE ON * TO USER 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT, CREATE ON TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT, CREATE ON TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3438,11 +3430,7 @@ Grant(
 ---------- Input ----------
 GRANT ALL ON *.* TO 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT ALL PRIVILEGES ON *.* TO USER 'test-grant'@'localhost'
-=======
-GRANT ALL PRIVILEGES ON *.* TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3479,11 +3467,7 @@ Grant(
 ---------- Input ----------
 GRANT ALL PRIVILEGES ON * TO 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT ALL PRIVILEGES ON * TO USER 'test-grant'@'localhost'
-=======
-GRANT ALL PRIVILEGES ON TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3505,11 +3489,7 @@ Grant(
 ---------- Input ----------
 GRANT ALL PRIVILEGES ON * TO ROLE 'role3';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT ALL PRIVILEGES ON * TO ROLE role3
-=======
-GRANT ALL PRIVILEGES ON TO ROLE role3
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3528,11 +3508,7 @@ Grant(
 ---------- Input ----------
 GRANT ROLE 'test' TO 'test-user';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT ROLE test TO USER 'test-user'@'%'
-=======
-GRANT ROLE test TOUSER 'test-user'@'%'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3552,11 +3528,7 @@ Grant(
 ---------- Input ----------
 GRANT ROLE 'test' TO USER 'test-user';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT ROLE test TO USER 'test-user'@'%'
-=======
-GRANT ROLE test TOUSER 'test-user'@'%'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3593,11 +3565,7 @@ Grant(
 ---------- Input ----------
 GRANT SELECT ON db01.* TO 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT ON db01.* TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT ON db01.* TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3624,11 +3592,7 @@ Grant(
 ---------- Input ----------
 GRANT SELECT ON db01.* TO USER 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT ON db01.* TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT ON db01.* TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3679,11 +3643,7 @@ Grant(
 ---------- Input ----------
 GRANT SELECT ON db01.tb1 TO 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT ON db01.tb1 TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT ON db01.tb1 TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3711,11 +3671,7 @@ Grant(
 ---------- Input ----------
 GRANT SELECT ON db01.tb1 TO USER 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 GRANT SELECT ON db01.tb1 TO USER 'test-grant'@'localhost'
-=======
-GRANT SELECT ON db01.tb1 TOUSER 'test-grant'@'localhost'
->>>>>>> migrate grant to planner v2
 ---------- AST ------------
 Grant(
     GrantStatement {
@@ -3771,28 +3727,17 @@ SHOW GRANTS;
 SHOW GRANTS
 ---------- AST ------------
 ShowGrants {
-<<<<<<< HEAD
     principal: None,
-=======
-    opt_principal: None,
->>>>>>> migrate grant to planner v2
 }
 
 
 ---------- Input ----------
 SHOW GRANTS FOR 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 SHOW GRANTS FOR USER 'test-grant'@'localhost'
 ---------- AST ------------
 ShowGrants {
     principal: Some(
-=======
-SHOW GRANTS FORUSER 'test-grant'@'localhost'
----------- AST ------------
-ShowGrants {
-    opt_principal: Some(
->>>>>>> migrate grant to planner v2
         User(
             UserIdentity {
                 username: "test-grant",
@@ -3806,17 +3751,10 @@ ShowGrants {
 ---------- Input ----------
 SHOW GRANTS FOR USER 'test-grant'@'localhost';
 ---------- Output ---------
-<<<<<<< HEAD
 SHOW GRANTS FOR USER 'test-grant'@'localhost'
 ---------- AST ------------
 ShowGrants {
     principal: Some(
-=======
-SHOW GRANTS FORUSER 'test-grant'@'localhost'
----------- AST ------------
-ShowGrants {
-    opt_principal: Some(
->>>>>>> migrate grant to planner v2
         User(
             UserIdentity {
                 username: "test-grant",
@@ -3833,15 +3771,37 @@ SHOW GRANTS FOR ROLE 'role1';
 SHOW GRANTS FOR ROLE role1
 ---------- AST ------------
 ShowGrants {
-<<<<<<< HEAD
     principal: Some(
-=======
-    opt_principal: Some(
->>>>>>> migrate grant to planner v2
         Role(
             "role1",
         ),
     ),
 }
+
+
+---------- Input ----------
+REVOKE SELECT, CREATE ON * FROM 'test-grant'@'localhost';
+---------- Output ---------
+REVOKE SELECT, CREATE ON FROM USER 'test-grant'@'localhost'
+---------- AST ------------
+Revoke(
+    GrantStatement {
+        source: Privs {
+            privileges: [
+                Select,
+                Create,
+            ],
+            level: Database(
+                None,
+            ),
+        },
+        principal: User(
+            UserIdentity {
+                username: "test-grant",
+                hostname: "localhost",
+            },
+        ),
+    },
+)
 
 

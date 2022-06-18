@@ -145,6 +145,7 @@ fn test_statement() {
         r#"SHOW GRANTS FOR 'test-grant'@'localhost';"#,
         r#"SHOW GRANTS FOR USER 'test-grant'@'localhost';"#,
         r#"SHOW GRANTS FOR ROLE 'role1';"#,
+        r#"REVOKE SELECT, CREATE ON * FROM 'test-grant'@'localhost';"#,
     ];
 
     for case in cases {
@@ -187,6 +188,8 @@ fn test_statement_error() {
         r#"GRANT SELECT, ALL PRIVILEGES, CREATE ON * TO 'test-grant'@'localhost';"#,
         r#"GRANT SELECT, CREATE ON *.c TO 'test-grant'@'localhost';"#,
         r#"SHOW GRANT FOR ROLE role1;"#,
+        r#"REVOKE SELECT, CREATE, ALL PRIVILEGES ON * FROM 'test-grant'@'localhost';"#,
+        r#"REVOKE SELECT, CREATE ON * TO 'test-grant'@'localhost';"#,
     ];
 
     for case in cases {
