@@ -236,19 +236,36 @@ fn register_like(registry: &mut FunctionRegistry) {
         FunctionProperty::default(),
         |_, _| None,
         vectorize_regexp(|str, pat, map, _| {
+            let mut sub_strings: Vec<&str> = vec![];
             let pattern = if let Some(pattern) = map.get(pat) {
                 pattern
             } else {
                 let pattern_str = simdutf8::basic::from_utf8(pat).map_err(|err| {
                     format!("unable to convert the LIKE pattern to string: {err}")
                 })?;
+                sub_strings = pattern_str
+                    .split(|c: char| c == '%' || c == '_' || c == '\\')
+                    .collect();
+                sub_strings.retain(|&substring| !substring.is_empty());
                 let re_pattern = like_pattern_to_regex(pattern_str);
                 let re = Regex::new(&re_pattern)
                     .map_err(|err| format!("unable to build the LIKE pattern: {err}"))?;
                 map.insert(pat.to_vec(), re);
                 map.get(pat).unwrap()
             };
-            Ok(pattern.is_match(str))
+
+            if !sub_strings.is_empty() {
+                let lhs_str =
+                    std::str::from_utf8(str).expect("Unable to convert lhs value to string: {}");
+                let contain = lhs_str.find(sub_strings[0].clone());
+                if contain.is_none() {
+                    Ok(false)
+                } else {
+                    Ok(pattern.is_match(str))
+                }
+            } else {
+                Ok(pattern.is_match(str))
+            }
         }),
     );
 
