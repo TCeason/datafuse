@@ -24,9 +24,9 @@ use super::aggregate_min_max_any::aggregate_max_function_desc;
 use super::aggregate_min_max_any::aggregate_min_function_desc;
 use super::aggregate_stddev_pop::aggregate_stddev_pop_function_desc;
 use super::aggregate_window_funnel::aggregate_window_funnel_function_desc;
-use super::AggregateCountFunction;
 use super::AggregateFunctionFactory;
-use super::AggregateIfCombinator;
+use crate::aggregates::aggregate_combinator_if::aggregate_combinator_if_desc;
+use crate::aggregates::aggregate_count::aggregate_count_function_desc;
 use crate::aggregates::aggregate_retention::aggregate_retention_function_desc;
 use crate::aggregates::aggregate_sum::aggregate_sum_function_desc;
 
@@ -36,7 +36,7 @@ impl Aggregators {
     pub fn register(factory: &mut AggregateFunctionFactory) {
         // DatabendQuery always uses lowercase function names to get functions.
         factory.register("sum", aggregate_sum_function_desc());
-        factory.register("count", AggregateCountFunction::desc());
+        factory.register("count", aggregate_count_function_desc());
         factory.register("avg", aggregate_avg_function_desc());
         factory.register("uniq", aggregate_combinator_uniq_desc());
 
@@ -57,7 +57,7 @@ impl Aggregators {
     }
 
     pub fn register_combinator(factory: &mut AggregateFunctionFactory) {
-        factory.register_combinator("_if", AggregateIfCombinator::combinator_desc());
+        factory.register_combinator("_if", aggregate_combinator_if_desc());
         factory.register_combinator("_distinct", aggregate_combinator_distinct_desc());
     }
 }

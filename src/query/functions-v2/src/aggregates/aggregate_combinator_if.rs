@@ -77,10 +77,10 @@ impl AggregateIfCombinator {
             nested,
         }))
     }
+}
 
-    pub fn combinator_desc() -> CombinatorDescription {
-        CombinatorDescription::creator(Box::new(Self::try_create))
-    }
+pub fn aggregate_combinator_if_desc() -> CombinatorDescription {
+    CombinatorDescription::creator(Box::new(AggregateIfCombinator::try_create))
 }
 
 impl AggregateFunction for AggregateIfCombinator {

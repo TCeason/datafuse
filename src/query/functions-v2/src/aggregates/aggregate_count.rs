@@ -53,14 +53,17 @@ impl AggregateCountFunction {
             display_name: display_name.to_string(),
         }))
     }
+}
 
-    pub fn desc() -> AggregateFunctionDescription {
-        let features = super::aggregate_function_factory::AggregateFunctionFeatures {
-            returns_default_when_only_null: true,
-            ..Default::default()
-        };
-        AggregateFunctionDescription::creator_with_features(Box::new(Self::try_create), features)
-    }
+pub fn aggregate_count_function_desc() -> AggregateFunctionDescription {
+    let features = super::aggregate_function_factory::AggregateFunctionFeatures {
+        returns_default_when_only_null: true,
+        ..Default::default()
+    };
+    AggregateFunctionDescription::creator_with_features(
+        Box::new(AggregateCountFunction::try_create),
+        features,
+    )
 }
 
 impl AggregateFunction for AggregateCountFunction {
