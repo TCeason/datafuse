@@ -122,6 +122,7 @@ tokio-stream = { version = "0.1.10", features = ["net"] }
 tonic = "0.8.1"
 tracing = "0.1.36"
 typetag = "0.2.3"
+url = "2.3.1"
 unicode-segmentation = "1.10.0"
 uuid = { version = "1.1.2", features = ["serde", "v4"] }
 

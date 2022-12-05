@@ -29,6 +29,7 @@ use poem::Middleware;
 use poem::Request;
 use tracing::error;
 use tracing::info;
+use url::Url;
 
 use super::v1::HttpQueryContext;
 use crate::auth::AuthMgr;
@@ -72,6 +73,32 @@ fn get_credential(req: &Request, kind: HttpHandlerKind) -> Result<Credential> {
                     hostname: client_ip,
                 };
                 return Ok(c);
+            } else {
+                if req.uri().query().is_none() {
+                    return Err(ErrorCode::AuthenticateFailure(
+                        "No authorization header detected",
+                    ));
+                }
+                let uri_string = "https://mock.net/?".to_owned() + req.uri().query().unwrap();
+                let request_url = Url::parse(&uri_string).unwrap();
+                let params = request_url.query_pairs();
+                let mut name = String::new();
+                let mut password = None;
+                for param in params {
+                    if param.0 == "user" {
+                        name = param.1.to_string();
+                    } else if param.0 == "password" {
+                        password = Some(param.1.as_bytes().to_vec());
+                    }
+                }
+                if !name.is_empty() && password.is_some() {
+                    let c = Credential::Password {
+                        name,
+                        password,
+                        hostname: client_ip,
+                    };
+                    return Ok(c);
+                }
             }
         }
         return Err(ErrorCode::AuthenticateFailure(
