@@ -61,6 +61,7 @@ impl FuseTable {
                         block_count_sum += 1;
                         row_count_sum += row_count;
                         for (i, col_stat) in block.col_stats.iter() {
+                            println!("");
                             let density = match col_stat.distinct_of_values {
                                 Some(ndv) => ndv as f64 / row_count as f64,
                                 None => 0.0,
@@ -75,6 +76,7 @@ impl FuseTable {
                                 }
                             }
                         }
+                        pritnln!("block.col_stats is {:?}, block_count_sum is {:?}, row_count_sum is {:?}", block.col_stats.clone(), block_count_sum, row_count_sum);
                     }
                 });
             }
@@ -83,7 +85,7 @@ impl FuseTable {
                 let density_avg = *sum / block_count_sum as f64;
                 ndv_map.insert(*i, (density_avg * row_count_sum as f64) as u64);
             }
-
+            println!("the sum_map is {:?}, the ndv_map is {:?}, block_count_sum is {:?}, row_count_sum is {:?}", sum_map.clone(), ndv_map.clone(), block_count_sum, row_count_sum);
             // 3. Generate new table statistics
             let table_statistics = TableSnapshotStatistics::new(ndv_map);
             let table_statistics_location = self
