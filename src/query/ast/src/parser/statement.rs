@@ -1323,6 +1323,24 @@ pub fn unset_source(i: Input) -> IResult<UnSetSource> {
     )(i)
 }
 
+pub fn set_var_hints(i: Input) -> IResult<HintItem> {
+    map(
+        rule! {
+            SET_VAR ~ ^"(" ~ ^#ident ~ ^"=" ~ ^#subexpr(0) ~ ^")"
+        },
+        |(_, _, name, _, expr, _)| HintItem { name, expr },
+    )(i)
+}
+
+pub fn hint(i: Input) -> IResult<Hint> {
+    map(
+        rule! {
+            "/*+" ~ ^(#set_var_hints+) ~ ^"*/"
+        },
+        |(_, hints_list, _)| Hint { hints_list },
+    )(i)
+}
+
 pub fn rest_str(i: Input) -> IResult<(String, usize)> {
     // It's safe to unwrap because input must contain EOI.
     let first_token = i.0.first().unwrap();

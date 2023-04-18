@@ -38,11 +38,13 @@ use common_exception::Result;
 use common_exception::Span;
 use common_expression::type_check::common_super_type;
 use common_expression::types::DataType;
+use common_expression::ConstantFolder;
 use common_functions::BUILTIN_FUNCTIONS;
 
 use crate::binder::join::JoinConditions;
 use crate::binder::project_set::SrfCollector;
 use crate::binder::scalar_common::split_conjunctions;
+use crate::binder::wrap_cast;
 use crate::binder::CteInfo;
 use crate::binder::ExprContext;
 use crate::binder::Visibility;
@@ -60,6 +62,7 @@ use crate::plans::ScalarItem;
 use crate::plans::UnionAll;
 use crate::ColumnBinding;
 use crate::IndexType;
+use crate::TypeChecker;
 
 // A normalized IR for `SELECT` clause.
 #[derive(Debug, Default)]
@@ -82,6 +85,39 @@ impl Binder {
         stmt: &SelectStmt,
         order_by: &[OrderByExpr],
     ) -> Result<(SExpr, BindContext)> {
+        if let Some(hints) = stmt.hints.clone() {
+            let mut type_checker = TypeChecker::new(
+                bind_context,
+                self.ctx.clone(),
+                &self.name_resolution_ctx,
+                self.metadata.clone(),
+                &[],
+            );
+            let mut hint_settings: HashMap<String, String> = HashMap::new();
+            for hint in hints.hints_list {
+                let variable = hint.name.name;
+                let (scalar, _) = *type_checker.resolve(&hint.expr).await?;
+                let scalar = wrap_cast(&scalar, &DataType::String);
+                let expr = scalar.as_expr_with_col_index()?;
+
+                let (new_expr, _) = ConstantFolder::fold(
+                    &expr,
+                    self.ctx.get_function_context()?,
+                    &BUILTIN_FUNCTIONS,
+                );
+                match new_expr {
+                    common_expression::Expr::Constant { scalar, .. } => {
+                        let value = String::from_utf8(scalar.into_string().unwrap())?;
+                        hint_settings.entry(variable).or_insert(value);
+                    }
+                    _ => continue,
+                }
+            }
+            self.ctx
+                .get_settings()
+                .set_batch_settings(&hint_settings)
+                .ok();
+        }
         let (mut s_expr, mut from_context) = if stmt.from.is_empty() {
             self.bind_one_table(bind_context, stmt).await?
         } else {
