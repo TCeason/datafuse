@@ -1606,10 +1606,21 @@ pub fn create_table_source(i: Input) -> IResult<CreateTableSource> {
             table,
         },
     );
+    let clone = map(
+        rule! {
+            CLONE ~ #period_separated_idents_1_to_3
+        },
+        |(_, (catalog, database, table))| CreateTableSource::Clone {
+            catalog,
+            database,
+            table,
+        }
+    );
 
     rule!(
         #columns
         | #like
+        | #clone
     )(i)
 }
 

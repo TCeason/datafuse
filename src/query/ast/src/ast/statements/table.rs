@@ -168,6 +168,11 @@ pub enum CreateTableSource {
         database: Option<Identifier>,
         table: Identifier,
     },
+    Clone {
+        catalog: Option<Identifier>,
+        database: Option<Identifier>,
+        table: Identifier,
+    },
 }
 
 impl Display for CreateTableSource {
@@ -184,6 +189,14 @@ impl Display for CreateTableSource {
                 table,
             } => {
                 write!(f, "LIKE ")?;
+                write_period_separated_list(f, catalog.iter().chain(database).chain(Some(table)))
+            }
+            CreateTableSource::Clone {
+                catalog,
+                database,
+                table,
+            } => {
+                write!(f, "CLONE ")?;
                 write_period_separated_list(f, catalog.iter().chain(database).chain(Some(table)))
             }
         }

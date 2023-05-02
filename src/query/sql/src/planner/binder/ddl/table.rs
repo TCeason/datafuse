@@ -368,10 +368,10 @@ impl Binder {
         }
 
         // Build table schema
-        let (schema, field_default_exprs, field_comments) = match (&source, &as_query) {
+        let (schema, field_default_exprs, field_comments, cloned_table) = match (&source, &as_query) {
             (Some(source), None) => {
                 // `CREATE TABLE` without `AS SELECT ...`
-                self.analyze_create_table_schema(source).await?
+                self.analyze_create_table_schema(source, engine).await?
             }
             (None, Some(query)) => {
                 // `CREATE TABLE AS SELECT ...` without column definitions
@@ -389,12 +389,12 @@ impl Binder {
                     .collect::<Result<Vec<_>>>()?;
                 let schema = TableSchemaRefExt::create(fields);
                 Self::validate_create_table_schema(&schema)?;
-                (schema, vec![], vec![])
+                (schema, vec![], vec![], None)
             }
             (Some(source), Some(query)) => {
                 // e.g. `CREATE TABLE t (i INT) AS SELECT * from old_t` with columns specified
-                let (source_schema, source_default_exprs, source_comments) =
-                    self.analyze_create_table_schema(source).await?;
+                let (source_schema, source_default_exprs, source_comments, cloned_table) =
+                    self.analyze_create_table_schema(source, engine).await?;
                 let mut init_bind_context = BindContext::new();
                 let (_, bind_context) = self.bind_query(&mut init_bind_context, query).await?;
                 let query_fields: Vec<TableField> = bind_context
@@ -411,7 +411,7 @@ impl Binder {
                     return Err(ErrorCode::BadArguments("Number of columns does not match"));
                 }
                 Self::validate_create_table_schema(&source_schema)?;
-                (source_schema, source_default_exprs, source_comments)
+                (source_schema, source_default_exprs, source_comments, cloned_table)
             }
             _ => Err(ErrorCode::BadArguments(
                 "Incorrect CREATE query: required list of column descriptions or AS section or SELECT..",
@@ -493,6 +493,7 @@ impl Binder {
             catalog: catalog.clone(),
             database: database.clone(),
             table,
+            cloned_table,
             schema: schema.clone(),
             engine,
             storage_params,
@@ -923,11 +924,13 @@ impl Binder {
     async fn analyze_create_table_schema(
         &self,
         source: &CreateTableSource,
-    ) -> Result<(TableSchemaRef, Vec<Option<String>>, Vec<String>)> {
+        engine: Engine,
+    ) -> Result<(TableSchemaRef, Vec<Option<String>>, Vec<String>, Option<(String, String, String)>)> {
         match source {
             CreateTableSource::Columns(columns) => {
-                self.analyze_create_table_schema_by_columns(columns, false)
-                    .await
+                let (res1, res2, res3) = self.analyze_create_table_schema_by_columns(columns, false)
+                    .await?;
+                Ok((res1, res2, res3, None))
             }
             CreateTableSource::Like {
                 catalog,
@@ -942,15 +945,34 @@ impl Binder {
                     if let Some(query) = table.get_table_info().options().get(QUERY) {
                         let mut planner = Planner::new(self.ctx.clone());
                         let (plan, _) = planner.plan_sql(query).await?;
-                        Ok((infer_table_schema(&plan.schema())?, vec![], vec![]))
+                        Ok((infer_table_schema(&plan.schema())?, vec![], vec![], None))
                     } else {
                         Err(ErrorCode::Internal(
                             "Logical error, View Table must have a SelectQuery inside.",
                         ))
                     }
                 } else {
-                    Ok((table.schema(), vec![], table.field_comments().clone()))
+                    Ok((table.schema(), vec![], table.field_comments().clone(), None))
                 }
+            }
+            CreateTableSource::Clone {
+                catalog,
+                database,
+                table,
+            } => {
+                let (catalog, database, table_name) =
+                        self.normalize_object_identifier_triple(catalog, database, table);
+                let table = self.ctx.get_table(&catalog, &database, &table_name).await?;
+                let cloned_engine = table.engine().to_lowercase();
+                if engine == Engine::Fuse && cloned_engine == "fuse" {
+                    Ok((table.schema(), vec![], table.field_comments().clone(), Some((catalog, database, table_name))))
+                } else {
+                    Err(ErrorCode::UnsupportedEngineParams(format!(
+                        "Only support Create Clone FUSE Engine. Unsupported create clone for engine: {} to engine: {}",
+                        engine, cloned_engine
+                    )))
+                }
+
             }
         }
     }

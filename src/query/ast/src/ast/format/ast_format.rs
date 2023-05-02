@@ -1274,6 +1274,18 @@ impl<'ast> Visitor<'ast> for AstFormatVisitor {
                 let node = FormatTreeNode::with_children(format_ctx, vec![child]);
                 self.children.push(node);
             }
+            CreateTableSource::Clone {
+                catalog,
+                database,
+                table,
+            } => {
+                self.visit_table_ref(catalog, database, table);
+                let child = self.children.pop().unwrap();
+                let name = "CloneTable".to_string();
+                let format_ctx = AstFormatContext::with_children(name, 1);
+                let node = FormatTreeNode::with_children(format_ctx, vec![child]);
+                self.children.push(node);
+            }
         }
     }
 

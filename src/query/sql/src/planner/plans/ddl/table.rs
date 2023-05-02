@@ -39,7 +39,7 @@ pub struct CreateTablePlan {
     pub catalog: String,
     pub database: String,
     pub table: String,
-
+    pub cloned_table: Option<(String, String, String)>,
     pub schema: TableSchemaRef,
     pub engine: Engine,
     pub storage_params: Option<StorageParams>,

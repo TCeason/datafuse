@@ -131,6 +131,24 @@ fn pretty_table_source(source: CreateTableSource) -> RcDoc<'static> {
                 RcDoc::nil()
             })
             .append(RcDoc::text(table.to_string())),
+        CreateTableSource::Clone {
+            catalog,
+            database,
+            table,
+        } => RcDoc::space()
+            .append(RcDoc::text("CLONE"))
+            .append(RcDoc::space())
+            .append(if let Some(catalog) = catalog {
+                RcDoc::text(catalog.to_string()).append(RcDoc::text("."))
+            } else {
+                RcDoc::nil()
+            })
+            .append(if let Some(database) = database {
+                RcDoc::text(database.to_string()).append(RcDoc::text("."))
+            } else {
+                RcDoc::nil()
+            })
+            .append(RcDoc::text(table.to_string())),
     }
 }
 
