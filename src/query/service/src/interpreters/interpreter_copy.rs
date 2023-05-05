@@ -66,14 +66,15 @@ impl CopyInterpreter {
 
     #[async_backtrace::framed]
     async fn build_query(&self, query: &Plan) -> Result<(PipelineBuildResult, DataSchemaRef)> {
-        let (s_expr, metadata, bind_context, formatted_ast) = match query {
+        let (s_expr, metadata, bind_context, formatted_ast, opt_hints) = match query {
             Plan::Query {
                 s_expr,
                 metadata,
                 bind_context,
                 formatted_ast,
+                opt_hints,
                 ..
-            } => (s_expr, metadata, bind_context, formatted_ast),
+            } => (s_expr, metadata, bind_context, formatted_ast, opt_hints),
             v => unreachable!("Input plan must be Query, but it's {}", v),
         };
 
@@ -84,6 +85,7 @@ impl CopyInterpreter {
             metadata.clone(),
             formatted_ast.clone(),
             false,
+            opt_hints.clone(),
         )?;
 
         // Building data schema from bind_context columns

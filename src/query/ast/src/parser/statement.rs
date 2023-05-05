@@ -1614,7 +1614,7 @@ pub fn create_table_source(i: Input) -> IResult<CreateTableSource> {
             catalog,
             database,
             table,
-        }
+        },
     );
 
     rule!(

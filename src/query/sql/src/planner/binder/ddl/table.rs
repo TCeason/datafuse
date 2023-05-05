@@ -368,7 +368,8 @@ impl Binder {
         }
 
         // Build table schema
-        let (schema, field_default_exprs, field_comments, cloned_table) = match (&source, &as_query) {
+        let (schema, field_default_exprs, field_comments, cloned_table) = match (&source, &as_query)
+        {
             (Some(source), None) => {
                 // `CREATE TABLE` without `AS SELECT ...`
                 self.analyze_create_table_schema(source, engine).await?
@@ -376,7 +377,7 @@ impl Binder {
             (None, Some(query)) => {
                 // `CREATE TABLE AS SELECT ...` without column definitions
                 let mut init_bind_context = BindContext::new();
-                let (_, bind_context) = self.bind_query(&mut init_bind_context, query).await?;
+                let (_, bind_context, _) = self.bind_query(&mut init_bind_context, query).await?;
                 let fields = bind_context
                     .columns
                     .iter()
@@ -396,7 +397,7 @@ impl Binder {
                 let (source_schema, source_default_exprs, source_comments, cloned_table) =
                     self.analyze_create_table_schema(source, engine).await?;
                 let mut init_bind_context = BindContext::new();
-                let (_, bind_context) = self.bind_query(&mut init_bind_context, query).await?;
+                let (_, bind_context, _) = self.bind_query(&mut init_bind_context, query).await?;
                 let query_fields: Vec<TableField> = bind_context
                     .columns
                     .iter()
@@ -411,7 +412,12 @@ impl Binder {
                     return Err(ErrorCode::BadArguments("Number of columns does not match"));
                 }
                 Self::validate_create_table_schema(&source_schema)?;
-                (source_schema, source_default_exprs, source_comments, cloned_table)
+                (
+                    source_schema,
+                    source_default_exprs,
+                    source_comments,
+                    cloned_table,
+                )
             }
             _ => Err(ErrorCode::BadArguments(
                 "Incorrect CREATE query: required list of column descriptions or AS section or SELECT..",
@@ -925,10 +931,16 @@ impl Binder {
         &self,
         source: &CreateTableSource,
         engine: Engine,
-    ) -> Result<(TableSchemaRef, Vec<Option<String>>, Vec<String>, Option<(String, String, String)>)> {
+    ) -> Result<(
+        TableSchemaRef,
+        Vec<Option<String>>,
+        Vec<String>,
+        Option<(String, String, String)>,
+    )> {
         match source {
             CreateTableSource::Columns(columns) => {
-                let (res1, res2, res3) = self.analyze_create_table_schema_by_columns(columns, false)
+                let (res1, res2, res3) = self
+                    .analyze_create_table_schema_by_columns(columns, false)
                     .await?;
                 Ok((res1, res2, res3, None))
             }
@@ -961,18 +973,22 @@ impl Binder {
                 table,
             } => {
                 let (catalog, database, table_name) =
-                        self.normalize_object_identifier_triple(catalog, database, table);
+                    self.normalize_object_identifier_triple(catalog, database, table);
                 let table = self.ctx.get_table(&catalog, &database, &table_name).await?;
                 let cloned_engine = table.engine().to_lowercase();
                 if engine == Engine::Fuse && cloned_engine == "fuse" {
-                    Ok((table.schema(), vec![], table.field_comments().clone(), Some((catalog, database, table_name))))
+                    Ok((
+                        table.schema(),
+                        vec![],
+                        table.field_comments().clone(),
+                        Some((catalog, database, table_name)),
+                    ))
                 } else {
                     Err(ErrorCode::UnsupportedEngineParams(format!(
                         "Only support Create Clone FUSE Engine. Unsupported create clone for engine: {} to engine: {}",
                         engine, cloned_engine
                     )))
                 }
-
             }
         }
     }

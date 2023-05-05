@@ -16,6 +16,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use common_ast::ast::ExplainKind;
+use common_ast::ast::Hint;
 use common_expression::types::DataType;
 use common_expression::DataField;
 use common_expression::DataSchema;
@@ -108,6 +109,7 @@ pub enum Plan {
         // Use for generate query result cache key.
         formatted_ast: Option<String>,
         ignore_result: bool,
+        opt_hints: Option<Hint>,
     },
 
     Explain {

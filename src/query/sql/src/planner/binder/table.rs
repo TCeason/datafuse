@@ -237,7 +237,7 @@ impl Binder {
                                 table_alias_name,
                                 false,
                             );
-                            let (s_expr, mut new_bind_context) =
+                            let (s_expr, mut new_bind_context, _) =
                                 self.bind_query(&mut new_bind_context, query).await?;
                             if let Some(alias) = alias {
                                 // view maybe has alias, e.g. select v1.col1 from v as v1;
@@ -390,8 +390,10 @@ impl Binder {
                         having: None,
                         window_list: None,
                     };
-                    self.bind_select_stmt(&mut bind_context, &stmt, &[], 0)
-                        .await
+                    let (s_expr, bind_ctx, _) = self
+                        .bind_select_stmt(&mut bind_context, &stmt, &[], 0)
+                        .await?;
+                    Ok((s_expr, bind_ctx))
                 } else {
                     // Other table functions always reside is default catalog
                     let table_meta: Arc<dyn TableFunction> = self
@@ -430,7 +432,7 @@ impl Binder {
             } => {
                 // For subquery, we need use a new context to bind it.
                 let mut new_bind_context = BindContext::with_parent(Box::new(bind_context.clone()));
-                let (s_expr, mut new_bind_context) =
+                let (s_expr, mut new_bind_context, _) =
                     self.bind_query(&mut new_bind_context, subquery).await?;
                 if let Some(alias) = alias {
                     new_bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
@@ -599,7 +601,7 @@ impl Binder {
             srfs: Default::default(),
             expr_context: ExprContext::default(),
         };
-        let (s_expr, mut new_bind_context) = self
+        let (s_expr, mut new_bind_context, _) = self
             .bind_query(&mut new_bind_context, &cte_info.query)
             .await?;
         let mut cols_alias = cte_info.columns_alias.clone();

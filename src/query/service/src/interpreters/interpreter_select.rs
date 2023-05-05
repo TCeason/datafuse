@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono_tz::Tz;
+use common_ast::ast::Hint;
 use common_catalog::table::Table;
 use common_exception::ErrorCode;
 use common_exception::Result;
 use common_expression::infer_table_schema;
+use common_expression::types::DataType;
+use common_expression::ConstantFolder;
 use common_expression::DataSchemaRef;
+use common_expression::Expr;
 use common_expression::TableSchemaRef;
+use common_functions::BUILTIN_FUNCTIONS;
 use common_meta_store::MetaStore;
 use common_pipeline_core::pipe::Pipe;
 use common_pipeline_core::pipe::PipeItem;
@@ -27,13 +34,19 @@ use common_pipeline_core::processors::port::InputPort;
 use common_pipeline_core::processors::port::OutputPort;
 use common_pipeline_core::Pipeline;
 use common_pipeline_transforms::processors::transforms::TransformDummy;
+use common_sql::binder::wrap_cast;
 use common_sql::executor::PhysicalPlan;
 use common_sql::parse_result_scan_args;
+use common_sql::Metadata;
 use common_sql::MetadataRef;
+use common_sql::NameResolutionContext;
+use common_sql::TypeChecker;
 use common_storages_result_cache::gen_result_cache_key;
 use common_storages_result_cache::ResultCacheReader;
 use common_storages_result_cache::WriteResultCacheSink;
 use common_users::UserApiProvider;
+use parking_lot::lock_api::RwLock;
+use tracing::log::warn;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -52,6 +65,7 @@ pub struct SelectInterpreter {
     metadata: MetadataRef,
     formatted_ast: Option<String>,
     ignore_result: bool,
+    opt_hints: Option<Hint>,
 }
 
 impl SelectInterpreter {
@@ -62,6 +76,7 @@ impl SelectInterpreter {
         metadata: MetadataRef,
         formatted_ast: Option<String>,
         ignore_result: bool,
+        opt_hints: Option<Hint>,
     ) -> Result<Self> {
         Ok(SelectInterpreter {
             ctx,
@@ -70,6 +85,7 @@ impl SelectInterpreter {
             metadata,
             formatted_ast,
             ignore_result,
+            opt_hints,
         })
     }
 
@@ -178,6 +194,47 @@ impl SelectInterpreter {
         }
         Ok(None)
     }
+
+    pub(crate) async fn opt_hints_set_var(&self, hints: &Hint) -> Result<()> {
+        let name_resolution_ctx = NameResolutionContext::try_from(&*self.ctx.get_settings())?;
+        let mut bind_context = BindContext::new();
+        let mut type_checker = TypeChecker::new(
+            &mut bind_context,
+            self.ctx.clone(),
+            &name_resolution_ctx,
+            self.metadata.clone(),
+            &[],
+            false,
+        );
+        let mut hint_settings: HashMap<String, String> = HashMap::new();
+        for hint in &hints.hints_list {
+            let variable = &hint.name.name;
+            let (scalar, _) = *type_checker.resolve(&hint.expr).await?;
+
+            let scalar = wrap_cast(&scalar, &DataType::String);
+            let expr = scalar.as_expr_with_col_index()?;
+
+            let (new_expr, _) =
+                ConstantFolder::fold(&expr, &self.ctx.get_function_context()?, &BUILTIN_FUNCTIONS);
+            match new_expr {
+                Expr::Constant { scalar, .. } => {
+                    let value = String::from_utf8(scalar.into_string().unwrap())?;
+                    if variable.to_lowercase().as_str() == "timezone" {
+                        let tz = value.trim_matches(|c| c == '\'' || c == '\"');
+                        tz.parse::<Tz>().map_err(|_| {
+                            ErrorCode::InvalidTimezone(format!("Invalid Timezone: {:?}", value))
+                        })?;
+                    }
+                    hint_settings.entry(variable.to_string()).or_insert(value);
+                }
+                _ => {
+                    warn!("fold hints {:?} failed. value must be constant value", hint);
+                }
+            }
+        }
+
+        self.ctx.get_settings().set_batch_settings(&hint_settings)
+    }
 }
 
 #[async_trait::async_trait]
@@ -197,6 +254,9 @@ impl Interpreter for SelectInterpreter {
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         // 0. Need to build physical plan first to get the partitions.
         let physical_plan = self.build_physical_plan().await?;
+        if let Some(hints) = &self.opt_hints {
+            self.opt_hints_set_var(hints);
+        }
         if self.ctx.get_settings().get_enable_query_result_cache()? && self.ctx.get_cacheable() {
             let key = gen_result_cache_key(self.formatted_ast.as_ref().unwrap());
             // 1. Try to get result from cache.

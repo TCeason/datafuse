@@ -81,6 +81,7 @@ impl InterpreterFactory {
                 metadata,
                 ignore_result,
                 formatted_ast,
+                opt_hints,
                 ..
             } => Ok(Arc::new(SelectInterpreter::try_create(
                 ctx,
@@ -89,6 +90,7 @@ impl InterpreterFactory {
                 metadata.clone(),
                 formatted_ast.clone(),
                 *ignore_result,
+                opt_hints.clone()
             )?)),
             Plan::Explain { kind, plan } => Ok(Arc::new(ExplainInterpreter::try_create(
                 ctx,

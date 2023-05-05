@@ -625,6 +625,7 @@ impl<'a> Binder {
             rewrite_kind: None,
             ignore_result: false,
             formatted_ast: None,
+            opt_hints: None,
         };
 
         Ok(Plan::Copy(Box::new(CopyPlan::IntoTableWithTransform {

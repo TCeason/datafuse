@@ -153,14 +153,15 @@ impl ReplaceInterpreter {
         self_schema: DataSchemaRef,
         query_plan: &Plan,
     ) -> Result<PipelineBuildResult> {
-        let (s_expr, metadata, bind_context, formatted_ast) = match query_plan {
+        let (s_expr, metadata, bind_context, formatted_ast, opt_hints) = match query_plan {
             Plan::Query {
                 s_expr,
                 metadata,
                 bind_context,
                 formatted_ast,
+                opt_hints,
                 ..
-            } => (s_expr, metadata, bind_context, formatted_ast),
+            } => (s_expr, metadata, bind_context, formatted_ast, opt_hints),
             v => unreachable!("Input plan must be Query, but it's {}", v),
         };
 
@@ -171,6 +172,7 @@ impl ReplaceInterpreter {
             metadata.clone(),
             formatted_ast.clone(),
             false,
+            opt_hints.clone(),
         )?;
 
         let mut build_res = select_interpreter.execute2().await?;

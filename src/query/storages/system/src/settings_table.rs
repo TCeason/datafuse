@@ -45,6 +45,7 @@ impl SyncSystemTable for SettingsTable {
 
     fn get_full_data(&self, ctx: Arc<dyn TableContext>) -> Result<DataBlock> {
         let settings = ctx.get_settings();
+        println!("the settings is {:?}", settings.clone());
 
         let mut names: Vec<String> = vec![];
         let mut values: Vec<String> = vec![];

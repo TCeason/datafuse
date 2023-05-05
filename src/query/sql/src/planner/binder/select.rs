@@ -20,6 +20,7 @@ use common_ast::ast::BinaryOperator;
 use common_ast::ast::Expr;
 use common_ast::ast::Expr::Array;
 use common_ast::ast::GroupBy;
+use common_ast::ast::Hint;
 use common_ast::ast::Identifier;
 use common_ast::ast::Join;
 use common_ast::ast::JoinCondition;
@@ -86,15 +87,15 @@ impl Binder {
         stmt: &SelectStmt,
         order_by: &[OrderByExpr],
         limit: usize,
-    ) -> Result<(SExpr, BindContext)> {
-        if let Some(hints) = &stmt.hints {
-            if let Some(e) = self.opt_hints_set_var(bind_context, hints).await.err() {
-                warn!(
-                    "In SELECT resolve optimize hints {:?} failed, err: {:?}",
-                    hints, e
-                );
-            }
-        }
+    ) -> Result<(SExpr, BindContext, Option<Hint>)> {
+        // if let Some(hints) = &stmt.hints {
+        //     if let Some(e) = self.opt_hints_set_var(bind_context, hints).await.err() {
+        //         warn!(
+        //             "In SELECT resolve optimize hints {:?} failed, err: {:?}",
+        //             hints, e
+        //         );
+        //     }
+        // }
         let (mut s_expr, mut from_context) = if stmt.from.is_empty() {
             self.bind_one_table(bind_context, stmt).await?
         } else {
@@ -253,7 +254,7 @@ impl Binder {
         output_context.columns = from_context.columns;
         output_context.ctes_map = from_context.ctes_map;
 
-        Ok((s_expr, output_context))
+        Ok((s_expr, output_context, stmt.hints.clone()))
     }
 
     #[async_recursion]
@@ -264,22 +265,27 @@ impl Binder {
         set_expr: &SetExpr,
         order_by: &[OrderByExpr],
         limit: usize,
-    ) -> Result<(SExpr, BindContext)> {
+    ) -> Result<(SExpr, BindContext, Option<Hint>)> {
         match set_expr {
             SetExpr::Select(stmt) => {
                 self.bind_select_stmt(bind_context, stmt, order_by, limit)
                     .await
             }
-            SetExpr::Query(stmt) => self.bind_query(bind_context, stmt).await,
+            SetExpr::Query(stmt) => {
+                let (s_expr, bind_ctx, _) = self.bind_query(bind_context, stmt).await?;
+                Ok((s_expr, bind_ctx, None))
+            }
             SetExpr::SetOperation(set_operation) => {
-                self.bind_set_operator(
-                    bind_context,
-                    &set_operation.left,
-                    &set_operation.right,
-                    &set_operation.op,
-                    &set_operation.all,
-                )
-                .await
+                let (s_expr, bind_ctx) = self
+                    .bind_set_operator(
+                        bind_context,
+                        &set_operation.left,
+                        &set_operation.right,
+                        &set_operation.op,
+                        &set_operation.all,
+                    )
+                    .await?;
+                Ok((s_expr, bind_ctx, None))
             }
         }
     }
@@ -290,7 +296,7 @@ impl Binder {
         &mut self,
         bind_context: &mut BindContext,
         query: &Query,
-    ) -> Result<(SExpr, BindContext)> {
+    ) -> Result<(SExpr, BindContext, Option<Hint>)> {
         if let Some(with) = &query.with {
             for cte in with.ctes.iter() {
                 let table_name = cte.alias.name.name.clone();
@@ -319,7 +325,7 @@ impl Binder {
             (None, 0)
         };
 
-        let (mut s_expr, bind_context) = match query.body {
+        let (mut s_expr, bind_context, opt_hints) = match query.body {
             SetExpr::Select(_) | SetExpr::Query(_) => {
                 self.bind_set_expr(
                     bind_context,
@@ -330,7 +336,7 @@ impl Binder {
                 .await?
             }
             SetExpr::SetOperation(_) => {
-                let (mut s_expr, mut bind_context) = self
+                let (mut s_expr, mut bind_context, opt_hints) = self
                     .bind_set_expr(bind_context, &query.body, &[], limit.unwrap_or_default())
                     .await?;
                 if !query.order_by.is_empty() {
@@ -338,7 +344,7 @@ impl Binder {
                         .bind_order_by_for_set_operation(&mut bind_context, s_expr, &query.order_by)
                         .await?;
                 }
-                (s_expr, bind_context)
+                (s_expr, bind_context, opt_hints)
             }
         };
 
@@ -346,7 +352,7 @@ impl Binder {
             s_expr = Self::bind_limit(s_expr, limit, offset);
         }
 
-        Ok((s_expr, bind_context))
+        Ok((s_expr, bind_context, opt_hints))
     }
 
     #[async_backtrace::framed]
@@ -383,8 +389,9 @@ impl Binder {
         op: &SetOperator,
         all: &bool,
     ) -> Result<(SExpr, BindContext)> {
-        let (left_expr, left_bind_context) = self.bind_set_expr(bind_context, left, &[], 0).await?;
-        let (right_expr, right_bind_context) =
+        let (left_expr, left_bind_context, _) =
+            self.bind_set_expr(bind_context, left, &[], 0).await?;
+        let (right_expr, right_bind_context, _) =
             self.bind_set_expr(bind_context, right, &[], 0).await?;
         let mut coercion_types = Vec::with_capacity(left_bind_context.columns.len());
         if left_bind_context.columns.len() != right_bind_context.columns.len() {

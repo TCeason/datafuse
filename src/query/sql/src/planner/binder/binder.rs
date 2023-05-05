@@ -149,7 +149,7 @@ impl<'a> Binder {
     ) -> Result<Plan> {
         let plan = match stmt {
             Statement::Query(query) => {
-                let (s_expr, bind_context) = self.bind_query(bind_context, query).await?;
+                let (s_expr, bind_context, opt_hints) = self.bind_query(bind_context, query).await?;
                 let formatted_ast = if self.ctx.get_settings().get_enable_query_result_cache()? {
                     Some(format_statement(stmt.clone())?)
                 } else {
@@ -162,6 +162,7 @@ impl<'a> Binder {
                     rewrite_kind: None,
                     ignore_result: query.ignore_result,
                     formatted_ast,
+                    opt_hints,
                 }
             }
 

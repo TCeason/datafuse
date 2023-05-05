@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use common_catalog::table::Table;
 
+use common_catalog::table::Table;
 use common_config::GlobalConfig;
 use common_exception::ErrorCode;
 use common_exception::Result;
@@ -28,8 +28,8 @@ use common_meta_types::MatchSeq;
 use common_sql::binder::INTERNAL_COLUMN_FACTORY;
 use common_sql::field_default_value;
 use common_sql::plans::CreateTablePlan;
-use common_storages_fuse::FuseTable;
 use common_storages_fuse::io::MetaReaders;
+use common_storages_fuse::FuseTable;
 use common_users::UserApiProvider;
 use storages_common_cache::LoadParams;
 use storages_common_table_meta::meta::TableSnapshot;
@@ -126,7 +126,9 @@ impl CreateTableInterpreter {
         let catalog = self.ctx.get_catalog(&self.plan.catalog)?;
 
         // TODO: maybe the table creation and insertion should be a transaction, but it may require create_table support 2pc.
-        catalog.create_table(self.build_request(None).await?).await?;
+        catalog
+            .create_table(self.build_request(None).await?)
+            .await?;
         let table = catalog
             .get_table(tenant.as_str(), &self.plan.database, &self.plan.table)
             .await?;
@@ -159,7 +161,9 @@ impl CreateTableInterpreter {
     async fn create_table(&self) -> Result<PipelineBuildResult> {
         let catalog = self.ctx.get_catalog(self.plan.catalog.as_str())?;
         let mut stat = None;
-        catalog.create_table(self.build_request(stat).await?).await?;
+        catalog
+            .create_table(self.build_request(stat).await?)
+            .await?;
         Ok(PipelineBuildResult::create())
     }
 

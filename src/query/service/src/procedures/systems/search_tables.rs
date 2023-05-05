@@ -73,6 +73,7 @@ impl OneBlockProcedure for SearchTablesProcedure {
                 metadata,
                 None,
                 false,
+                None,
             )?;
             interpreter.execute(ctx.clone()).await
         } else {
