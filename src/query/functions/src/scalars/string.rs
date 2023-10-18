@@ -767,15 +767,19 @@ pub fn register(registry: &mut FunctionRegistry) {
                 |str, sep, output, ctx| match String::from_utf8(str.to_vec()) {
                     Ok(s) => match String::from_utf8(sep.to_vec()) {
                         Ok(sep) => {
-                            let res: Vec<&str> = s.split(&sep).collect();
-                            let len = res.len();
-                            let mut builder = StringColumnBuilder::with_capacity(len, len);
-                            for i in res {
-                                builder.put_slice(i.as_bytes());
-                                builder.commit_row();
+                            if s == sep {
+                                output.builder.put_slice(&[]);
+                                output.builder.commit_row();
+                            } else if sep.is_empty() {
+                                output.builder.put_slice(str);
+                                output.builder.commit_row();
+                            } else {
+                                let split = s.split(&sep);
+                                for i in split {
+                                    output.builder.put_slice(i.as_bytes());
+                                    output.builder.commit_row();
+                                }
                             }
-                            let column = builder.build();
-                            output.builder.append_column(&column);
                             output.commit_row()
                         }
                         Err(e) => {
@@ -799,19 +803,28 @@ pub fn register(registry: &mut FunctionRegistry) {
                 |str, sep, part, output, ctx| match String::from_utf8(str.to_vec()) {
                     Ok(s) => match String::from_utf8(sep.to_vec()) {
                         Ok(sep) => {
-                            let split: Vec<&str> = s.split(&sep).collect();
-                            let len = split.len();
-                            if part <= len as i64 && part >= -(len as i64) {
-                                let idx = match part.cmp(&(0i64)) {
-                                    Ordering::Greater => (part-1) as usize,
-                                    Ordering::Less =>  (len as i64 + part) as usize,
-                                    Ordering::Equal => 0
-                                };
-                                let res = split[idx];
-                                output.put_slice(res.as_bytes());
+                            if s == sep {
+                                output.commit_row()
+                            } else if sep.is_empty() {
+                                if part == 0 || part == 1 || part == -1 {
+                                    output.put_slice(str);
+                                }
+                                output.commit_row()
+                            } else {
+                                let split: Vec<&str> = s.split(&sep).collect();
+                                let len = split.len();
+                                if part <= len as i64 && part >= -(len as i64) {
+                                    let idx = match part.cmp(&(0i64)) {
+                                        Ordering::Greater => (part-1) as usize,
+                                        Ordering::Less =>  (len as i64 + part) as usize,
+                                        Ordering::Equal => 0
+                                    };
+                                    let res = split[idx];
+                                    output.put_slice(res.as_bytes());
 
+                                }
+                                output.commit_row();
                             }
-                            output.commit_row();
                         }
                         Err(e) => {
                             ctx.set_error(output.len(), e.to_string());
