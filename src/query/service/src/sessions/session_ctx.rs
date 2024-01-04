@@ -252,18 +252,20 @@ impl SessionContext {
     }
 
     pub fn update_query_ids_results(&self, query_id: String, value: Option<String>) {
-        let mut lock = self.query_ids_results.write();
-        // Here we use reverse iteration, as it is not common to modify elements from earlier.
-        for (idx, (qid, _)) in (*lock).iter().rev().enumerate() {
-            if qid.eq_ignore_ascii_case(&query_id) {
-                // update value iff value is some.
-                if let Some(v) = value {
-                    (*lock)[idx] = (query_id, Some(v))
+        if self.typ != SessionType::Dummy {
+            let mut lock = self.query_ids_results.write();
+            // Here we use reverse iteration, as it is not common to modify elements from earlier.
+            for (idx, (qid, _)) in (*lock).iter().rev().enumerate() {
+                if qid.eq_ignore_ascii_case(&query_id) {
+                    // update value iff value is some.
+                    if let Some(v) = value {
+                        (*lock)[idx] = (query_id, Some(v))
+                    }
+                    return;
                 }
-                return;
             }
+            lock.push((query_id, value))
         }
-        lock.push((query_id, value))
     }
 
     pub fn get_last_query_id(&self, index: i32) -> String {
