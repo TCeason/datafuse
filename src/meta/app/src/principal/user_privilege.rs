@@ -66,6 +66,9 @@ pub enum UserPrivilegeType {
     CreateDataMask = 1 << 16,
     // Privilege to Own a databend object such as database/table.
     Ownership = 1 << 17,
+    Read = 1 << 18,
+    Write = 1 << 19,
+
     // TODO: remove this later
     Set = 1 << 4,
 }
@@ -89,6 +92,8 @@ const ALL_PRIVILEGES: BitFlags<UserPrivilegeType> = make_bitflags!(
         | Set
         | CreateDataMask
         | Ownership
+        | Read
+        | Write
     }
 );
 
@@ -113,6 +118,8 @@ impl std::fmt::Display for UserPrivilegeType {
             UserPrivilegeType::Set => "SET",
             UserPrivilegeType::CreateDataMask => "CREATE DATAMASK",
             UserPrivilegeType::Ownership => "OWNERSHIP",
+            UserPrivilegeType::Read => "READ",
+            UserPrivilegeType::Write => "Write",
         })
     }
 }
