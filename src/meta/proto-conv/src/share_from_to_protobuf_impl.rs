@@ -129,7 +129,9 @@ impl FromToProto for mt::ShareGrantEntry {
     where Self: Sized {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let privileges = BitFlags::<mt::ShareGrantObjectPrivilege, u64>::from_bits(p.privileges);
+        // ignore unknown flags
+        let privileges =
+            BitFlags::<mt::ShareGrantObjectPrivilege, u64>::from_bits_truncate(p.privileges);
         match privileges {
             Ok(privileges) => Ok(mt::ShareGrantEntry {
                 object: mt::ShareGrantObject::from_pb(p.object.ok_or_else(|| Incompatible {

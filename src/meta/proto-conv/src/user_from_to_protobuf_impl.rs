@@ -204,7 +204,9 @@ impl FromToProto for mt::principal::GrantEntry {
     where Self: Sized {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let privileges = BitFlags::<mt::principal::UserPrivilegeType, u64>::from_bits(p.privileges);
+        // ignore unknown flags
+        let privileges =
+            BitFlags::<mt::principal::UserPrivilegeType, u64>::from_bits_truncate(p.privileges);
         match privileges {
             Ok(privileges) => Ok(mt::principal::GrantEntry::new(
                 mt::principal::GrantObject::from_pb(p.object.ok_or_else(|| Incompatible {
