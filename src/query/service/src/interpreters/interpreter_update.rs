@@ -325,7 +325,7 @@ impl UpdateInterpreter {
             update_stream_meta: vec![],
             merge_meta,
             need_lock: false,
-            deduplicated_label: unsafe { ctx.get_settings().get_deduplicate_label()? },
+            deduplicated_label: ctx.get_settings().get_deduplicate_label()?,
         })))
     }
 }

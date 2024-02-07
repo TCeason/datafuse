@@ -313,7 +313,7 @@ impl Interpreter for CopyIntoTableInterpreter {
                 &self.plan,
                 &files,
                 update_stream_meta,
-                unsafe { self.ctx.get_settings().get_deduplicate_label()? },
+                self.ctx.get_settings().get_deduplicate_label()?,
             )
             .await?;
         }

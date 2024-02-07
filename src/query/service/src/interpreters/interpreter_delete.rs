@@ -314,7 +314,7 @@ pub async fn subquery_filter(
 
     let opt_ctx = OptimizerContext::new(ctx.clone(), metadata.clone())
         .with_enable_distributed_optimization(false)
-        .with_enable_join_reorder(unsafe { !ctx.get_settings().get_disable_join_reorder()? })
+        .with_enable_join_reorder( !ctx.get_settings().get_disable_join_reorder()? )
         .with_enable_dphyp(ctx.get_settings().get_enable_dphyp()?);
 
     s_expr = optimize_query(opt_ctx, s_expr.clone())?;

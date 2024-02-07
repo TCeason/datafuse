@@ -217,13 +217,12 @@ impl AsyncSource for LicenseInfoSource {
         let settings = self.ctx.get_settings();
         // sync global changes on distributed node cluster.
         settings.load_global_changes().await?;
-        let license = unsafe {
+        let license =
             settings
                 .get_enterprise_license()
                 .map_err_to_code(ErrorCode::LicenseKeyInvalid, || {
                     format!("failed to get license for {}", self.ctx.get_tenant())
-                })?
-        };
+                })?;
 
         get_license_manager()
             .manager

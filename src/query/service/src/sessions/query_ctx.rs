@@ -880,11 +880,9 @@ impl TableContext for QueryContext {
     }
 
     fn get_license_key(&self) -> String {
-        unsafe {
             self.get_settings()
                 .get_enterprise_license()
                 .unwrap_or_default()
-        }
     }
 
     fn add_query_profiles(&self, profiles: &[PlanProfile]) {

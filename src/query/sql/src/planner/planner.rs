@@ -115,9 +115,9 @@ impl Planner {
                 // Step 4: Optimize the SExpr with optimizers, and generate optimized physical SExpr
                 let opt_ctx = OptimizerContext::new(self.ctx.clone(), metadata.clone())
                     .with_enable_distributed_optimization(!self.ctx.get_cluster().is_empty())
-                    .with_enable_join_reorder(unsafe {
+                    .with_enable_join_reorder(
                         !self.ctx.get_settings().get_disable_join_reorder()?
-                    })
+                    )
                     .with_enable_dphyp(self.ctx.get_settings().get_enable_dphyp()?);
 
                 let optimized_plan = optimize(opt_ctx, plan)?;

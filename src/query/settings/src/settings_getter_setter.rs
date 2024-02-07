@@ -35,10 +35,10 @@ impl Settings {
     fn try_get_u64(&self, key: &str) -> Result<u64> {
         DefaultSettings::check_setting_mode(key, SettingMode::Read)?;
 
-        unsafe { self.unchecked_try_get_u64(key) }
+        self.unchecked_try_get_u64(key)
     }
 
-    unsafe fn unchecked_try_get_u64(&self, key: &str) -> Result<u64> {
+    fn unchecked_try_get_u64(&self, key: &str) -> Result<u64> {
         match self.changes.get(key) {
             Some(v) => v.value.as_u64(),
             None => match self.configs.get(key) {
@@ -51,10 +51,10 @@ impl Settings {
     fn try_get_string(&self, key: &str) -> Result<String> {
         DefaultSettings::check_setting_mode(key, SettingMode::Read)?;
 
-        unsafe { self.unchecked_try_get_string(key) }
+        self.unchecked_try_get_string(key)
     }
 
-    unsafe fn unchecked_try_get_string(&self, key: &str) -> Result<String, ErrorCode> {
+    fn unchecked_try_get_string(&self, key: &str) -> Result<String, ErrorCode> {
         match self.changes.get(key) {
             Some(v) => Ok(v.value.as_string()),
             None => match self.configs.get(key) {
@@ -67,12 +67,12 @@ impl Settings {
     fn try_set_u64(&self, key: &str, val: u64) -> Result<()> {
         DefaultSettings::check_setting_mode(key, SettingMode::Write)?;
 
-        unsafe { self.unchecked_try_set_u64(key, val) }
+        self.unchecked_try_set_u64(key, val)
     }
 
     /// Sets a u64 value for a given key in the settings.
     /// Ensures that the key exists, the setting type is UInt64, and the value is within any defined numeric range.
-    unsafe fn unchecked_try_set_u64(&self, key: &str, val: u64) -> Result<()> {
+    fn unchecked_try_set_u64(&self, key: &str, val: u64) -> Result<()> {
         // Retrieve the instance of default settings
         let default_settings = DefaultSettings::instance()?;
 
@@ -110,10 +110,10 @@ impl Settings {
     pub fn set_setting(&self, k: String, v: String) -> Result<()> {
         DefaultSettings::check_setting_mode(&k, SettingMode::Write)?;
 
-        unsafe { self.unchecked_set_setting(k, v) }
+        self.unchecked_set_setting(k, v)
     }
 
-    unsafe fn unchecked_set_setting(&self, k: String, v: String) -> Result<()> {
+    fn unchecked_set_setting(&self, k: String, v: String) -> Result<()> {
         let (key, value) = DefaultSettings::convert_value(k.clone(), v)?;
 
         if key == "sandbox_tenant" {
@@ -261,7 +261,7 @@ impl Settings {
     }
 
     /// # Safety
-    pub unsafe fn get_disable_join_reorder(&self) -> Result<bool> {
+    pub fn get_disable_join_reorder(&self) -> Result<bool> {
         Ok(self.unchecked_try_get_u64("disable_join_reorder")? != 0)
     }
 
@@ -394,17 +394,17 @@ impl Settings {
     }
 
     /// # Safety
-    pub unsafe fn get_enterprise_license(&self) -> Result<String> {
+    pub fn get_enterprise_license(&self) -> Result<String> {
         self.unchecked_try_get_string("enterprise_license")
     }
 
     /// # Safety
-    pub unsafe fn set_enterprise_license(&self, val: String) -> Result<()> {
+    pub fn set_enterprise_license(&self, val: String) -> Result<()> {
         self.unchecked_set_setting("enterprise_license".to_string(), val)
     }
 
     /// # Safety
-    pub unsafe fn get_deduplicate_label(&self) -> Result<Option<String>> {
+    pub fn get_deduplicate_label(&self) -> Result<Option<String>> {
         let deduplicate_label = self.unchecked_try_get_string("deduplicate_label")?;
         if deduplicate_label.is_empty() {
             Ok(None)
@@ -414,7 +414,7 @@ impl Settings {
     }
 
     /// # Safety
-    pub unsafe fn set_deduplicate_label(&self, val: String) -> Result<()> {
+    pub fn set_deduplicate_label(&self, val: String) -> Result<()> {
         self.unchecked_set_setting("deduplicate_label".to_string(), val)
     }
 

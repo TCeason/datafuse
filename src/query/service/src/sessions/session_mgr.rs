@@ -126,9 +126,7 @@ impl SessionManager {
         }
 
         if let Some(enterprise_license_key) = query_config.databend_enterprise_license.clone() {
-            unsafe {
                 settings.set_enterprise_license(enterprise_license_key)?;
-            }
         }
         Ok(())
     }

@@ -241,7 +241,7 @@ impl Interpreter for InsertInterpreter {
                     update_stream_meta,
                     self.plan.overwrite,
                     None,
-                    unsafe { self.ctx.get_settings().get_deduplicate_label()? },
+                    self.ctx.get_settings().get_deduplicate_label()?,
                 )?;
 
                 //  Execute the hook operator.
@@ -276,7 +276,7 @@ impl Interpreter for InsertInterpreter {
             vec![],
             self.plan.overwrite,
             append_mode,
-            unsafe { self.ctx.get_settings().get_deduplicate_label()? },
+            self.ctx.get_settings().get_deduplicate_label()?,
         )?;
 
         //  Execute the hook operator.
