@@ -52,13 +52,27 @@ impl Interpreter for DropDatabaseInterpreter {
         // unset the ownership of the database, the database may not exists.
         let db = catalog.get_database(&tenant, &self.plan.database).await;
         if let Ok(db) = db {
+            let db_id = db.get_db_info().ident.db_id;
             let role_api = UserApiProvider::instance().get_role_api_client(&tenant)?;
             let owner_object = OwnershipObject::Database {
                 catalog_name: self.plan.catalog.clone(),
-                db_id: db.get_db_info().ident.db_id,
+                db_id,
             };
-
             role_api.revoke_ownership(&owner_object).await?;
+
+            match catalog.list_tables(&tenant, &self.plan.database).await {
+                Ok(tables) => {
+                    for tbl in tables {
+                        let owner_object = OwnershipObject::Table {
+                            catalog_name: self.plan.catalog.clone(),
+                            db_id,
+                            table_id: tbl.get_table_info().ident.table_id,
+                        };
+                        role_api.revoke_ownership(&owner_object).await?;
+                    }
+                }
+                Err(_) => {}
+            }
             RoleCacheManager::instance().invalidate_cache(&tenant);
         }
 
