@@ -37,6 +37,15 @@ stmt() {
 	return 0
 }
 
+stmt_with_user() {
+	echo ">>>> $1"
+	echo "$1" | $2
+	if [ $? -ne 0 ]; then
+		echo "<<<<"
+	fi
+	return 0
+}
+
 comment() {
 	echo "#### $1"
 }

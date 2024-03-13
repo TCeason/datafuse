@@ -190,24 +190,24 @@ echo "create stage s3;" | $BENDSQL_CLIENT_CONNECT
 echo "copy into '@s3/a b' from (select 2);" | $BENDSQL_CLIENT_CONNECT | $RM_UUID
 
 # need err
-echo "insert into t select * from t1" | $USER_B_CONNECT
-echo "insert into t select * from @s3" | $USER_B_CONNECT
-echo "create table t2 as select * from t" | $USER_B_CONNECT
-echo "create table t2 as select * from @s3" | $USER_B_CONNECT
-echo "copy into t from (select * from @s3);" | $USER_B_CONNECT | $RM_UUID
-echo "replace into t on(id) select * from t1;" | $USER_B_CONNECT
+stmt_with_user "insert into t select * from t1" "$USER_B_CONNECT"
+stmt_with_user "insert into t select * from @s3" "$USER_B_CONNECT"
+stmt_with_user "create table t2 as select * from t" "$USER_B_CONNECT"
+stmt_with_user "create table t2 as select * from @s3" "$USER_B_CONNECT"
+echo "copy into t from (select * from @s3);" | "$USER_B_CONNECT" | $RM_UUID
+stmt_with_user "replace into t on(id) select * from t1;" "$USER_B_CONNECT"
 
 echo "grant select on default.t to b" | $BENDSQL_CLIENT_CONNECT
 echo "grant select on default.t1 to b" | $BENDSQL_CLIENT_CONNECT
 echo "grant read on stage s3 to b" | $BENDSQL_CLIENT_CONNECT
 
-echo "insert into t select * from t1" | $USER_B_CONNECT
-echo "insert into t select * from @s3" | $USER_B_CONNECT
-echo "create table t2 as select * from t" | $USER_B_CONNECT
+stmt_with_user "insert into t select * from t1" "$USER_B_CONNECT"
+stmt_with_user "insert into t select * from @s3" "$USER_B_CONNECT"
+stmt_with_user "create table t2 as select * from t" "$USER_B_CONNECT"
 echo "drop table t2" | $BENDSQL_CLIENT_CONNECT
-echo "create table t2 as select * from @s3" | $USER_B_CONNECT
-echo "copy into t from (select * from @s3);" | $USER_B_CONNECT | $RM_UUID
-echo "replace into t on(id) select * from t1;" | $USER_B_CONNECT
+stmt_with_user "create table t2 as select * from @s3" "$USER_B_CONNECT"
+echo "copy into t from (select * from @s3);" | "$USER_B_CONNECT" | $RM_UUID
+stmt_with_user "replace into t on(id) select * from t1;" "$USER_B_CONNECT"
 
 ## check after alter table/db name, table id and db id is normal.
 echo "=== check db/table_id ==="
@@ -218,25 +218,25 @@ echo "create database c;" | $BENDSQL_CLIENT_CONNECT
 echo "create table c.t (id int);" | $BENDSQL_CLIENT_CONNECT
 echo "grant insert, select on c.t to b" | $BENDSQL_CLIENT_CONNECT
 echo "show grants for b" | $BENDSQL_CLIENT_CONNECT
-echo "insert into c.t values(1)" | $USER_B_CONNECT
-echo "select * from c.t" | $USER_B_CONNECT
+stmt_with_user "insert into c.t values(1)" "$USER_B_CONNECT"
+stmt_with_user "select * from c.t" "$USER_B_CONNECT"
 
 echo "alter table c.t rename to t1" | $BENDSQL_CLIENT_CONNECT
 echo "show grants for b" | $BENDSQL_CLIENT_CONNECT
-echo "insert into c.t1 values(2)" | $USER_B_CONNECT
-echo "select * from c.t1 order by id" | $USER_B_CONNECT
+stmt_with_user "insert into c.t1 values(2)" "$USER_B_CONNECT"
+stmt_with_user "select * from c.t1 order by id" "$USER_B_CONNECT"
 
 echo "alter database c rename to d" | $BENDSQL_CLIENT_CONNECT
 echo "show grants for b" | $BENDSQL_CLIENT_CONNECT
-echo "insert into d.t1 values(3)" | $USER_B_CONNECT
-echo "select * from d.t1 order by id" | $USER_B_CONNECT
+stmt_with_user "insert into d.t1 values(3)" "$USER_B_CONNECT"
+stmt_with_user "select * from d.t1 order by id" "$USER_B_CONNECT"
 
 ## Drop user
 echo "drop database if exists no_grant" | $BENDSQL_CLIENT_CONNECT
 echo "grant drop on d.* to b" | $BENDSQL_CLIENT_CONNECT
 echo "grant drop on *.* to a" | $BENDSQL_CLIENT_CONNECT
 echo "drop database grant_db" | $USER_A_CONNECT
-echo "drop database d" | $USER_B_CONNECT
+echo "drop database d" | "$USER_B_CONNECT"
 echo "drop user a" | $BENDSQL_CLIENT_CONNECT
 echo "drop user b" | $BENDSQL_CLIENT_CONNECT
 
@@ -245,9 +245,9 @@ echo "create user c identified by '123'" | $BENDSQL_CLIENT_CONNECT
 echo "grant drop on default.t to c" | $BENDSQL_CLIENT_CONNECT
 export USER_C_CONNECT="bendsql --user=c --password=123 --host=${QUERY_MYSQL_HANDLER_HOST} --port ${QUERY_HTTP_HANDLER_PORT}"
 
-echo "drop table if exists t" | $USER_C_CONNECT
-echo "drop table if exists unknown_t" | $USER_C_CONNECT
-echo "drop database if exists unknown_db" | $USER_C_CONNECT
+echo "drop table if exists t" | "$USER_C_CONNECT"
+echo "drop table if exists unknown_t" | "$USER_C_CONNECT"
+echo "drop database if exists unknown_db" | "$USER_C_CONNECT"
 
 echo "drop table if exists t1" | $BENDSQL_CLIENT_CONNECT
 echo "drop table if exists t2" | $BENDSQL_CLIENT_CONNECT
