@@ -101,6 +101,7 @@ pub struct WindowFuncLagLeadImpl {
     pub arg: usize,
     pub default: LagLeadDefault,
     pub return_type: DataType,
+    pub ignore_null: bool,
 }
 
 #[derive(Clone)]
@@ -108,6 +109,7 @@ pub struct WindowFuncNthValueImpl {
     pub n: Option<u64>,
     pub arg: usize,
     pub return_type: DataType,
+    pub ignore_null: bool,
 }
 
 #[derive(Clone)]
@@ -217,6 +219,7 @@ impl WindowFunctionInfo {
                     arg: new_arg,
                     default: new_default,
                     return_type: ll.return_type.clone(),
+                    ignore_null: ll.ignore_null,
                 })
             }
             WindowFunction::NthValue(func) => {
@@ -225,6 +228,7 @@ impl WindowFunctionInfo {
                     n: func.n,
                     arg: new_arg,
                     return_type: func.return_type.clone(),
+                    ignore_null: func.ignore_null,
                 })
             }
             WindowFunction::Ntile(func) => Self::Ntile(WindowFuncNtileImpl {

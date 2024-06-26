@@ -834,6 +834,7 @@ pub struct FunctionCall {
     pub name: Identifier,
     pub args: Vec<Expr>,
     pub params: Vec<Expr>,
+    pub window_ignore_null: Option<bool>,
     pub window: Option<Window>,
     pub lambda: Option<Lambda>,
 }
@@ -843,6 +844,7 @@ impl Display for FunctionCall {
         let FunctionCall {
             distinct,
             name,
+            window_ignore_null,
             args,
             params,
             window,
@@ -865,6 +867,13 @@ impl Display for FunctionCall {
         write!(f, ")")?;
 
         if let Some(window) = window {
+            if let Some(window_ignore_null) = window_ignore_null {
+                if *window_ignore_null {
+                    write!(f, " IGNORE NULLS")?;
+                } else {
+                    write!(f, " RESPECT NULLS")?;
+                }
+            }
             write!(f, " OVER {window}")?;
         }
         Ok(())
