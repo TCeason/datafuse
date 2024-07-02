@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -107,7 +108,6 @@ pub struct ChunkFillAndReorder {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FillAndReorder {
     pub source_schema: DataSchemaRef,
-    pub catalog_info: CatalogInfo,
     pub target_table_info: TableInfo,
 }
 
@@ -120,7 +120,7 @@ pub struct ChunkAppendData {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SerializableTable {
-    pub target_catalog_info: CatalogInfo,
+    pub target_catalog_info: Arc<CatalogInfo>,
     pub target_table_info: TableInfo,
 }
 

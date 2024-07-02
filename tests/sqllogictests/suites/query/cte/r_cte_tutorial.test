@@ -105,7 +105,6 @@ SELECT * FROM ctename;
 7566 JONES
 7902 FORD
 
-
 statement ok
 CREATE OR REPLACE VIEW ctenames AS (
   WITH RECURSIVE ctename AS (

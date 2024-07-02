@@ -111,13 +111,11 @@ use volo_thrift::transport::pool;
 use super::hive_database::HiveDatabase;
 use crate::hive_table::HiveTable;
 
-pub const HIVE_CATALOG: &str = "hive";
-
 #[derive(Debug)]
 pub struct HiveCreator;
 
 impl CatalogCreator for HiveCreator {
-    fn try_create(&self, info: &CatalogInfo) -> Result<Arc<dyn Catalog>> {
+    fn try_create(&self, info: Arc<CatalogInfo>) -> Result<Arc<dyn Catalog>> {
         let opt = match &info.meta.catalog_option {
             CatalogOption::Hive(opt) => opt,
             _ => unreachable!(
@@ -137,7 +135,7 @@ impl CatalogCreator for HiveCreator {
 
 #[derive(Clone)]
 pub struct HiveCatalog {
-    info: CatalogInfo,
+    info: Arc<CatalogInfo>,
 
     /// storage params for this hive catalog
     ///
@@ -162,7 +160,7 @@ impl Debug for HiveCatalog {
 
 impl HiveCatalog {
     pub fn try_create(
-        info: CatalogInfo,
+        info: Arc<CatalogInfo>,
         sp: Option<StorageParams>,
         hms_address: impl Into<String>,
     ) -> Result<HiveCatalog> {
@@ -272,7 +270,7 @@ impl Catalog for HiveCatalog {
         self.info.name_ident.catalog_name.clone()
     }
 
-    fn info(&self) -> CatalogInfo {
+    fn info(&self) -> Arc<CatalogInfo> {
         self.info.clone()
     }
 
@@ -425,8 +423,12 @@ impl Catalog for HiveCatalog {
             .get_schema(FastStr::new(db_name), FastStr::new(table_name))
             .await
             .map_err(from_thrift_error)?;
-        let table_info: TableInfo =
-            super::converters::try_into_table_info(self.sp.clone(), table_meta, fields)?;
+        let table_info: TableInfo = super::converters::try_into_table_info(
+            self.info.clone(),
+            self.sp.clone(),
+            table_meta,
+            fields,
+        )?;
         let res: Arc<dyn Table> = Arc::new(HiveTable::try_create(table_info)?);
 
         Ok(res)
