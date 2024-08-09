@@ -186,18 +186,20 @@ pub fn set_operation_element(i: Input) -> IResult<WithSpan<SetOperationElement>>
         |(_, set_expr, _)| SetOperationElement::Group(set_expr),
     );
 
-    let (rest, (span, elem)) = consumed(rule! {
-        #group
-        | #with
-        | #set_operator
-        | #select_stmt
-        | #values
-        | #order_by
-        | #limit
-        | #offset
-        | #ignore_result
-    })(i)?;
-    Ok((rest, WithSpan { span, elem }))
+    map(
+        consumed(rule! {
+            #group
+            | #with
+            | #set_operator
+            | #select_stmt
+            | #values
+            | #order_by
+            | #limit
+            | #offset
+            | #ignore_result
+        }),
+        |(span, elem)| WithSpan { span, elem },
+    )(i)
 }
 
 struct SetOperationParser;
@@ -1097,6 +1099,18 @@ pub fn window_spec_ident(i: Input) -> IResult<Window> {
             |window_name| Window::WindowReference(WindowRef { window_name }),
         ),
     ))(i)
+}
+
+pub fn window_function(i: Input) -> IResult<WindowDesc> {
+    map(
+        rule! {
+        (( IGNORE | RESPECT ) ~ NULLS)? ~ (OVER ~ #window_spec_ident)
+        },
+        |(opt_ignore_nulls, window)| WindowDesc {
+            ignore_nulls: opt_ignore_nulls.map(|key| key.0.kind == IGNORE),
+            window: window.1,
+        },
+    )(i)
 }
 
 pub fn window_clause(i: Input) -> IResult<WindowDefinition> {

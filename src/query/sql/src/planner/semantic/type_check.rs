@@ -842,10 +842,22 @@ impl<'a> TypeChecker<'a> {
                         ))
                         .set_span(*span));
                     }
-                    let func = self.resolve_general_window_function(*span, func_name, &args)?;
                     let window = window.as_ref().unwrap();
+                    let rank_window = ["first_value", "first", "last_value", "last", "nth_value"];
+                    if !rank_window.contains(&func_name) && window.ignore_nulls.is_some() {
+                        return Err(ErrorCode::SemanticError(format!(
+                            "window function {func_name} not support IGNORE/RESPECT NULLS option"
+                        ))
+                        .set_span(*span));
+                    }
+                    let func = self.resolve_general_window_function(
+                        *span,
+                        func_name,
+                        &args,
+                        &window.ignore_nulls,
+                    )?;
                     let display_name = format!("{:#}", expr);
-                    self.resolve_window(*span, display_name, window, func)?
+                    self.resolve_window(*span, display_name, &window.window, func)?
                 } else if AggregateFunctionFactory::instance().contains(func_name) {
                     let mut new_params = Vec::with_capacity(params.len());
                     for param in params {
@@ -875,8 +887,15 @@ impl<'a> TypeChecker<'a> {
                     if let Some(window) = window {
                         // aggregate window function
                         let display_name = format!("{:#}", expr);
+                        if window.ignore_nulls.is_some() {
+                            return Err(ErrorCode::SemanticError(format!(
+                                "window function {func_name} not support IGNORE/RESPECT NULLS option"
+                            ))
+                                .set_span(*span));
+                        }
+                        // general window function
                         let func = WindowFuncType::Aggregate(new_agg_func);
-                        self.resolve_window(*span, display_name, window, func)?
+                        self.resolve_window(*span, display_name, &window.window, func)?
                     } else {
                         // aggregate function
                         Box::new((new_agg_func.into(), data_type))
@@ -1405,6 +1424,7 @@ impl<'a> TypeChecker<'a> {
         span: Span,
         func_name: &str,
         args: &[&Expr],
+        window_ignore_null: &Option<bool>,
     ) -> Result<WindowFuncType> {
         if matches!(
             self.bind_context.expr_context,
@@ -1447,13 +1467,20 @@ impl<'a> TypeChecker<'a> {
         }
         self.in_window_function = false;
 
+        // If { IGNORE | RESPECT } NULLS is not specified, the default is RESPECT NULLS
+        // (i.e. a NULL value will be returned if the expression contains a NULL value and it is the first value in the expression).
+        let ignore_null = if let Some(ignore_null) = window_ignore_null {
+            *ignore_null
+        } else {
+            false
+        };
+
         match func_name {
             "lag" | "lead" => {
                 self.resolve_lag_lead_window_function(func_name, &arguments, &arg_types)
             }
-            "first_value" | "first" | "last_value" | "last" | "nth_value" => {
-                self.resolve_nth_value_window_function(func_name, &arguments, &arg_types)
-            }
+            "first_value" | "first" | "last_value" | "last" | "nth_value" => self
+                .resolve_nth_value_window_function(func_name, &arguments, &arg_types, ignore_null),
             "ntile" => self.resolve_ntile_window_function(&arguments),
             _ => Err(ErrorCode::UnknownFunction(format!(
                 "Unknown window function: {func_name}"
@@ -1533,6 +1560,7 @@ impl<'a> TypeChecker<'a> {
         func_name: &str,
         args: &[ScalarExpr],
         arg_types: &[DataType],
+        ignore_null: bool,
     ) -> Result<WindowFuncType> {
         Ok(match func_name {
             "first_value" | "first" => {
@@ -1547,6 +1575,7 @@ impl<'a> TypeChecker<'a> {
                     n: Some(1),
                     arg: Box::new(args[0].clone()),
                     return_type: Box::new(return_type),
+                    ignore_null,
                 })
             }
             "last_value" | "last" => {
@@ -1561,6 +1590,7 @@ impl<'a> TypeChecker<'a> {
                     n: None,
                     arg: Box::new(args[0].clone()),
                     return_type: Box::new(return_type),
+                    ignore_null,
                 })
             }
             _ => {
@@ -1595,6 +1625,7 @@ impl<'a> TypeChecker<'a> {
                     n: Some(n),
                     arg: Box::new(args[0].clone()),
                     return_type: Box::new(return_type),
+                    ignore_null,
                 })
             }
         })
@@ -2175,13 +2206,13 @@ impl<'a> TypeChecker<'a> {
         // convert query text to lowercase and remove punctuation characters,
         // so that tantivy query parser can parse the query text as plain text
         // without syntax
-        let formated_query_text: String = query_text
+        let formatted_query_text: String = query_text
             .to_lowercase()
             .chars()
             .map(|v| if v.is_ascii_punctuation() { ' ' } else { v })
             .collect();
 
-        self.resolve_search_function(span, column_refs, &formated_query_text)
+        self.resolve_search_function(span, column_refs, &formatted_query_text)
     }
 
     /// Resolve query search function.
@@ -2766,7 +2797,7 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        let mut data_type = output_context.columns[0].data_type.clone();
+        let box mut data_type = output_context.columns[0].data_type.clone();
 
         let rel_expr = RelExpr::with_s_expr(&s_expr);
         let rel_prop = rel_expr.derive_relational_prop()?;
@@ -2774,12 +2805,16 @@ impl<'a> TypeChecker<'a> {
         let mut child_scalar = None;
         if let Some(expr) = child_expr {
             assert_eq!(output_context.columns.len(), 1);
-            let box (scalar, _) = self.resolve(&expr)?;
+            let box (scalar, expr_ty) = self.resolve(&expr)?;
             child_scalar = Some(Box::new(scalar));
+            // wrap nullable to make sure expr and list values have common type.
+            if expr_ty.is_nullable() {
+                data_type = data_type.wrap_nullable();
+            }
         }
 
         if typ.eq(&SubqueryType::Scalar) {
-            data_type = Box::new(data_type.wrap_nullable());
+            data_type = data_type.wrap_nullable();
         }
         let subquery_expr = SubqueryExpr {
             span: subquery.span,
@@ -2788,7 +2823,7 @@ impl<'a> TypeChecker<'a> {
             compare_op,
             output_column: output_context.columns[0].clone(),
             projection_index: None,
-            data_type: data_type.clone(),
+            data_type: Box::new(data_type),
             typ,
             outer_columns: rel_prop.outer_columns.clone(),
             contain_agg,
@@ -2826,6 +2861,7 @@ impl<'a> TypeChecker<'a> {
             "greatest",
             "least",
             "stream_has_data",
+            "getvariable",
         ]
     }
 
@@ -3177,6 +3213,30 @@ impl<'a> TypeChecker<'a> {
             ("least", args) => {
                 let (array, _) = *self.resolve_function(span, "array", vec![], args).ok()?;
                 Some(self.resolve_scalar_function_call(span, "array_min", vec![], vec![array]))
+            }
+            ("getvariable", args) => {
+                if args.len() != 1 {
+                    return None;
+                }
+                let box (scalar, _) = self.resolve(args[0]).ok()?;
+
+                if let Ok(arg) = ConstantExpr::try_from(scalar) {
+                    if let Scalar::String(var_name) = arg.value {
+                        let var_value = self.ctx.get_variable(&var_name).unwrap_or(Scalar::Null);
+                        let var_value = shrink_scalar(var_value);
+                        let data_type = var_value.as_ref().infer_data_type();
+                        return Some(Ok(Box::new((
+                            ScalarExpr::ConstantExpr(ConstantExpr {
+                                span,
+                                value: var_value,
+                            }),
+                            data_type,
+                        ))));
+                    }
+                }
+                Some(Err(ErrorCode::SemanticError(
+                    "Variable name must be a constant string",
+                )))
             }
             _ => None,
         }
@@ -3532,13 +3592,13 @@ impl<'a> TypeChecker<'a> {
         let mut args_map = HashMap::new();
         arguments.iter().enumerate().for_each(|(idx, argument)| {
             if let Some(parameter) = parameters.get(idx) {
-                args_map.insert(parameter, (*argument).clone());
+                args_map.insert(parameter.as_str(), (*argument).clone());
             }
         });
         let udf_expr = self
             .clone_expr_with_replacement(&expr, &|nest_expr| {
                 if let Expr::ColumnRef { column, .. } = nest_expr {
-                    if let Some(arg) = args_map.get(&column.column.name().to_string()) {
+                    if let Some(arg) = args_map.get(column.column.name()) {
                         return Ok(Some(arg.clone()));
                     }
                 }
@@ -3890,10 +3950,14 @@ impl<'a> TypeChecker<'a> {
             Arc::new(const_scan),
         );
 
-        let data_type = ctx.columns[0].data_type.clone();
+        let box mut data_type = ctx.columns[0].data_type.clone();
         let rel_expr = RelExpr::with_s_expr(&distinct_const_scan);
         let rel_prop = rel_expr.derive_relational_prop()?;
-        let box (scalar, _) = self.resolve(expr)?;
+        let box (scalar, expr_ty) = self.resolve(expr)?;
+        // wrap nullable to make sure expr and list values have common type.
+        if expr_ty.is_nullable() {
+            data_type = data_type.wrap_nullable();
+        }
         let child_scalar = Some(Box::new(scalar));
         let subquery_expr = SubqueryExpr {
             span: None,
@@ -3902,7 +3966,7 @@ impl<'a> TypeChecker<'a> {
             compare_op: Some(ComparisonOp::Equal),
             output_column: ctx.columns[0].clone(),
             projection_index: None,
-            data_type: data_type.clone(),
+            data_type: Box::new(data_type),
             typ: SubqueryType::Any,
             outer_columns: rel_prop.outer_columns.clone(),
             contain_agg: None,

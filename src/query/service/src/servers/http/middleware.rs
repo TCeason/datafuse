@@ -17,6 +17,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use databend_common_base::headers::HEADER_DEDUPLICATE_LABEL;
+use databend_common_base::headers::HEADER_NODE_ID;
+use databend_common_base::headers::HEADER_QUERY_ID;
+use databend_common_base::headers::HEADER_TENANT;
 use databend_common_base::runtime::ThreadTracker;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -26,6 +30,7 @@ use databend_common_metrics::http::metrics_incr_http_response_panics_count;
 use databend_common_metrics::http::metrics_incr_http_slow_request_count;
 use databend_common_metrics::http::metrics_observe_http_response_duration;
 use databend_common_storages_fuse::TableContext;
+use fastrace::func_name;
 use headers::authorization::Basic;
 use headers::authorization::Bearer;
 use headers::authorization::Credentials;
@@ -35,7 +40,6 @@ use http::HeaderValue;
 use http::StatusCode;
 use log::error;
 use log::warn;
-use minitrace::func_name;
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::propagation::TextMapPropagator;
@@ -58,11 +62,7 @@ use crate::servers::HttpHandlerKind;
 use crate::sessions::SessionManager;
 use crate::sessions::SessionType;
 
-const DEDUPLICATE_LABEL: &str = "X-DATABEND-DEDUPLICATE-LABEL";
 const USER_AGENT: &str = "User-Agent";
-const QUERY_ID: &str = "X-DATABEND-QUERY-ID";
-const NODE_ID: &str = "X-DATABEND-NODE-ID";
-
 const TRACE_PARENT: &str = "traceparent";
 
 pub struct HTTPSessionMiddleware {
@@ -244,7 +244,7 @@ impl<E> HTTPSessionEndpoint<E> {
 
         let mut session = session_manager.create_session(SessionType::Dummy).await?;
 
-        if let Some(tenant_id) = req.headers().get("X-DATABEND-TENANT") {
+        if let Some(tenant_id) = req.headers().get(HEADER_TENANT) {
             let tenant_id = tenant_id.to_str().unwrap().to_string();
             let tenant = Tenant::new_or_err(tenant_id.clone(), func_name!())?;
             session.set_current_tenant(tenant);
@@ -256,7 +256,7 @@ impl<E> HTTPSessionEndpoint<E> {
 
         let deduplicate_label = req
             .headers()
-            .get(DEDUPLICATE_LABEL)
+            .get(HEADER_DEDUPLICATE_LABEL)
             .map(|id| id.to_str().unwrap().to_string());
 
         let user_agent = req
@@ -266,7 +266,7 @@ impl<E> HTTPSessionEndpoint<E> {
 
         let expected_node_id = req
             .headers()
-            .get(NODE_ID)
+            .get(HEADER_NODE_ID)
             .map(|id| id.to_str().unwrap().to_string());
 
         let trace_parent = req
@@ -306,7 +306,7 @@ impl<E: Endpoint> Endpoint for HTTPSessionEndpoint<E> {
 
         let query_id = req
             .headers()
-            .get(QUERY_ID)
+            .get(HEADER_QUERY_ID)
             .map(|id| id.to_str().unwrap().to_string())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 

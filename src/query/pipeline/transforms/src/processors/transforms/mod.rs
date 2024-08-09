@@ -23,11 +23,10 @@ mod transform_blocking;
 mod transform_compact;
 mod transform_dummy;
 mod transform_multi_sort_merge;
-mod transform_sort_merge_base;
-
 mod transform_pipeline_helper;
 mod transform_retry_async;
 mod transform_sort_merge;
+mod transform_sort_merge_base;
 mod transform_sort_merge_limit;
 
 pub mod transform_sort_partial;
