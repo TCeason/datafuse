@@ -27,8 +27,8 @@ use super::*;
 use crate::ast::quote::QuotedString;
 use crate::ast::statements::connection::CreateConnectionStmt;
 use crate::ast::statements::pipe::CreatePipeStmt;
+use crate::ast::statements::settings::Settings;
 use crate::ast::statements::task::CreateTaskStmt;
-use crate::ast::write_comma_separated_list;
 use crate::ast::CreateOption;
 use crate::ast::Identifier;
 use crate::ast::Query;
@@ -86,14 +86,15 @@ pub enum Statement {
     },
 
     SetStmt {
-        set_type: SetType,
-        identifiers: Vec<Identifier>,
-        values: SetValues,
+        settings: Settings,
     },
 
     UnSetStmt {
-        unset_type: SetType,
-        identifiers: Vec<Identifier>,
+        settings: Settings,
+    },
+
+    ShowVariables {
+        show_options: Option<ShowOptions>,
     },
 
     SetRole {
@@ -154,9 +155,7 @@ pub enum Statement {
     CreateDictionary(CreateDictionaryStmt),
     DropDictionary(DropDictionaryStmt),
     ShowCreateDictionary(ShowCreateDictionaryStmt),
-    ShowDictionaries {
-        show_options: Option<ShowOptions>,
-    },
+    ShowDictionaries(ShowDictionariesStmt),
 
     // Columns
     ShowColumns(ShowColumnsStmt),
@@ -191,6 +190,9 @@ pub enum Statement {
 
     // User
     ShowUsers,
+    DescribeUser {
+        user: UserIdentity,
+    },
     CreateUser(CreateUserStmt),
     AlterUser(AlterUserStmt),
     DropUser {
@@ -259,20 +261,6 @@ pub enum Statement {
     ShowFileFormats,
     Presign(PresignStmt),
 
-    // share
-    CreateShareEndpoint(CreateShareEndpointStmt),
-    ShowShareEndpoint(ShowShareEndpointStmt),
-    DropShareEndpoint(DropShareEndpointStmt),
-    CreateShare(CreateShareStmt),
-    DropShare(DropShareStmt),
-    GrantShareObject(GrantShareObjectStmt),
-    RevokeShareObject(RevokeShareObjectStmt),
-    AlterShareTenants(AlterShareTenantsStmt),
-    DescShare(DescShareStmt),
-    ShowShares(ShowSharesStmt),
-    ShowObjectGrantPrivileges(ShowObjectGrantPrivilegesStmt),
-    ShowGrantsOfShare(ShowGrantsOfShareStmt),
-
     // data mask
     CreateDatamaskPolicy(CreateDatamaskPolicyStmt),
     DropDatamaskPolicy(DropDatamaskPolicyStmt),
@@ -323,6 +311,13 @@ pub enum Statement {
 
     // Stored procedures
     ExecuteImmediate(ExecuteImmediateStmt),
+    CreateProcedure(CreateProcedureStmt),
+    DropProcedure(DropProcedureStmt),
+    ShowProcedures {
+        show_options: Option<ShowOptions>,
+    },
+    DescProcedure(DescProcedureStmt),
+    CallProcedure(CallProcedureStmt),
 
     // Sequence
     CreateSequence(CreateSequenceStmt),
@@ -438,6 +433,12 @@ impl Display for Statement {
                     write!(f, " {show_options}")?;
                 }
             }
+            Statement::ShowVariables { show_options } => {
+                write!(f, "SHOW VARIABLES")?;
+                if let Some(show_options) = show_options {
+                    write!(f, " {show_options}")?;
+                }
+            }
             Statement::ShowProcessList { show_options } => {
                 write!(f, "SHOW PROCESSLIST")?;
                 if let Some(show_options) = show_options {
@@ -492,71 +493,8 @@ impl Display for Statement {
                 }
                 write!(f, " '{object_id}'")?;
             }
-            Statement::SetStmt {
-                set_type,
-                identifiers,
-                values,
-            } => {
-                write!(f, "SET ")?;
-                match *set_type {
-                    SetType::SettingsGlobal => write!(f, "GLOBAL ")?,
-                    SetType::SettingsSession => {}
-                    SetType::Variable => write!(f, "VARIABLE ")?,
-                }
-
-                if identifiers.len() > 1 {
-                    write!(f, "(")?;
-                }
-                for (idx, variable) in identifiers.iter().enumerate() {
-                    if idx > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{variable}")?;
-                }
-                if identifiers.len() > 1 {
-                    write!(f, ")")?;
-                }
-
-                match values {
-                    SetValues::Expr(exprs) => {
-                        write!(f, " = ")?;
-                        if exprs.len() > 1 {
-                            write!(f, "(")?;
-                        }
-
-                        for (idx, value) in exprs.iter().enumerate() {
-                            if idx > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{value}")?;
-                        }
-                        if exprs.len() > 1 {
-                            write!(f, ")")?;
-                        }
-                    }
-                    SetValues::Query(query) => {
-                        write!(f, " = {query}")?;
-                    }
-                }
-            }
-            Statement::UnSetStmt {
-                unset_type,
-                identifiers,
-            } => {
-                write!(f, "UNSET ")?;
-                match *unset_type {
-                    SetType::SettingsSession => write!(f, "SESSION ")?,
-                    SetType::SettingsGlobal => write!(f, "GLOBAL ")?,
-                    SetType::Variable => write!(f, "VARIABLE ")?,
-                }
-                if identifiers.len() == 1 {
-                    write!(f, "{}", identifiers[0])?;
-                } else {
-                    write!(f, "(")?;
-                    write_comma_separated_list(f, identifiers)?;
-                    write!(f, ")")?;
-                }
-            }
+            Statement::SetStmt { settings } => write!(f, "SET {}", settings)?,
+            Statement::UnSetStmt { settings } => write!(f, "UNSET {}", settings)?,
             Statement::SetRole {
                 is_default,
                 role_name,
@@ -607,12 +545,7 @@ impl Display for Statement {
             Statement::CreateDictionary(stmt) => write!(f, "{stmt}")?,
             Statement::DropDictionary(stmt) => write!(f, "{stmt}")?,
             Statement::ShowCreateDictionary(stmt) => write!(f, "{stmt}")?,
-            Statement::ShowDictionaries { show_options } => {
-                write!(f, "SHOW DICTIONARIES")?;
-                if let Some(show_options) = show_options {
-                    write!(f, " {show_options}")?;
-                }
-            }
+            Statement::ShowDictionaries(stmt) => write!(f, "{stmt}")?,
             Statement::CreateView(stmt) => write!(f, "{stmt}")?,
             Statement::AlterView(stmt) => write!(f, "{stmt}")?,
             Statement::DropView(stmt) => write!(f, "{stmt}")?,
@@ -634,6 +567,7 @@ impl Display for Statement {
             Statement::RefreshVirtualColumn(stmt) => write!(f, "{stmt}")?,
             Statement::ShowVirtualColumns(stmt) => write!(f, "{stmt}")?,
             Statement::ShowUsers => write!(f, "SHOW USERS")?,
+            Statement::DescribeUser { user } => write!(f, "DESCRIBE USER {user}")?,
             Statement::ShowRoles => write!(f, "SHOW ROLES")?,
             Statement::CreateUser(stmt) => write!(f, "{stmt}")?,
             Statement::AlterUser(stmt) => write!(f, "{stmt}")?,
@@ -743,18 +677,6 @@ impl Display for Statement {
             Statement::ShowFileFormats => write!(f, "SHOW FILE FORMATS")?,
             Statement::Call(stmt) => write!(f, "{stmt}")?,
             Statement::Presign(stmt) => write!(f, "{stmt}")?,
-            Statement::CreateShareEndpoint(stmt) => write!(f, "{stmt}")?,
-            Statement::ShowShareEndpoint(stmt) => write!(f, "{stmt}")?,
-            Statement::DropShareEndpoint(stmt) => write!(f, "{stmt}")?,
-            Statement::CreateShare(stmt) => write!(f, "{stmt}")?,
-            Statement::DropShare(stmt) => write!(f, "{stmt}")?,
-            Statement::GrantShareObject(stmt) => write!(f, "{stmt}")?,
-            Statement::RevokeShareObject(stmt) => write!(f, "{stmt}")?,
-            Statement::AlterShareTenants(stmt) => write!(f, "{stmt}")?,
-            Statement::DescShare(stmt) => write!(f, "{stmt}")?,
-            Statement::ShowShares(stmt) => write!(f, "{stmt}")?,
-            Statement::ShowObjectGrantPrivileges(stmt) => write!(f, "{stmt}")?,
-            Statement::ShowGrantsOfShare(stmt) => write!(f, "{stmt}")?,
             Statement::CreateDatamaskPolicy(stmt) => write!(f, "{stmt}")?,
             Statement::DropDatamaskPolicy(stmt) => write!(f, "{stmt}")?,
             Statement::DescDatamaskPolicy(stmt) => write!(f, "{stmt}")?,
@@ -795,6 +717,15 @@ impl Display for Statement {
             Statement::DropNotification(stmt) => write!(f, "{stmt}")?,
             Statement::DescribeNotification(stmt) => write!(f, "{stmt}")?,
             Statement::ExecuteImmediate(stmt) => write!(f, "{stmt}")?,
+            Statement::CreateProcedure(stmt) => write!(f, "{stmt}")?,
+            Statement::DropProcedure(stmt) => write!(f, "{stmt}")?,
+            Statement::DescProcedure(stmt) => write!(f, "{stmt}")?,
+            Statement::ShowProcedures { show_options } => {
+                write!(f, "SHOW PROCEDURES")?;
+                if let Some(show_options) = show_options {
+                    write!(f, " {show_options}")?;
+                }
+            }
             Statement::CreateSequence(stmt) => write!(f, "{stmt}")?,
             Statement::DropSequence(stmt) => write!(f, "{stmt}")?,
             Statement::CreateDynamicTable(stmt) => write!(f, "{stmt}")?,
@@ -807,6 +738,7 @@ impl Display for Statement {
                 write!(f, " '{object_id}'")?;
             }
             Statement::System(stmt) => write!(f, "{stmt}")?,
+            Statement::CallProcedure(stmt) => write!(f, "{stmt}")?,
         }
         Ok(())
     }

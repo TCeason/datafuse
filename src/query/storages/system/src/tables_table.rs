@@ -39,6 +39,7 @@ use databend_common_expression::TableSchemaRef;
 use databend_common_expression::TableSchemaRefExt;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_meta_app::principal::OwnershipObject;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
 use databend_common_meta_app::schema::TableIdent;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::schema::TableMeta;
@@ -145,6 +146,10 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 TableField::new("database", TableDataType::String),
                 TableField::new("name", TableDataType::String),
                 TableField::new("table_id", TableDataType::Number(NumberDataType::UInt64)),
+                TableField::new(
+                    "total_columns",
+                    TableDataType::Number(NumberDataType::UInt64),
+                ),
                 TableField::new("engine", TableDataType::String),
                 TableField::new("engine_full", TableDataType::String),
                 TableField::new("cluster_by", TableDataType::String),
@@ -323,6 +328,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 );
             }
         }
+        let catalog_dbs = visibility_checker.get_visibility_database();
 
         for (ctl_name, ctl) in ctls.iter() {
             if let Some(push_downs) = &push_downs {
@@ -356,15 +362,49 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
             }
 
             if dbs.is_empty() || invalid_optimize {
-                dbs = match ctl.list_databases(&tenant).await {
-                    Ok(dbs) => dbs,
-                    Err(err) => {
-                        let msg =
-                            format!("List databases failed on catalog {}: {}", ctl.name(), err);
-                        warn!("{}", msg);
-                        ctx.push_warning(msg);
+                // None means has global level privileges
+                dbs = if let Some(catalog_dbs) = &catalog_dbs {
+                    let mut final_dbs = vec![];
+                    for (catalog_name, dbs) in catalog_dbs {
+                        if ctl.name() == catalog_name.to_string() {
+                            let mut catalog_db_ids = vec![];
+                            let mut catalog_db_names = vec![];
+                            catalog_db_names.extend(
+                                dbs.iter()
+                                    .filter_map(|(db_name, _)| *db_name)
+                                    .map(|db_name| db_name.to_string()),
+                            );
+                            catalog_db_ids.extend(dbs.iter().filter_map(|(_, db_id)| *db_id));
+                            if let Ok(databases) = ctl
+                                .mget_database_names_by_ids(&tenant, &catalog_db_ids)
+                                .await
+                            {
+                                catalog_db_names.extend(databases.into_iter().flatten());
+                            } else {
+                                let msg =
+                                    format!("Failed to get database name by id: {}", ctl.name());
+                                warn!("{}", msg);
+                            }
+                            let db_idents = catalog_db_names
+                                .iter()
+                                .map(|name| DatabaseNameIdent::new(&tenant, name))
+                                .collect::<Vec<DatabaseNameIdent>>();
+                            let dbs = ctl.mget_databases(&tenant, &db_idents).await?;
+                            final_dbs.extend(dbs);
+                        }
+                    }
+                    final_dbs
+                } else {
+                    match ctl.list_databases(&tenant).await {
+                        Ok(dbs) => dbs,
+                        Err(err) => {
+                            let msg =
+                                format!("List databases failed on catalog {}: {}", ctl.name(), err);
+                            warn!("{}", msg);
+                            ctx.push_warning(msg);
 
-                        vec![]
+                            vec![]
+                        }
                     }
                 }
             }
@@ -391,7 +431,6 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 let db_name = db.name();
                 let tables = if tables_names.is_empty()
                     || tables_names.len() > 10
-                    || WITH_HISTORY
                     || invalid_tables_ids
                     || invalid_optimize
                 {
@@ -414,15 +453,33 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                             continue;
                         }
                     }
+                } else if WITH_HISTORY {
+                    // Only can call get_table
+                    let mut tables = Vec::new();
+                    for table_name in &tables_names {
+                        match ctl.get_table_history(&tenant, db_name, table_name).await {
+                            Ok(t) => tables.extend(t),
+                            Err(err) => {
+                                let msg = format!(
+                                    "Failed to get_table_history tables in database: {}, {}",
+                                    db_name, err
+                                );
+                                // warn no need to pad in ctx
+                                warn!("{}", msg);
+                                continue;
+                            }
+                        }
+                    }
+                    tables
                 } else {
-                    // Only without history can call get_table
+                    // Only can call get_table
                     let mut tables = Vec::new();
                     for table_name in &tables_names {
                         match ctl.get_table(&tenant, db_name, table_name).await {
                             Ok(t) => tables.push(t),
                             Err(err) => {
                                 let msg = format!(
-                                    "Failed to list tables in database: {}, {}",
+                                    "Failed to get table in database: {}, {}",
                                     db_name, err
                                 );
                                 // warn no need to pad in ctx
@@ -534,6 +591,10 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
             .iter()
             .map(|v| v.get_table_info().ident.table_id)
             .collect();
+        let total_columns: Vec<u64> = database_tables
+            .iter()
+            .map(|v| v.get_table_info().schema().fields().len() as u64)
+            .collect();
         let engines: Vec<String> = database_tables
             .iter()
             .map(|v| v.engine().to_string())
@@ -625,6 +686,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 StringType::from_data(databases),
                 StringType::from_data(names),
                 UInt64Type::from_data(table_id),
+                UInt64Type::from_data(total_columns),
                 StringType::from_data(engines),
                 StringType::from_data(engines_full),
                 StringType::from_data(cluster_bys),
