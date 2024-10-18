@@ -18,22 +18,15 @@ use std::io::Write;
 
 use databend_common_ast::ast::quote::ident_needs_quote;
 use databend_common_ast::ast::quote::QuotedIdent;
-use databend_common_ast::parser::display_parser_error;
 use databend_common_ast::parser::expr::*;
-use databend_common_ast::parser::parse_sql;
 use databend_common_ast::parser::query::*;
 use databend_common_ast::parser::script::script_block;
 use databend_common_ast::parser::script::script_stmt;
 use databend_common_ast::parser::statement::insert_stmt;
 use databend_common_ast::parser::token::*;
-use databend_common_ast::parser::tokenize_sql;
-use databend_common_ast::parser::Backtrace;
-use databend_common_ast::parser::Dialect;
-use databend_common_ast::parser::IResult;
-use databend_common_ast::parser::Input;
-use databend_common_ast::parser::ParseMode;
-use databend_common_ast::rule;
+use databend_common_ast::parser::*;
 use goldenfile::Mint;
+use nom_rule::rule;
 
 fn run_parser<P, O>(file: &mut dyn Write, parser: P, src: &str)
 where
@@ -147,7 +140,6 @@ fn test_statement() {
         r#"drop table if exists a."b";"#,
         r#"use "a";"#,
         r#"create catalog ctl type=hive connection=(url='<hive-meta-store>' thrift_protocol='binary');"#,
-        r#"create catalog ctl type=share connection=(name='provider.test_share' endpoint='endpoint_name');"#,
         r#"create database if not exists a;"#,
         r#"create database ctl.t engine = Default;"#,
         r#"create database t engine = Default;"#,
@@ -232,10 +224,11 @@ fn test_statement() {
         r#"select * from t sample row (99);"#,
         r#"select * from t sample block (99);"#,
         r#"select * from t sample row (10 rows);"#,
-        r#"select * from t sample block (10 rows);"#,
         r#"select * from numbers(1000) sample row (99);"#,
         r#"select * from numbers(1000) sample block (99);"#,
         r#"select * from numbers(1000) sample row (10 rows);"#,
+        r#"select * from numbers(1000) sample block (99) row (10 rows);"#,
+        r#"select * from numbers(1000) sample block (99) row (10);"#,
         r#"insert into t (c1, c2) values (1, 2), (3, 4);"#,
         r#"insert into t (c1, c2) values (1, 2);"#,
         r#"insert into table t select * from t2;"#,
@@ -551,14 +544,6 @@ fn test_statement() {
         r#"PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200"#,
         r#"PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200 CONTENT_TYPE='application/octet-stream'"#,
         r#"PRESIGN UPLOAD @my_stage/path/to/file CONTENT_TYPE='application/octet-stream' EXPIRE=7200"#,
-        r#"CREATE SHARE ENDPOINT IF NOT EXISTS t URL='http://127.0.0.1' CREDENTIAL=(TYPE='HMAC' KEY='hello') ARGS=(jwks_key_file="https://eks.public/keys" ssl_cert="cert.pem") COMMENT='share endpoint comment';"#,
-        r#"CREATE OR REPLACE SHARE ENDPOINT t URL='http://127.0.0.1' CREDENTIAL=(TYPE='HMAC' KEY='hello') ARGS=(jwks_key_file="https://eks.public/keys" ssl_cert="cert.pem") COMMENT='share endpoint comment';"#,
-        r#"CREATE SHARE t COMMENT='share comment';"#,
-        r#"CREATE SHARE IF NOT EXISTS t;"#,
-        r#"DROP SHARE a;"#,
-        r#"DROP SHARE IF EXISTS a;"#,
-        r#"GRANT USAGE ON DATABASE db1 TO SHARE a;"#,
-        r#"GRANT SELECT ON TABLE db1.tb1 TO SHARE a;"#,
         r#"GRANT all ON stage s1 TO a;"#,
         r#"GRANT read ON stage s1 TO a;"#,
         r#"GRANT write ON stage s1 TO a;"#,
@@ -567,17 +552,8 @@ fn test_statement() {
         r#"GRANT usage ON UDF a TO 'test-grant';"#,
         r#"REVOKE usage ON UDF a FROM 'test-grant';"#,
         r#"REVOKE all ON UDF a FROM 'test-grant';"#,
-        r#"REVOKE USAGE ON DATABASE db1 FROM SHARE a;"#,
-        r#"REVOKE SELECT ON TABLE db1.tb1 FROM SHARE a;"#,
-        r#"ALTER SHARE a ADD TENANTS = b,c;"#,
-        r#"ALTER SHARE IF EXISTS a ADD TENANTS = b,c;"#,
-        r#"ALTER SHARE IF EXISTS a REMOVE TENANTS = b,c;"#,
-        r#"DESC SHARE b;"#,
-        r#"DESCRIBE SHARE b;"#,
-        r#"SHOW SHARES;"#,
         r#"SHOW GRANTS ON TABLE db1.tb1;"#,
         r#"SHOW GRANTS ON DATABASE db;"#,
-        r#"SHOW GRANTS OF SHARE t;"#,
         r#"UPDATE db1.tb1 set a = a + 1, b = 2 WHERE c > 3;"#,
         r#"select $abc + 3"#,
         r#"select IDENTIFIER($abc)"#,
@@ -589,6 +565,8 @@ fn test_statement() {
         r#"UNSET (max_threads, sql_dialect);"#,
         r#"UNSET session (max_threads, sql_dialect);"#,
         r#"SET variable a = 3"#,
+        r#"show variables"#,
+        r#"show variables like 'v%'"#,
         r#"SET variable a = select 3"#,
         r#"SET variable a = (select max(number) from numbers(10))"#,
         r#"select $1 FROM '@my_stage/my data/'"#,
@@ -811,7 +789,7 @@ fn test_statement() {
         r#"DROP FUNCTION binary_reverse;"#,
         r#"DROP FUNCTION isnotempty;"#,
         r#"
-            EXECUTE IMMEDIATE 
+            EXECUTE IMMEDIATE
             $$
             BEGIN
                 LOOP
@@ -841,6 +819,60 @@ fn test_statement() {
             PRIMARY KEY username
             SOURCE (mysql(host='localhost' username='root' password='1234'))
             COMMENT 'This is a comment';"#,
+        // Stored Procedure
+        r#"describe PROCEDURE p1()"#,
+        r#"describe PROCEDURE p1(string, timestamp)"#,
+        r#"drop PROCEDURE p1()"#,
+        r#"drop PROCEDURE if exists p1()"#,
+        r#"drop PROCEDURE p1(int, string)"#,
+        r#"call PROCEDURE p1()"#,
+        r#"call PROCEDURE p1(1, 'x', '2022-02-02'::Date)"#,
+        r#"show PROCEDURES like 'p1%'"#,
+        r#"create or replace PROCEDURE p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE if not exists p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1(a int, b string) returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1() returns table(a string not null, b int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
     ];
 
     for case in cases {
@@ -959,6 +991,30 @@ fn test_statement_error() {
         PRIMARY KEY username
         SOURCE ()
         COMMENT 'This is a comment';"#,
+        // Stored Procedure
+        r#"desc procedure p1"#,
+        r#"desc procedure p1(array, c int)"#,
+        r#"drop procedure p1"#,
+        r#"drop procedure p1(a int)"#,
+        r#"call procedure p1"#,
+        r#"create PROCEDURE p1() returns table(string not null, int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1(int, string) returns table(string not null, int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
     ];
 
     for case in cases {
@@ -1184,6 +1240,7 @@ fn test_expr_error() {
         r#"1 a"#,
         r#"CAST(col1)"#,
         r#"a.add(b)"#,
+        r#"$ abc + 3"#,
         r#"[ x * 100 FOR x in [1,2,3] if x % 2 = 0 ]"#,
         r#"
             G.E.B IS NOT NULL

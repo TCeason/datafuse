@@ -117,7 +117,6 @@ impl DataBlock {
         num_rows: usize,
         meta: Option<BlockMetaInfoPtr>,
     ) -> Self {
-        #[cfg(debug_assertions)]
         Self::check_columns_valid(&columns, num_rows).unwrap();
 
         Self {
@@ -130,12 +129,14 @@ impl DataBlock {
     fn check_columns_valid(columns: &[BlockEntry], num_rows: usize) -> Result<()> {
         for entry in columns.iter() {
             if let Value::Column(c) = &entry.value {
+                #[cfg(debug_assertions)]
                 c.check_valid()?;
                 if c.len() != num_rows {
                     return Err(ErrorCode::Internal(format!(
-                        "DataBlock corrupted, column length mismatch, col: {}, num_rows: {}",
+                        "DataBlock corrupted, column length mismatch, col rows: {}, num_rows: {}, datatype: {}",
                         c.len(),
-                        num_rows
+                        num_rows,
+                        c.data_type()
                     )));
                 }
             }
@@ -239,6 +240,18 @@ impl DataBlock {
         self.columns().iter().map(|entry| entry.memory_size()).sum()
     }
 
+    pub fn consume_convert_to_full(self) -> Self {
+        if self
+            .columns()
+            .iter()
+            .all(|entry| entry.value.as_column().is_some())
+        {
+            return self;
+        }
+
+        self.convert_to_full()
+    }
+
     pub fn convert_to_full(&self) -> Self {
         let columns = self
             .columns()
@@ -263,6 +276,12 @@ impl DataBlock {
     }
 
     pub fn slice(&self, range: Range<usize>) -> Self {
+        assert!(
+            range.end <= self.num_rows(),
+            "range {:?} out of len {}",
+            range,
+            self.num_rows()
+        );
         let columns = self
             .columns()
             .iter()
@@ -278,7 +297,11 @@ impl DataBlock {
             .collect();
         Self {
             columns,
-            num_rows: range.end - range.start,
+            num_rows: if range.is_empty() {
+                0
+            } else {
+                range.end - range.start
+            },
             meta: self.meta.clone(),
         }
     }
@@ -318,16 +341,19 @@ impl DataBlock {
         res
     }
 
-    pub fn split_by_rows_if_needed_no_tail(&self, min_rows_per_block: usize) -> Vec<Self> {
-        let max_rows_per_block = min_rows_per_block * 2;
+    pub fn split_by_rows_if_needed_no_tail(&self, rows_per_block: usize) -> Vec<Self> {
+        // Since rows_per_block represents the expected number of rows per block,
+        // and the minimum number of rows per block is 0.8 * rows_per_block,
+        // the maximum is taken as 1.8 * rows_per_block.
+        let max_rows_per_block = (rows_per_block * 9).div_ceil(5);
         let mut res = vec![];
         let mut offset = 0;
         let mut remain_rows = self.num_rows;
         while remain_rows >= max_rows_per_block {
-            let cut = self.slice(offset..(offset + min_rows_per_block));
+            let cut = self.slice(offset..(offset + rows_per_block));
             res.push(cut);
-            offset += min_rows_per_block;
-            remain_rows -= min_rows_per_block;
+            offset += rows_per_block;
+            remain_rows -= rows_per_block;
         }
         res.push(self.slice(offset..(offset + remain_rows)));
         res
