@@ -35,6 +35,7 @@ use databend_common_storages_system::ConfigsTable;
 use databend_common_storages_system::ContributorsTable;
 use databend_common_storages_system::CreditsTable;
 use databend_common_storages_system::DatabasesTable;
+use databend_common_storages_system::DictionariesTable;
 use databend_common_storages_system::EnginesTable;
 use databend_common_storages_system::FullStreamsTable;
 use databend_common_storages_system::FunctionsTable;
@@ -47,6 +48,7 @@ use databend_common_storages_system::NotificationHistoryTable;
 use databend_common_storages_system::NotificationsTable;
 use databend_common_storages_system::OneTable;
 use databend_common_storages_system::PasswordPoliciesTable;
+use databend_common_storages_system::ProceduresTable;
 use databend_common_storages_system::ProcessesTable;
 use databend_common_storages_system::QueriesProfilingTable;
 use databend_common_storages_system::QueryCacheTable;
@@ -142,6 +144,8 @@ impl SystemDatabase {
             ViewsTableWithHistory::create(sys_db_meta.next_table_id()),
             ViewsTableWithoutHistory::create(sys_db_meta.next_table_id()),
             TemporaryTablesTable::create(sys_db_meta.next_table_id()),
+            ProceduresTable::create(sys_db_meta.next_table_id()),
+            DictionariesTable::create(sys_db_meta.next_table_id()),
         ];
 
         let disable_tables = Self::disable_system_tables();

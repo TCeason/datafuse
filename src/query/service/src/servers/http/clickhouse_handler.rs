@@ -27,8 +27,7 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_formats::ClickhouseFormatType;
 use databend_common_formats::FileFormatOptionsExt;
 use databend_common_formats::FileFormatTypeExt;
-use databend_common_sql::Planner;
-use fastrace::full_name;
+use fastrace::func_path;
 use fastrace::prelude::*;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -56,9 +55,7 @@ use crate::interpreters::InterpreterFactory;
 use crate::interpreters::InterpreterPtr;
 use crate::servers::http::middleware::sanitize_request_headers;
 use crate::servers::http::v1::HttpQueryContext;
-use crate::sessions::QueriesQueueManager;
 use crate::sessions::QueryContext;
-use crate::sessions::QueryEntry;
 use crate::sessions::SessionType;
 use crate::sessions::TableContext;
 
@@ -227,7 +224,7 @@ pub async fn clickhouse_handler_get(
     Query(params): Query<StatementHandlerParams>,
     headers: &HeaderMap,
 ) -> PoemResult<WithContentType<Body>> {
-    let root = Span::root(full_name!(), SpanContext::random());
+    let root = Span::root(func_path!(), SpanContext::random());
     async {
         let session = ctx.upgrade_session(SessionType::ClickHouseHttpHandler)?;
         if let Some(db) = &params.database {
@@ -256,16 +253,11 @@ pub async fn clickhouse_handler_get(
         let default_format = get_default_format(&params, headers).map_err(BadRequest)?;
         let sql = params.query();
         // Use interpreter_plan_sql, we can write the query log if an error occurs.
-        let (plan, extras) = interpreter_plan_sql(context.clone(), &sql)
+        let (plan, extras, _guard) = interpreter_plan_sql(context.clone(), &sql, true)
             .await
             .map_err(|err| err.display_with_sql(&sql))
             .map_err(BadRequest)?;
 
-        let query_entry = QueryEntry::create(&context, &plan, &extras).map_err(BadRequest)?;
-        let _guard = QueriesQueueManager::instance()
-            .acquire(query_entry)
-            .await
-            .map_err(BadRequest)?;
         let format = get_format_with_default(extras.format, default_format)?;
         let interpreter = InterpreterFactory::get(context.clone(), &plan)
             .await
@@ -288,7 +280,7 @@ pub async fn clickhouse_handler_post(
     Query(params): Query<StatementHandlerParams>,
     headers: &HeaderMap,
 ) -> PoemResult<impl IntoResponse> {
-    let root = Span::root(full_name!(), SpanContext::random());
+    let root = Span::root(func_path!(), SpanContext::random());
 
     async {
         info!(
@@ -330,23 +322,24 @@ pub async fn clickhouse_handler_post(
         // other parts of the request already logged in middleware
         let len = sql.len();
         let msg = if len > n {
-            format!("{}...(omit {} bytes)", short_sql(sql.clone()), len - n)
+            format!(
+                "{}...(omit {} bytes)",
+                short_sql(
+                    sql.clone(),
+                    ctx.get_settings()
+                        .get_short_sql_max_length()
+                        .unwrap_or(1000)
+                ),
+                len - n
+            )
         } else {
             sql.to_string()
         };
         info!("receive clickhouse http post, (query + body) = {}", &msg);
 
-        let mut planner = Planner::new(ctx.clone());
-        let (mut plan, extras) = planner
-            .plan_sql(&sql)
+        let (mut plan, extras, _guard) = interpreter_plan_sql(ctx.clone(), &sql, true)
             .await
             .map_err(|err| err.display_with_sql(&sql))
-            .map_err(BadRequest)?;
-
-        let entry = QueryEntry::create(&ctx, &plan, &extras).map_err(BadRequest)?;
-        let _guard = QueriesQueueManager::instance()
-            .acquire(entry)
-            .await
             .map_err(BadRequest)?;
 
         let mut handle = None;

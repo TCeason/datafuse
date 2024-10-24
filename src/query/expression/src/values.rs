@@ -26,6 +26,7 @@ use databend_common_arrow::arrow::bitmap::Bitmap;
 use databend_common_arrow::arrow::bitmap::MutableBitmap;
 use databend_common_arrow::arrow::buffer::Buffer;
 use databend_common_arrow::arrow::trusted_len::TrustedLen;
+use databend_common_base::base::OrderedFloat;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_io::prelude::BinaryRead;
@@ -36,7 +37,6 @@ use geo::Point;
 use geozero::CoordDimensions;
 use geozero::ToWkb;
 use itertools::Itertools;
-use ordered_float::OrderedFloat;
 use roaring::RoaringTreemap;
 use serde::de::Visitor;
 use serde::Deserialize;
@@ -78,7 +78,7 @@ use crate::types::number::F64;
 use crate::types::string::StringColumn;
 use crate::types::string::StringColumnBuilder;
 use crate::types::string::StringDomain;
-use crate::types::timestamp::check_timestamp;
+use crate::types::timestamp::clamp_timestamp;
 use crate::types::timestamp::TIMESTAMP_MAX;
 use crate::types::timestamp::TIMESTAMP_MIN;
 use crate::types::variant::JSONB_NULL;
@@ -884,8 +884,26 @@ impl PartialOrd for Column {
             (Column::Geography(col1), Column::Geography(col2)) => {
                 col1.iter().partial_cmp(col2.iter())
             }
-            _ => None,
+            (a, b) => {
+                if a.len() != b.len() {
+                    a.len().partial_cmp(&b.len())
+                } else {
+                    for (l, r) in AnyType::iter_column(a).zip(AnyType::iter_column(b)) {
+                        match l.partial_cmp(&r) {
+                            Some(Ordering::Equal) => {}
+                            other => return other,
+                        }
+                    }
+                    Some(Ordering::Equal)
+                }
+            }
         }
+    }
+}
+
+impl Ord for Column {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -2037,8 +2055,8 @@ impl ColumnBuilder {
                 string::CheckUTF8::check_utf8(&(&builder.data[last..last + offset])).unwrap();
             }
             ColumnBuilder::Timestamp(builder) => {
-                let value: i64 = reader.read_scalar()?;
-                check_timestamp(value)?;
+                let mut value: i64 = reader.read_scalar()?;
+                clamp_timestamp(&mut value);
                 builder.push(value);
             }
             ColumnBuilder::Date(builder) => {
@@ -2139,8 +2157,8 @@ impl ColumnBuilder {
             ColumnBuilder::Timestamp(builder) => {
                 for row in 0..rows {
                     let mut reader = &reader[step * row..];
-                    let value: i64 = reader.read_scalar()?;
-                    check_timestamp(value)?;
+                    let mut value: i64 = reader.read_scalar()?;
+                    clamp_timestamp(&mut value);
                     builder.push(value);
                 }
             }

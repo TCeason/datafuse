@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::ops::Range;
@@ -22,6 +23,7 @@ use databend_common_arrow::arrow::buffer::Buffer;
 use databend_common_exception::ErrorCode;
 use databend_common_io::cursor_ext::BufferReadDateTimeExt;
 use databend_common_io::cursor_ext::ReadBytesExt;
+use log::error;
 use num_traits::AsPrimitive;
 
 use super::number::SimpleDomain;
@@ -45,12 +47,14 @@ pub const DATE_MIN: i32 = -354285;
 pub const DATE_MAX: i32 = 2932896;
 
 /// Check if date is within range.
+/// /// If days is invalid convert to DATE_MIN.
 #[inline]
-pub fn check_date(days: i64) -> Result<i32, String> {
+pub fn clamp_date(days: i64) -> i32 {
     if (DATE_MIN as i64..=DATE_MAX as i64).contains(&days) {
-        Ok(days as i32)
+        days as i32
     } else {
-        Err("date is out of range".to_string())
+        error!("{}", format!("date {} is out of range", days));
+        DATE_MIN
     }
 }
 
@@ -183,6 +187,11 @@ impl ValueType for DateType {
     fn build_scalar(builder: Self::ColumnBuilder) -> Self::Scalar {
         assert_eq!(builder.len(), 1);
         builder[0]
+    }
+
+    #[inline(always)]
+    fn compare(lhs: Self::ScalarRef<'_>, rhs: Self::ScalarRef<'_>) -> Ordering {
+        lhs.cmp(&rhs)
     }
 
     #[inline(always)]

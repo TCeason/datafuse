@@ -478,7 +478,7 @@ impl<'a, R: Rng> SqlGenerator<'a, R> {
             alias: None,
             // TODO
             temporal: None,
-            consume: false,
+            with_options: None,
             // TODO
             pivot: None,
             // TODO
@@ -692,6 +692,8 @@ impl<'a, R: Rng> SqlGenerator<'a, R> {
             lateral: false,
             subquery: Box::new(subquery),
             alias: Some(alias),
+            pivot: None,
+            unpivot: None,
         }
     }
 
