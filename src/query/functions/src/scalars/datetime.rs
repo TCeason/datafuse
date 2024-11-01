@@ -156,10 +156,11 @@ fn register_convert_timezone(registry: &mut FunctionRegistry) {
                 let t_tz: Tz = match target_tz.parse() {
                     Ok(tz) => tz,
                     Err(e) => {
-                        return ctx.set_error(
+                        ctx.set_error(
                             output.len(),
                             format!("cannot parse target `timezone`. {}", e),
                         );
+                        return output.push_default();
                     }
                 };
 
@@ -173,9 +174,15 @@ fn register_convert_timezone(registry: &mut FunctionRegistry) {
                 match offset_as_micros_sec.checked_mul(MICROS_PER_SEC) {
                     Some(offset) => match result_timestamp.checked_add(offset) {
                         Some(res) => output.push(res),
-                        None => ctx.set_error(output.len(), "calc final time error".to_string()),
+                        None => {
+                            ctx.set_error(output.len(), "calc final time error".to_string());
+                            output.push_default();
+                        }
                     },
-                    None => ctx.set_error(output.len(), "calc time offset error".to_string()),
+                    None => {
+                        ctx.set_error(output.len(), "calc time offset error".to_string());
+                        output.push_default();
+                    }
                 }
             },
         ),
