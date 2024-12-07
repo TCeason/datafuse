@@ -10,11 +10,13 @@ edition = { workspace = true }
 doctest = false
 test = true
 
+[features]
+jemalloc = ["databend-common-base/jemalloc", "tikv-jemalloc-ctl"]
+
 [dependencies]
 async-backtrace = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 databend-common-ast = { workspace = true }
 databend-common-base = { workspace = true }
 databend-common-catalog = { workspace = true }
@@ -39,6 +41,7 @@ databend-common-users = { workspace = true }
 databend-storages-common-cache = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
+jiff = { workspace = true }
 jsonb = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
@@ -47,9 +50,9 @@ parking_lot = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_repr = "0.1.9"
-snailquote = "0.3.1"
-tikv-jemalloc-ctl = { workspace = true }
+serde_repr = { workspace = true }
+snailquote = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 typetag = { workspace = true }
 
 [build-dependencies]

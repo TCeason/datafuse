@@ -15,7 +15,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -27,12 +26,14 @@ use databend_common_base::base::short_sql;
 use databend_common_base::base::Progress;
 use databend_common_base::runtime::drop_guard;
 use databend_common_base::runtime::Runtime;
+use databend_common_catalog::catalog::Catalog;
 use databend_common_catalog::catalog::CatalogManager;
 use databend_common_catalog::merge_into_join::MergeIntoJoin;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::runtime_filter_info::RuntimeFilterInfo;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterReady;
 use databend_common_catalog::statistics::data_cache_statistics::DataCacheMetrics;
-use databend_common_catalog::table_context::MaterializedCtesBlocks;
+use databend_common_catalog::table_context::ContextError;
 use databend_common_catalog::table_context::StageAttachment;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -66,6 +67,8 @@ type DatabaseAndTable = (String, String, String);
 
 /// Data that needs to be shared in a query context.
 pub struct QueryContextShared {
+    // Query level
+    pub(crate) query_settings: Arc<Settings>,
     /// total_scan_values for scan stats
     pub(in crate::sessions) total_scan_values: Arc<Progress>,
     /// scan_progress for scan metrics of datablocks (uncompressed)
@@ -82,7 +85,7 @@ pub struct QueryContextShared {
     pub(in crate::sessions) window_partition_spill_progress: Arc<Progress>,
     /// result_progress for metrics of result datablocks (uncompressed)
     pub(in crate::sessions) result_progress: Arc<Progress>,
-    pub(in crate::sessions) error: Arc<Mutex<Option<ErrorCode>>>,
+    pub(in crate::sessions) error: Arc<Mutex<Option<ErrorCode<ContextError>>>>,
     pub(in crate::sessions) warnings: Arc<Mutex<Vec<String>>>,
     pub(in crate::sessions) session: Arc<Session>,
     pub(in crate::sessions) runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
@@ -115,19 +118,22 @@ pub struct QueryContextShared {
     pub(in crate::sessions) partitions_shas: Arc<RwLock<Vec<String>>>,
     pub(in crate::sessions) cacheable: Arc<AtomicBool>,
     pub(in crate::sessions) can_scan_from_agg_index: Arc<AtomicBool>,
-    pub(in crate::sessions) num_fragmented_block_hint: Arc<AtomicU64>,
+    pub(in crate::sessions) num_fragmented_block_hint: Arc<Mutex<HashMap<String, u64>>>,
     pub(in crate::sessions) enable_sort_spill: Arc<AtomicBool>,
     // Status info.
     pub(in crate::sessions) status: Arc<RwLock<String>>,
 
     // Client User-Agent
     pub(in crate::sessions) user_agent: Arc<RwLock<String>>,
-    /// Key is (cte index, used_count), value contains cte's materialized blocks
-    pub(in crate::sessions) materialized_cte_tables: MaterializedCtesBlocks,
 
     pub(in crate::sessions) query_profiles: Arc<RwLock<HashMap<Option<u32>, PlanProfile>>>,
 
     pub(in crate::sessions) runtime_filters: Arc<RwLock<HashMap<IndexType, RuntimeFilterInfo>>>,
+
+    pub(in crate::sessions) runtime_filter_ready:
+        Arc<RwLock<HashMap<IndexType, Vec<Arc<RuntimeFilterReady>>>>>,
+
+    pub(in crate::sessions) wait_runtime_filter: Arc<RwLock<HashMap<IndexType, bool>>>,
 
     pub(in crate::sessions) merge_into_join: Arc<RwLock<MergeIntoJoin>>,
 
@@ -143,6 +149,7 @@ impl QueryContextShared {
         cluster_cache: Arc<Cluster>,
     ) -> Result<Arc<QueryContextShared>> {
         Ok(Arc::new(QueryContextShared {
+            query_settings: Settings::create(session.get_current_tenant()),
             catalog_manager: CatalogManager::instance(),
             session,
             cluster_cache,
@@ -173,11 +180,10 @@ impl QueryContextShared {
             partitions_shas: Arc::new(RwLock::new(vec![])),
             cacheable: Arc::new(AtomicBool::new(true)),
             can_scan_from_agg_index: Arc::new(AtomicBool::new(true)),
-            num_fragmented_block_hint: Arc::new(AtomicU64::new(0)),
+            num_fragmented_block_hint: Default::default(),
             enable_sort_spill: Arc::new(AtomicBool::new(true)),
             status: Arc::new(RwLock::new("null".to_string())),
             user_agent: Arc::new(RwLock::new("null".to_string())),
-            materialized_cte_tables: Arc::new(Default::default()),
             join_spill_progress: Arc::new(Progress::create()),
             agg_spill_progress: Arc::new(Progress::create()),
             group_by_spill_progress: Arc::new(Progress::create()),
@@ -185,18 +191,22 @@ impl QueryContextShared {
             query_cache_metrics: DataCacheMetrics::new(),
             query_profiles: Arc::new(RwLock::new(HashMap::new())),
             runtime_filters: Default::default(),
+            runtime_filter_ready: Default::default(),
+            wait_runtime_filter: Default::default(),
             merge_into_join: Default::default(),
             multi_table_insert_status: Default::default(),
             query_queued_duration: Arc::new(RwLock::new(Duration::from_secs(0))),
         }))
     }
 
-    pub fn set_error(&self, err: ErrorCode) {
+    pub fn set_error<C>(&self, err: ErrorCode<C>) {
+        let err = err.with_context("query context error");
+
         let mut guard = self.error.lock();
         *guard = Some(err);
     }
 
-    pub fn get_error(&self) -> Option<ErrorCode> {
+    pub fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         let guard = self.error.lock();
         (*guard).clone()
     }
@@ -231,7 +241,7 @@ impl QueryContextShared {
         *guard = Some(mode);
     }
 
-    pub fn kill(&self, cause: ErrorCode) {
+    pub fn kill<C>(&self, cause: ErrorCode<C>) {
         self.set_error(cause.clone());
 
         if let Some(executor) = self.executor.read().upgrade() {
@@ -251,16 +261,21 @@ impl QueryContextShared {
         self.session.get_current_catalog()
     }
 
+    pub fn set_current_catalog(&self, catalog_name: String) {
+        self.session.set_current_catalog(catalog_name)
+    }
+
     pub fn get_aborting(&self) -> Arc<AtomicBool> {
         self.aborting.clone()
     }
 
-    pub fn check_aborting(&self) -> Result<()> {
+    pub fn check_aborting(&self) -> Result<(), ContextError> {
         if self.aborting.load(Ordering::Acquire) {
             Err(self.get_error().unwrap_or_else(|| {
                 ErrorCode::AbortedQuery(
                     "Aborted query, because the server is shutting down or the query was killed.",
                 )
+                .with_context("query aborted")
             }))
         } else {
             Ok(())
@@ -319,6 +334,7 @@ impl QueryContextShared {
         catalog: &str,
         database: &str,
         table: &str,
+        max_batch_size: Option<u64>,
     ) -> Result<Arc<dyn Table>> {
         // Always get same table metadata in the same query
 
@@ -326,7 +342,10 @@ impl QueryContextShared {
 
         let already_in_cache = { self.tables_refs.lock().contains_key(&table_meta_key) };
         let res = match already_in_cache {
-            false => self.get_table_to_cache(catalog, database, table).await?,
+            false => {
+                self.get_table_to_cache(catalog, database, table, max_batch_size)
+                    .await?
+            }
             true => self
                 .tables_refs
                 .lock()
@@ -344,6 +363,7 @@ impl QueryContextShared {
         catalog_name: &str,
         database: &str,
         table: &str,
+        max_batch_size: Option<u64>,
     ) -> Result<Arc<dyn Table>> {
         let tenant = self.get_tenant();
         let table_meta_key = (
@@ -361,7 +381,7 @@ impl QueryContextShared {
             .await?;
         let cache_table = catalog.get_table(&tenant, database, table).await?;
         let cache_table = self
-            .cache_stream_source_table(cache_table, catalog_name)
+            .cache_stream_source_table(catalog, cache_table, max_batch_size)
             .await?;
 
         let mut tables_refs = self.tables_refs.lock();
@@ -376,74 +396,68 @@ impl QueryContextShared {
     #[async_backtrace::framed]
     async fn cache_stream_source_table(
         &self,
+        catalog: Arc<dyn Catalog>,
         table: Arc<dyn Table>,
-        catalog_name: &str,
+        max_batch_size: Option<u64>,
     ) -> Result<Arc<dyn Table>> {
-        if table.is_stream() {
-            let tenant = self.get_tenant();
-            let catalog = self
-                .catalog_manager
-                .get_catalog(
-                    tenant.tenant_name(),
-                    catalog_name,
-                    self.session.session_ctx.session_state(),
-                )
-                .await?;
+        if !table.is_stream() {
+            return Ok(table);
+        }
 
-            let stream = StreamTable::try_from_table(table.as_ref())?;
-            let source_database_name = stream.source_database_name(catalog.as_ref()).await?;
-            let source_table_name = stream.source_table_name(catalog.as_ref()).await?;
-            let meta_key = (
-                catalog_name.to_string(),
-                source_database_name.to_string(),
-                source_table_name.to_string(),
-            );
-            let already_in_cache = { self.tables_refs.lock().contains_key(&meta_key) };
-            let source_table = match already_in_cache {
-                false => {
-                    let stream_desc = &stream.get_table_info().desc;
-                    let source_table = match catalog.get_stream_source_table(stream_desc)? {
+        let stream = StreamTable::try_from_table(table.as_ref())?;
+        let source_database_name = stream.source_database_name(catalog.as_ref()).await?;
+        let source_table_name = stream.source_table_name(catalog.as_ref()).await?;
+        let meta_key = (
+            catalog.name(),
+            source_database_name.to_string(),
+            source_table_name.to_string(),
+        );
+        let already_in_cache = { self.tables_refs.lock().contains_key(&meta_key) };
+        let source_table = match already_in_cache {
+            false => {
+                let stream_desc = &stream.get_table_info().desc;
+                let source_table =
+                    match catalog.get_stream_source_table(stream_desc, max_batch_size)? {
                         Some(source_table) => source_table,
                         None => {
-                            let source_table = catalog
-                                .get_table(&tenant, &source_database_name, &source_table_name)
-                                .await
-                                .map_err(|err| {
-                                    ErrorCode::IllegalStream(format!(
-                                        "Cannot get base table '{}'.'{}' from stream {}, cause: {}",
-                                        source_database_name,
-                                        source_table_name,
-                                        stream_desc,
-                                        err.message()
-                                    ))
-                                })?;
+                            let source_table = stream
+                                .navigate_within_batch_limit(
+                                    catalog.as_ref(),
+                                    &self.get_tenant(),
+                                    &source_database_name,
+                                    &source_table_name,
+                                    max_batch_size,
+                                )
+                                .await?;
                             catalog.cache_stream_source_table(
                                 stream.get_table_info().clone(),
                                 source_table.get_table_info().clone(),
+                                max_batch_size,
                             );
                             source_table
                         }
                     };
 
-                    let mut tables_refs = self.tables_refs.lock();
-                    tables_refs.entry(meta_key).or_insert(source_table.clone());
-                    source_table
-                }
-                true => self
-                    .tables_refs
-                    .lock()
-                    .get(&meta_key)
-                    .ok_or_else(|| ErrorCode::Internal("Logical error, it's a bug."))?
-                    .clone(),
-            };
+                let mut tables_refs = self.tables_refs.lock();
+                tables_refs.entry(meta_key).or_insert(source_table.clone());
+                source_table
+            }
+            true => self
+                .tables_refs
+                .lock()
+                .get(&meta_key)
+                .ok_or_else(|| ErrorCode::Internal("Logical error, it's a bug."))?
+                .clone(),
+        };
 
-            let mut stream_info = stream.get_table_info().to_owned();
-            stream_info.meta.schema = source_table.schema();
+        let mut stream_info = stream.get_table_info().to_owned();
+        stream_info.meta.schema = source_table.schema();
 
-            Ok(StreamTable::create(stream_info, Some(source_table)))
-        } else {
-            Ok(table)
-        }
+        Ok(StreamTable::create(
+            stream_info,
+            max_batch_size,
+            Some(source_table),
+        ))
     }
 
     pub fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
@@ -484,7 +498,12 @@ impl QueryContextShared {
     pub fn attach_query_str(&self, kind: QueryKind, query: String) {
         {
             let mut running_query = self.running_query.write();
-            *running_query = Some(short_sql(query));
+            *running_query = Some(short_sql(
+                query,
+                self.get_settings()
+                    .get_short_sql_max_length()
+                    .unwrap_or(1000),
+            ));
         }
 
         {
@@ -558,7 +577,7 @@ impl QueryContextShared {
             }
             Err(err) => {
                 executor.finish(Some(err.clone()));
-                Err(err)
+                Err(err.with_context("failed to set executor"))
             }
         }
     }

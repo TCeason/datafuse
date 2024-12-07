@@ -20,7 +20,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::AbortChecker;
 use databend_common_expression::BlockThresholds;
 use databend_common_expression::ColumnId;
 use databend_common_expression::RemoteExpr;
@@ -53,6 +52,7 @@ use crate::plan::ReclusterParts;
 use crate::plan::StreamColumn;
 use crate::statistics::BasicColumnStatistics;
 use crate::table_args::TableArgs;
+use crate::table_context::AbortChecker;
 use crate::table_context::TableContext;
 
 #[async_trait::async_trait]
@@ -108,6 +108,10 @@ pub trait Table: Sync + Send {
         false
     }
 
+    fn support_distributed_insert(&self) -> bool {
+        false
+    }
+
     /// whether table has the exact number of total rows
     fn has_exact_total_row_count(&self) -> bool {
         false
@@ -148,6 +152,10 @@ pub trait Table: Sync + Send {
 
     /// Whether the table engine supports virtual columns optimization.
     fn support_virtual_columns(&self) -> bool {
+        false
+    }
+
+    fn storage_format_as_parquet(&self) -> bool {
         false
     }
 
@@ -215,13 +223,8 @@ pub trait Table: Sync + Send {
     }
 
     /// Assembly the pipeline of appending data to storage
-    fn append_data(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        append_mode: AppendMode,
-    ) -> Result<()> {
-        let (_, _, _) = (ctx, pipeline, append_mode);
+    fn append_data(&self, ctx: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
+        let (_, _) = (ctx, pipeline);
 
         Err(ErrorCode::Unimplemented(format!(
             "The 'append_data' operation is not available for the table '{}'. Current table engine: '{}'.",
@@ -332,9 +335,9 @@ pub trait Table: Sync + Send {
         ctx: Arc<dyn TableContext>,
         database_name: &str,
         table_name: &str,
-        consume: bool,
+        with_options: &str,
     ) -> Result<String> {
-        let (_, _, _, _) = (ctx, database_name, table_name, consume);
+        let (_, _, _, _) = (ctx, database_name, table_name, with_options);
 
         Err(ErrorCode::Unimplemented(format!(
             "Change tracking operation is not supported for the table '{}', which uses the '{}' engine.",
@@ -537,13 +540,6 @@ pub enum CompactTarget {
     Blocks(Option<usize>),
     // compact segments
     Segments,
-}
-
-pub enum AppendMode {
-    // From INSERT and RECUSTER operation
-    Normal,
-    // From COPY, Streaming load operation
-    Copy,
 }
 
 pub trait ColumnStatisticsProvider: Send {

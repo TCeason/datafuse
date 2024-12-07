@@ -17,9 +17,10 @@
 use std::ops::BitAnd;
 use std::ops::BitOr;
 use std::ops::BitXor;
+use std::str::FromStr;
 use std::sync::Arc;
 
-use databend_common_arrow::arrow::bitmap::Bitmap;
+use databend_common_expression::serialize::read_decimal_with_size;
 use databend_common_expression::types::decimal::DecimalDomain;
 use databend_common_expression::types::decimal::DecimalType;
 use databend_common_expression::types::nullable::NullableColumn;
@@ -29,6 +30,7 @@ use databend_common_expression::types::number::NumberType;
 use databend_common_expression::types::number::F64;
 use databend_common_expression::types::string::StringColumnBuilder;
 use databend_common_expression::types::AnyType;
+use databend_common_expression::types::Bitmap;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::DecimalDataType;
 use databend_common_expression::types::NullableType;
@@ -45,7 +47,6 @@ use databend_common_expression::types::F32;
 use databend_common_expression::utils::arithmetics_type::ResultTypeOfBinary;
 use databend_common_expression::utils::arithmetics_type::ResultTypeOfUnary;
 use databend_common_expression::values::Value;
-use databend_common_expression::values::ValueRef;
 use databend_common_expression::vectorize_1_arg;
 use databend_common_expression::vectorize_2_arg;
 use databend_common_expression::vectorize_with_builder_1_arg;
@@ -863,7 +864,7 @@ pub fn register_decimal_minus(registry: &mut FunctionRegistry) {
 }
 
 fn unary_minus_decimal(
-    args: &[ValueRef<AnyType>],
+    args: &[Value<AnyType>],
     arg_type: DataType,
     ctx: &mut EvalContext,
 ) -> Value<AnyType> {
@@ -878,18 +879,48 @@ fn unary_minus_decimal(
     })
 }
 
+#[inline]
+fn parse_number<T>(
+    s: &str,
+    number_datatype: &NumberDataType,
+    rounding_mode: bool,
+) -> Result<T, <T as FromStr>::Err>
+where
+    T: FromStr + num_traits::Num,
+{
+    match s.parse::<T>() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if !number_datatype.is_float() {
+                let decimal_pro = number_datatype.get_decimal_properties().unwrap();
+                let (res, _) =
+                    read_decimal_with_size::<i128>(s.as_bytes(), decimal_pro, true, rounding_mode)
+                        .map_err(|_| e)?;
+                format!("{}", res).parse::<T>()
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 fn register_string_to_number(registry: &mut FunctionRegistry) {
     for dest_type in ALL_NUMERICS_TYPES {
         with_number_mapped_type!(|DEST_TYPE| match dest_type {
             NumberDataType::DEST_TYPE => {
                 let name = format!("to_{dest_type}").to_lowercase();
+                let data_type = DEST_TYPE::data_type();
                 registry
                     .register_passthrough_nullable_1_arg::<StringType, NumberType<DEST_TYPE>, _, _>(
                         &name,
                         |_, _| FunctionDomain::MayThrow,
                         vectorize_with_builder_1_arg::<StringType, NumberType<DEST_TYPE>>(
                             move |val, output, ctx| {
-                                match val.parse::<DEST_TYPE>() {
+                                match parse_number::<DEST_TYPE>(
+                                    val,
+                                    &data_type,
+                                    ctx.func_ctx.rounding_mode,
+                                ) {
                                     Ok(new_val) => output.push(new_val),
                                     Err(e) => {
                                         ctx.set_error(output.len(), e.to_string());
@@ -901,6 +932,7 @@ fn register_string_to_number(registry: &mut FunctionRegistry) {
                     );
 
                 let name = format!("try_to_{dest_type}").to_lowercase();
+                let data_type = DEST_TYPE::data_type();
                 registry
                     .register_combine_nullable_1_arg::<StringType, NumberType<DEST_TYPE>, _, _>(
                         &name,
@@ -908,8 +940,12 @@ fn register_string_to_number(registry: &mut FunctionRegistry) {
                         vectorize_with_builder_1_arg::<
                             StringType,
                             NullableType<NumberType<DEST_TYPE>>,
-                        >(|val, output, _| {
-                            if let Ok(new_val) = val.parse::<DEST_TYPE>() {
+                        >(move |val, output, ctx| {
+                            if let Ok(new_val) = parse_number::<DEST_TYPE>(
+                                val,
+                                &data_type,
+                                ctx.func_ctx.rounding_mode,
+                            ) {
                                 output.push(new_val);
                             } else {
                                 output.push_null();
@@ -930,34 +966,29 @@ pub fn register_number_to_string(registry: &mut FunctionRegistry) {
                         "to_string",
                         |_, _| FunctionDomain::Full,
                         |from, _| match from {
-                            ValueRef::Scalar(s) => Value::Scalar(s.to_string()),
-                            ValueRef::Column(from) => {
+                            Value::Scalar(s) => Value::Scalar(s.to_string()),
+                            Value::Column(from) => {
                                 let options = NUM_TYPE::lexical_options();
                                 const FORMAT: u128 = lexical_core::format::STANDARD;
-
-                                let mut builder =
-                                    StringColumnBuilder::with_capacity(from.len(), from.len() + 1);
-                                let values = &mut builder.data;
-
                                 type Native = <NUM_TYPE as Number>::Native;
-                                let mut offset: usize = 0;
-                                unsafe {
-                                    for x in from.iter() {
-                                        values.reserve(offset + Native::FORMATTED_SIZE_DECIMAL);
-                                        values.set_len(offset + Native::FORMATTED_SIZE_DECIMAL);
-                                        let bytes = &mut values[offset..];
+                                let mut builder = StringColumnBuilder::with_capacity(from.len());
 
-                                        let len = lexical_core::write_with_options_unchecked::<
-                                            _,
-                                            FORMAT,
-                                        >(
-                                            Native::from(*x), bytes, &options
+                                unsafe {
+                                    builder.row_buffer.resize(
+                                        <NUM_TYPE as Number>::Native::FORMATTED_SIZE_DECIMAL,
+                                        0,
+                                    );
+                                    for x in from.iter() {
+                                        let len = lexical_core::write_with_options::<_, FORMAT>(
+                                            Native::from(*x),
+                                            &mut builder.row_buffer[0..],
+                                            &options,
                                         )
                                         .len();
-                                        offset += len;
-                                        builder.offsets.push(offset as u64);
+                                        builder.data.push_value(std::str::from_utf8_unchecked(
+                                            &builder.row_buffer[0..len],
+                                        ));
                                     }
-                                    values.set_len(offset);
                                 }
                                 Value::Column(builder.build())
                             }
@@ -967,32 +998,29 @@ pub fn register_number_to_string(registry: &mut FunctionRegistry) {
                     "try_to_string",
                     |_, _| FunctionDomain::Full,
                     |from, _| match from {
-                        ValueRef::Scalar(s) => Value::Scalar(Some(s.to_string())),
-                        ValueRef::Column(from) => {
+                        Value::Scalar(s) => Value::Scalar(Some(s.to_string())),
+                        Value::Column(from) => {
                             let options = NUM_TYPE::lexical_options();
                             const FORMAT: u128 = lexical_core::format::STANDARD;
-                            let mut builder =
-                                StringColumnBuilder::with_capacity(from.len(), from.len() + 1);
-                            let values = &mut builder.data;
-
                             type Native = <NUM_TYPE as Number>::Native;
-                            let mut offset: usize = 0;
+                            let mut builder = StringColumnBuilder::with_capacity(from.len());
+
                             unsafe {
+                                builder.row_buffer.resize(
+                                    <NUM_TYPE as Number>::Native::FORMATTED_SIZE_DECIMAL,
+                                    0,
+                                );
                                 for x in from.iter() {
-                                    values.reserve(offset + Native::FORMATTED_SIZE_DECIMAL);
-                                    values.set_len(offset + Native::FORMATTED_SIZE_DECIMAL);
-                                    let bytes = &mut values[offset..];
-                                    let len =
-                                        lexical_core::write_with_options_unchecked::<_, FORMAT>(
-                                            Native::from(*x),
-                                            bytes,
-                                            &options,
-                                        )
-                                        .len();
-                                    offset += len;
-                                    builder.offsets.push(offset as u64);
+                                    let len = lexical_core::write_with_options::<_, FORMAT>(
+                                        Native::from(*x),
+                                        &mut builder.row_buffer[0..],
+                                        &options,
+                                    )
+                                    .len();
+                                    builder.data.push_value(std::str::from_utf8_unchecked(
+                                        &builder.row_buffer[0..len],
+                                    ));
                                 }
-                                values.set_len(offset);
                             }
                             let result = builder.build();
                             Value::Column(NullableColumn::new(

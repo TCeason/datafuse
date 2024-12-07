@@ -48,7 +48,7 @@ pub use message::ListKVReq;
 pub use message::MGetKVReply;
 pub use message::MGetKVReq;
 pub use message::UpsertKVReply;
-pub use message::UpsertKVReq;
+pub use pair::BasicPair;
 pub use pair::Pair;
 pub use pair::SeqPair;
 pub use prefix::prefix_to_range;

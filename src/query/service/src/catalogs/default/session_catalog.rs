@@ -23,6 +23,7 @@ use databend_common_catalog::table_args::TableArgs;
 use databend_common_catalog::table_function::TableFunction;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
 use databend_common_meta_app::schema::dictionary_name_ident::DictionaryNameIdent;
 use databend_common_meta_app::schema::CatalogInfo;
 use databend_common_meta_app::schema::CommitTableMetaReply;
@@ -40,7 +41,6 @@ use databend_common_meta_app::schema::CreateSequenceReq;
 use databend_common_meta_app::schema::CreateTableIndexReq;
 use databend_common_meta_app::schema::CreateTableReply;
 use databend_common_meta_app::schema::CreateTableReq;
-use databend_common_meta_app::schema::CreateVirtualColumnReply;
 use databend_common_meta_app::schema::CreateVirtualColumnReq;
 use databend_common_meta_app::schema::DeleteLockRevReq;
 use databend_common_meta_app::schema::DictionaryMeta;
@@ -52,7 +52,6 @@ use databend_common_meta_app::schema::DropSequenceReq;
 use databend_common_meta_app::schema::DropTableByIdReq;
 use databend_common_meta_app::schema::DropTableIndexReq;
 use databend_common_meta_app::schema::DropTableReply;
-use databend_common_meta_app::schema::DropVirtualColumnReply;
 use databend_common_meta_app::schema::DropVirtualColumnReq;
 use databend_common_meta_app::schema::DroppedId;
 use databend_common_meta_app::schema::ExtendLockRevReq;
@@ -78,6 +77,7 @@ use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::RenameDatabaseReply;
 use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
 use databend_common_meta_app::schema::RenameTableReply;
 use databend_common_meta_app::schema::RenameTableReq;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
@@ -89,7 +89,6 @@ use databend_common_meta_app::schema::TruncateTableReq;
 use databend_common_meta_app::schema::UndropDatabaseReply;
 use databend_common_meta_app::schema::UndropDatabaseReq;
 use databend_common_meta_app::schema::UndropTableByIdReq;
-use databend_common_meta_app::schema::UndropTableReply;
 use databend_common_meta_app::schema::UndropTableReq;
 use databend_common_meta_app::schema::UpdateDictionaryReply;
 use databend_common_meta_app::schema::UpdateDictionaryReq;
@@ -97,7 +96,6 @@ use databend_common_meta_app::schema::UpdateIndexReply;
 use databend_common_meta_app::schema::UpdateIndexReq;
 use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
 use databend_common_meta_app::schema::UpdateMultiTableMetaResult;
-use databend_common_meta_app::schema::UpdateVirtualColumnReply;
 use databend_common_meta_app::schema::UpdateVirtualColumnReq;
 use databend_common_meta_app::schema::UpsertTableOptionReply;
 use databend_common_meta_app::schema::UpsertTableOptionReq;
@@ -153,6 +151,11 @@ impl Catalog for SessionCatalog {
     // Get the database by name.
     async fn get_database(&self, tenant: &Tenant, db_name: &str) -> Result<Arc<dyn Database>> {
         self.inner.get_database(tenant, db_name).await
+    }
+
+    // List all the databases history.
+    async fn list_databases_history(&self, tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
+        self.inner.list_databases_history(tenant).await
     }
 
     // Get all the databases.
@@ -219,10 +222,7 @@ impl Catalog for SessionCatalog {
         self.inner.list_indexes_by_table_id(req).await
     }
 
-    async fn create_virtual_column(
-        &self,
-        req: CreateVirtualColumnReq,
-    ) -> Result<CreateVirtualColumnReply> {
+    async fn create_virtual_column(&self, req: CreateVirtualColumnReq) -> Result<()> {
         if is_temp_table_id(req.name_ident.table_id()) {
             return Err(ErrorCode::StorageUnsupported(format!(
                 "CreateVirtualColumn: table id {} is a temporary table id",
@@ -232,10 +232,7 @@ impl Catalog for SessionCatalog {
         self.inner.create_virtual_column(req).await
     }
 
-    async fn update_virtual_column(
-        &self,
-        req: UpdateVirtualColumnReq,
-    ) -> Result<UpdateVirtualColumnReply> {
+    async fn update_virtual_column(&self, req: UpdateVirtualColumnReq) -> Result<()> {
         if is_temp_table_id(req.name_ident.table_id()) {
             return Err(ErrorCode::StorageUnsupported(format!(
                 "UpdateVirtualColumn: table id {} is a temporary table id",
@@ -245,10 +242,7 @@ impl Catalog for SessionCatalog {
         self.inner.update_virtual_column(req).await
     }
 
-    async fn drop_virtual_column(
-        &self,
-        req: DropVirtualColumnReq,
-    ) -> Result<DropVirtualColumnReply> {
+    async fn drop_virtual_column(&self, req: DropVirtualColumnReq) -> Result<()> {
         if is_temp_table_id(req.name_ident.table_id()) {
             return Err(ErrorCode::StorageUnsupported(format!(
                 "DropVirtualColumn: table id {} is a temporary table id",
@@ -317,6 +311,14 @@ impl Catalog for SessionCatalog {
         self.inner.get_db_name_by_id(db_id).await
     }
 
+    async fn mget_databases(
+        &self,
+        tenant: &Tenant,
+        db_names: &[DatabaseNameIdent],
+    ) -> Result<Vec<Arc<dyn Database>>> {
+        self.inner.mget_databases(tenant, db_names).await
+    }
+
     // Mget the dbs name by meta ids.
     async fn mget_database_names_by_ids(
         &self,
@@ -369,6 +371,18 @@ impl Catalog for SessionCatalog {
         self.temp_tbl_mgr.lock().list_tables()
     }
 
+    // Get one table identified as dropped by db and table name.
+    async fn get_table_history(
+        &self,
+        tenant: &Tenant,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<Vec<Arc<dyn Table>>> {
+        self.inner
+            .get_table_history(tenant, db_name, table_name)
+            .await
+    }
+
     async fn list_tables_history(
         &self,
         tenant: &Tenant,
@@ -407,11 +421,11 @@ impl Catalog for SessionCatalog {
         self.inner.drop_table_by_id(req).await
     }
 
-    async fn undrop_table(&self, req: UndropTableReq) -> Result<UndropTableReply> {
+    async fn undrop_table(&self, req: UndropTableReq) -> Result<()> {
         self.inner.undrop_table(req).await
     }
 
-    async fn undrop_table_by_id(&self, req: UndropTableByIdReq) -> Result<UndropTableReply> {
+    async fn undrop_table_by_id(&self, req: UndropTableByIdReq) -> Result<()> {
         self.inner.undrop_table_by_id(req).await
     }
 
@@ -608,13 +622,25 @@ impl Catalog for SessionCatalog {
     }
 
     // Get stream source table from buffer by stream desc.
-    fn get_stream_source_table(&self, stream_desc: &str) -> Result<Option<Arc<dyn Table>>> {
+    fn get_stream_source_table(
+        &self,
+        stream_desc: &str,
+        max_batch_size: Option<u64>,
+    ) -> Result<Option<Arc<dyn Table>>> {
         let is_active = self.txn_mgr.lock().is_active();
         if is_active {
             self.txn_mgr
                 .lock()
-                .get_stream_table_source(stream_desc)
-                .map(|table_info| self.get_table_by_info(&table_info))
+                .get_stream_table(stream_desc)
+                .map(|stream| {
+                    if stream.max_batch_size != max_batch_size {
+                        Err(ErrorCode::StorageUnsupported(
+                            "Within the same transaction, the batch size for a stream must remain consistent",
+                        ))
+                    } else {
+                        self.get_table_by_info(&stream.source)
+                    }
+                    })
                 .transpose()
         } else {
             Ok(None)
@@ -622,10 +648,17 @@ impl Catalog for SessionCatalog {
     }
 
     // Cache stream source table to buffer.
-    fn cache_stream_source_table(&self, stream: TableInfo, source: TableInfo) {
+    fn cache_stream_source_table(
+        &self,
+        stream: TableInfo,
+        source: TableInfo,
+        max_batch_size: Option<u64>,
+    ) {
         let is_active = self.txn_mgr.lock().is_active();
         if is_active {
-            self.txn_mgr.lock().upsert_stream_table(stream, source);
+            self.txn_mgr
+                .lock()
+                .upsert_stream_table(stream, source, max_batch_size);
         }
     }
 
@@ -672,6 +705,10 @@ impl Catalog for SessionCatalog {
         req: ListDictionaryReq,
     ) -> Result<Vec<(String, DictionaryMeta)>> {
         self.inner.list_dictionaries(req).await
+    }
+
+    async fn rename_dictionary(&self, req: RenameDictionaryReq) -> Result<()> {
+        self.inner.rename_dictionary(req).await
     }
 }
 

@@ -17,6 +17,7 @@ mod format;
 mod metadata;
 #[allow(clippy::module_inception)]
 mod planner;
+pub mod query_executor;
 mod semantic;
 
 pub mod binder;
@@ -28,6 +29,7 @@ pub mod plans;
 mod stream_column;
 mod udf_validator;
 
+pub use binder::execute_commit_statement;
 pub use binder::parse_result_scan_args;
 pub use binder::BindContext;
 pub use binder::Binder;

@@ -21,6 +21,7 @@ use nom::combinator::map;
 use nom::combinator::not;
 use nom::combinator::value;
 use nom::Slice;
+use nom_rule::rule;
 
 use super::sequence::sequence;
 use crate::ast::*;
@@ -33,19 +34,15 @@ use crate::parser::expr::subexpr;
 use crate::parser::expr::*;
 use crate::parser::input::Input;
 use crate::parser::query::*;
-use crate::parser::share::share_endpoint_uri_location;
 use crate::parser::stage::*;
 use crate::parser::stream::stream_table;
 use crate::parser::token::*;
 use crate::parser::Error;
 use crate::parser::ErrorKind;
-use crate::rule;
 
 pub enum ShowGrantOption {
     PrincipalIdentity(PrincipalIdentity),
     GrantObjectName(GrantObjectName),
-    ShareGrantObjectName(ShareGrantObjectName),
-    ShareName(String),
 }
 
 // (tenant, share name, endpoint name)
@@ -59,7 +56,7 @@ pub enum CreateDatabaseOption {
 pub fn statement_body(i: Input) -> IResult<Statement> {
     let explain = map_res(
         rule! {
-            EXPLAIN ~ ( "(" ~ #comma_separated_list1(explain_option) ~ ")" )? ~ ( AST | SYNTAX | PIPELINE | JOIN | GRAPH | FRAGMENTS | RAW | OPTIMIZED | MEMO )? ~ #statement
+            EXPLAIN ~ ( "(" ~ #comma_separated_list1(explain_option) ~ ")" )? ~ ( AST | SYNTAX | PIPELINE | JOIN | GRAPH | FRAGMENTS | RAW | OPTIMIZED | MEMO | DECORRELATED)? ~ #statement
         },
         |(_, options, opt_kind, statement)| {
             Ok(Statement::Explain {
@@ -77,7 +74,9 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                     Some(TokenKind::FRAGMENTS) => ExplainKind::Fragments,
                     Some(TokenKind::RAW) => ExplainKind::Raw,
                     Some(TokenKind::OPTIMIZED) => ExplainKind::Optimized,
+                    Some(TokenKind::DECORRELATED) => ExplainKind::Decorrelated,
                     Some(TokenKind::MEMO) => ExplainKind::Memo("".to_string()),
+                    Some(TokenKind::GRAPHICAL) => ExplainKind::Graphical,
                     None => ExplainKind::Plan,
                     _ => unreachable!(),
                 },
@@ -86,13 +85,39 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+
+    let query_setting = map_res(
+        rule! {
+            SETTINGS ~ #query_statement_setting? ~ #statement_body
+        },
+        |(_, opt_settings, statement)| {
+            Ok(Statement::StatementWithSettings {
+                settings: opt_settings,
+                stmt: Box::new(statement),
+            })
+        },
+    );
     let explain_analyze = map(
         rule! {
-            EXPLAIN ~ ANALYZE ~ PARTIAL? ~ #statement
+            EXPLAIN ~ ANALYZE ~ (PARTIAL|GRAPHICAL)? ~ #statement
         },
-        |(_, _, partial, statement)| Statement::ExplainAnalyze {
-            partial: partial.is_some(),
-            query: Box::new(statement.stmt),
+        |(_, _, opt_partial_or_graphical, statement)| {
+            let (partial, graphical) = match opt_partial_or_graphical {
+                Some(Token {
+                    kind: TokenKind::PARTIAL,
+                    ..
+                }) => (true, false),
+                Some(Token {
+                    kind: TokenKind::GRAPHICAL,
+                    ..
+                }) => (false, true),
+                _ => (false, false),
+            };
+            Statement::ExplainAnalyze {
+                partial,
+                graphical,
+                query: Box::new(statement.stmt),
+            }
         },
     );
 
@@ -270,6 +295,12 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
         },
         |(_, _, show_options)| Statement::ShowSettings { show_options },
     );
+    let show_variables = map(
+        rule! {
+            SHOW ~ VARIABLES ~ #show_options?
+        },
+        |(_, _, show_options)| Statement::ShowVariables { show_options },
+    );
     let show_stages = value(Statement::ShowStages, rule! { SHOW ~ STAGES });
     let show_process_list = map(
         rule! {
@@ -348,11 +379,14 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
 
     let unset_stmt = map(
         rule! {
-            UNSET ~ #unset_type ~ #unset_source
+            UNSET ~ #set_type ~ #unset_source
         },
         |(_, unset_type, identifiers)| Statement::UnSetStmt {
-            unset_type,
-            identifiers,
+            settings: Settings {
+                set_type: unset_type,
+                identifiers,
+                values: SetValues::None,
+            },
         },
     );
 
@@ -386,9 +420,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ #ident ~ "=" ~ #subexpr(0)
             },
             |(_, set_type, var, _, value)| Statement::SetStmt {
-                set_type,
-                identifiers: vec![var],
-                values: SetValues::Expr(vec![Box::new(value)]),
+                settings: Settings {
+                    set_type,
+                    identifiers: vec![var],
+                    values: SetValues::Expr(vec![Box::new(value)]),
+                },
             },
         ),
         map_res(
@@ -399,9 +435,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             |(_, set_type, _, ids, _, _, _, values, _)| {
                 if ids.len() == values.len() {
                     Ok(Statement::SetStmt {
-                        set_type,
-                        identifiers: ids,
-                        values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+                        settings: Settings {
+                            set_type,
+                            identifiers: ids,
+                            values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+                        },
                     })
                 } else {
                     Err(nom::Err::Failure(ErrorKind::Other(
@@ -415,9 +453,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ #ident ~ "=" ~ #query
             },
             |(_, set_type, var, _, query)| Statement::SetStmt {
-                set_type,
-                identifiers: vec![var],
-                values: SetValues::Query(Box::new(query)),
+                settings: Settings {
+                    set_type,
+                    identifiers: vec![var],
+                    values: SetValues::Query(Box::new(query)),
+                },
             },
         ),
         map(
@@ -425,9 +465,11 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 SET ~ #set_type ~ "(" ~ #comma_separated_list0(ident) ~ ")" ~ "=" ~ #query
             },
             |(_, set_type, _, vars, _, _, query)| Statement::SetStmt {
-                set_type,
-                identifiers: vars,
-                values: SetValues::Query(Box::new(query)),
+                settings: Settings {
+                    set_type,
+                    identifiers: vars,
+                    values: SetValues::Query(Box::new(query)),
+                },
             },
         ),
     ));
@@ -474,6 +516,12 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+    let use_catalog = map(
+        rule! {
+            USE ~ CATALOG ~ #ident
+        },
+        |(_, _, catalog)| Statement::UseCatalog { catalog },
+    );
 
     let show_databases = map(
         rule! {
@@ -487,6 +535,19 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             })
         },
     );
+
+    let show_drop_databases = map(
+        rule! {
+            SHOW ~ DROP ~ ( DATABASES | DATABASES ) ~ ( FROM ~ ^#ident )? ~ #show_limit?
+        },
+        |(_, _, _, opt_catalog, limit)| {
+            Statement::ShowDropDatabases(ShowDropDatabasesStmt {
+                catalog: opt_catalog.map(|(_, catalog)| catalog),
+                limit,
+            })
+        },
+    );
+
     let show_create_database = map(
         rule! {
             SHOW ~ CREATE ~ ( DATABASE | SCHEMA ) ~ #dot_separated_idents_1_to_2
@@ -954,9 +1015,15 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
     );
     let show_dictionaries = map(
         rule! {
-            SHOW ~ DICTIONARIES ~ #show_options?
+            SHOW ~ DICTIONARIES ~ ((FROM|IN) ~ #ident)? ~ #show_limit?
         },
-        |(_, _, show_options)| Statement::ShowDictionaries { show_options },
+        |(_, _, db, limit)| {
+            let database = match db {
+                Some((_, d)) => Some(d),
+                _ => None,
+            };
+            Statement::ShowDictionaries(ShowDictionariesStmt { database, limit })
+        },
     );
     let show_create_dictionary = map(
         rule! {
@@ -967,6 +1034,29 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 catalog,
                 database,
                 dictionary_name,
+            })
+        },
+    );
+    let rename_dictionary = map(
+        rule! {
+            RENAME ~ DICTIONARY ~ ( IF ~ ^EXISTS )? ~ #dot_separated_idents_1_to_3 ~ TO ~ #dot_separated_idents_1_to_3
+        },
+        |(
+            _,
+            _,
+            opt_if_exists,
+            (catalog, database, dictionary),
+            _,
+            (new_catalog, new_database, new_dictionary),
+        )| {
+            Statement::RenameDictionary(RenameDictionaryStmt {
+                if_exists: opt_if_exists.is_some(),
+                catalog,
+                database,
+                dictionary,
+                new_catalog,
+                new_database,
+                new_dictionary,
             })
         },
     );
@@ -1282,6 +1372,12 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
     );
 
     let show_users = value(Statement::ShowUsers, rule! { SHOW ~ USERS });
+    let describe_user = map(
+        rule! {
+            ( DESC | DESCRIBE ) ~ USER ~ ^#user_identity
+        },
+        |(_, _, user)| Statement::DescribeUser { user },
+    );
     let create_user = map_res(
         rule! {
             CREATE ~  ( OR ~ ^REPLACE )? ~ USER ~ ( IF ~ ^NOT ~ ^EXISTS )?
@@ -1396,12 +1492,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 principal: Some(principal),
                 show_options: opt_limit,
             },
-            Some(ShowGrantOption::ShareGrantObjectName(object)) => {
-                Statement::ShowObjectGrantPrivileges(ShowObjectGrantPrivilegesStmt { object })
-            }
-            Some(ShowGrantOption::ShareName(share_name)) => {
-                Statement::ShowGrantsOfShare(ShowGrantsOfShareStmt { share_name })
-            }
             None => Statement::ShowGrants {
                 principal: None,
                 show_options: opt_limit,
@@ -1473,9 +1563,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             ~ ( #stage_name )
             ~ ( (URL ~ ^"=")? ~ #uri_location )?
             ~ ( #file_format_clause )?
-            ~ ( ON_ERROR ~ ^"=" ~ ^#ident )?
-            ~ ( SIZE_LIMIT ~ ^"=" ~ ^#literal_u64 )?
-            ~ ( VALIDATION_MODE ~ ^"=" ~ ^#ident )?
             ~ ( (COMMENT | COMMENTS) ~ ^"=" ~ ^#literal_string )?
         },
         |(
@@ -1486,9 +1573,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             stage,
             url_opt,
             file_format_opt,
-            on_error_opt,
-            size_limit_opt,
-            validation_mode_opt,
             comment_opt,
         )| {
             let create_option =
@@ -1498,11 +1582,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
                 stage_name: stage.to_string(),
                 location: url_opt.map(|(_, location)| location),
                 file_format_options: file_format_opt.unwrap_or_default(),
-                on_error: on_error_opt.map(|v| v.2.to_string()).unwrap_or_default(),
-                size_limit: size_limit_opt.map(|v| v.2 as usize).unwrap_or_default(),
-                validation_mode: validation_mode_opt
-                    .map(|v| v.2.to_string())
-                    .unwrap_or_default(),
                 comments: comment_opt.map(|v| v.2).unwrap_or_default(),
             }))
         },
@@ -1634,163 +1713,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             }
             Statement::Presign(presign_stmt)
         },
-    );
-
-    // share statements
-    let create_share_endpoint = map_res(
-        rule! {
-            CREATE ~ ( OR ~ ^REPLACE )? ~ SHARE ~ ENDPOINT ~ ( IF ~ ^NOT ~ ^EXISTS )?
-             ~ #ident
-             ~ URL ~ "=" ~ #share_endpoint_uri_location
-             ~ ( CREDENTIAL ~ ^"=" ~ ^#options)?
-             ~ ( ARGS ~ ^"=" ~ ^#options)?
-             ~ ( COMMENT ~ ^"=" ~ ^#literal_string)?
-        },
-        |(
-            _,
-            opt_or_replace,
-            _,
-            _,
-            opt_if_not_exists,
-            endpoint,
-            _,
-            _,
-            url,
-            credential_opt,
-            args_opt,
-            comment_opt,
-        )| {
-            let create_option =
-                parse_create_option(opt_or_replace.is_some(), opt_if_not_exists.is_some())?;
-
-            let credential_options = if let Some(opt) = credential_opt {
-                opt.2
-                    .iter()
-                    .map(|(k, v)| {
-                        let k = k.to_uppercase();
-                        if k == "TYPE" {
-                            (k, v.to_uppercase())
-                        } else {
-                            (k, v.clone())
-                        }
-                    })
-                    .collect()
-            } else {
-                BTreeMap::new()
-            };
-
-            Ok(Statement::CreateShareEndpoint(CreateShareEndpointStmt {
-                create_option,
-                endpoint,
-                url,
-                credential_options,
-                args: match args_opt {
-                    Some(opt) => opt.2,
-                    None => BTreeMap::new(),
-                },
-                comment: match comment_opt {
-                    Some(opt) => Some(opt.2),
-                    None => None,
-                },
-            }))
-        },
-    );
-    let show_share_endpoints = map(
-        rule! {
-            SHOW ~ SHARE ~ ENDPOINT
-        },
-        |(_, _, _)| Statement::ShowShareEndpoint(ShowShareEndpointStmt {}),
-    );
-    let drop_share_endpoint = map(
-        rule! {
-            DROP ~ SHARE ~ ENDPOINT ~ ( IF ~ EXISTS)? ~ #ident
-        },
-        |(_, _, _, opt_if_exists, endpoint)| {
-            Statement::DropShareEndpoint(DropShareEndpointStmt {
-                if_exists: opt_if_exists.is_some(),
-                endpoint,
-            })
-        },
-    );
-    let create_share = map(
-        rule! {
-            CREATE ~ SHARE ~ ( IF ~ ^NOT ~ ^EXISTS )? ~ #ident ~ ( COMMENT ~ "=" ~ #literal_string)?
-        },
-        |(_, _, opt_if_not_exists, share, comment_opt)| {
-            Statement::CreateShare(CreateShareStmt {
-                if_not_exists: opt_if_not_exists.is_some(),
-                share,
-                comment: match comment_opt {
-                    Some(opt) => Some(opt.2),
-                    None => None,
-                },
-            })
-        },
-    );
-    let drop_share = map(
-        rule! {
-            DROP ~ SHARE ~ ( IF ~ ^EXISTS )? ~ #ident
-        },
-        |(_, _, opt_if_exists, share)| {
-            Statement::DropShare(DropShareStmt {
-                if_exists: opt_if_exists.is_some(),
-                share,
-            })
-        },
-    );
-    let grant_share_object = map(
-        rule! {
-            GRANT ~ #priv_share_type ~ ON ~ #grant_share_object_name ~ TO ~ SHARE ~ #ident
-        },
-        |(_, privilege, _, object, _, _, share)| {
-            Statement::GrantShareObject(GrantShareObjectStmt {
-                share,
-                object,
-                privilege,
-            })
-        },
-    );
-    let revoke_share_object = map(
-        rule! {
-            REVOKE ~ #priv_share_type ~ ON ~ #grant_share_object_name ~ FROM ~ SHARE ~ #ident
-        },
-        |(_, privilege, _, object, _, _, share)| {
-            Statement::RevokeShareObject(RevokeShareObjectStmt {
-                share,
-                object,
-                privilege,
-            })
-        },
-    );
-    let alter_share_tenants = map(
-        rule! {
-            ALTER
-            ~ SHARE
-            ~ ( IF ~ ^EXISTS )?
-            ~ #ident
-            ~ #alter_add_share_accounts
-            ~ TENANTS ~ Eq ~ #comma_separated_list1(ident)
-        },
-        |(_, _, opt_if_exists, share, is_add, _, _, tenants)| {
-            Statement::AlterShareTenants(AlterShareTenantsStmt {
-                share,
-                if_exists: opt_if_exists.is_some(),
-                is_add,
-                tenants,
-            })
-        },
-    );
-    let desc_share = map(
-        rule! {
-            (DESC | DESCRIBE) ~ SHARE ~ #ident
-        },
-        |(_, _, share)| Statement::DescShare(DescShareStmt { share }),
-    );
-    let show_shares = map(
-        rule! {
-            SHOW ~ SHARES
-        },
-        |(_, _)| Statement::ShowShares(ShowSharesStmt {}),
     );
 
     let create_file_format = map_res(
@@ -2178,6 +2100,173 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
         |(_, action)| Statement::System(SystemStmt { action }),
     );
 
+    pub fn procedure_type(i: Input) -> IResult<ProcedureType> {
+        map(rule! { #ident ~ #type_name }, |(name, data_type)| {
+            ProcedureType {
+                name: Some(name.to_string()),
+                data_type,
+            }
+        })(i)
+    }
+
+    fn procedure_return(i: Input) -> IResult<Vec<ProcedureType>> {
+        let procedure_table_return = map(
+            rule! {
+                TABLE ~ "(" ~ #comma_separated_list1(procedure_type) ~ ")"
+            },
+            |(_, _, test, _)| test,
+        );
+        let procedure_single_return = map(rule! { #type_name }, |data_type| {
+            vec![ProcedureType {
+                name: None,
+                data_type,
+            }]
+        });
+        rule!(#procedure_single_return: "<type_name>"
+            | #procedure_table_return: "TABLE(<var_name> <type_name>, ...)")(i)
+    }
+
+    fn procedure_arg(i: Input) -> IResult<Option<Vec<ProcedureType>>> {
+        let procedure_args = map(
+            rule! {
+                "(" ~ #comma_separated_list1(procedure_type) ~ ")"
+            },
+            |(_, args, _)| Some(args),
+        );
+        let procedure_empty_args = map(
+            rule! {
+                "(" ~ ")"
+            },
+            |(_, _)| None,
+        );
+        rule!(#procedure_empty_args: "()"
+            | #procedure_args: "(<var_name> <type_name>, ...)")(i)
+    }
+
+    // CREATE [ OR REPLACE ] PROCEDURE <name> ()
+    // RETURNS { <result_data_type> }[ NOT NULL ]
+    // LANGUAGE SQL
+    // [ COMMENT = '<string_literal>' ] AS <procedure_definition>
+    let create_procedure = map_res(
+        rule! {
+            CREATE ~ ( OR ~ ^REPLACE )? ~ PROCEDURE ~ ( IF ~ ^NOT ~ ^EXISTS )? ~ #ident ~ #procedure_arg ~ RETURNS ~ #procedure_return ~ LANGUAGE ~ SQL  ~ (COMMENT ~ "=" ~ #literal_string)? ~ AS ~ #code_string
+        },
+        |(
+            _,
+            opt_or_replace,
+            _,
+            opt_if_not_exists,
+            name,
+            args,
+            _,
+            return_type,
+            _,
+            _,
+            opt_comment,
+            _,
+            script,
+        )| {
+            let create_option =
+                parse_create_option(opt_or_replace.is_some(), opt_if_not_exists.is_some())?;
+
+            let name = ProcedureIdentity {
+                name: name.to_string(),
+                args_type: if let Some(args) = &args {
+                    args.iter()
+                        .map(|arg| arg.data_type.to_string())
+                        .collect::<Vec<String>>()
+                        .join(",")
+                } else {
+                    "".to_string()
+                },
+            };
+            let stmt = CreateProcedureStmt {
+                create_option,
+                name,
+                args,
+                return_type,
+                language: ProcedureLanguage::SQL,
+                comment: match opt_comment {
+                    Some(opt) => Some(opt.2),
+                    None => None,
+                },
+                script,
+            };
+            Ok(Statement::CreateProcedure(stmt))
+        },
+    );
+
+    let show_procedures = map(
+        rule! {
+            SHOW ~ PROCEDURES ~ #show_options?
+        },
+        |(_, _, show_options)| Statement::ShowProcedures { show_options },
+    );
+
+    fn procedure_type_name(i: Input) -> IResult<Vec<TypeName>> {
+        let procedure_type_names = map(
+            rule! {
+                "(" ~ #comma_separated_list1(type_name) ~ ")"
+            },
+            |(_, args, _)| args,
+        );
+        let procedure_empty_types = map(
+            rule! {
+                "(" ~ ")"
+            },
+            |(_, _)| vec![],
+        );
+        rule!(#procedure_empty_types: "()"
+            | #procedure_type_names: "(<type_name>, ...)")(i)
+    }
+
+    let call_procedure = map(
+        rule! {
+            CALL ~ PROCEDURE ~ #ident ~ "(" ~ #comma_separated_list0(subexpr(0))? ~ ")"
+        },
+        |(_, _, name, _, opt_args, _)| {
+            Statement::CallProcedure(CallProcedureStmt {
+                name: name.to_string(),
+                args: opt_args.unwrap_or_default(),
+            })
+        },
+    );
+
+    let drop_procedure = map(
+        rule! {
+            DROP ~ PROCEDURE ~ ( IF ~ ^EXISTS )? ~ #ident ~ #procedure_type_name
+        },
+        |(_, _, opt_if_exists, name, args)| {
+            Statement::DropProcedure(DropProcedureStmt {
+                if_exists: opt_if_exists.is_some(),
+                name: ProcedureIdentity {
+                    name: name.to_string(),
+                    args_type: if args.is_empty() {
+                        "".to_string()
+                    } else {
+                        args.iter()
+                            .map(|arg| arg.to_string())
+                            .collect::<Vec<String>>()
+                            .join(",")
+                    },
+                },
+            })
+        },
+    );
+
+    let describe_procedure = map(
+        rule! {
+            ( DESC | DESCRIBE ) ~ PROCEDURE ~ #ident ~ #procedure_type_name
+        },
+        |(_, _, name, args)| {
+            // TODO: modify to ProcedureIdentify
+            Statement::DescProcedure(DescProcedureStmt {
+                name: name.to_string(),
+                args,
+            })
+        },
+    );
+
     alt((
         // query, explain,show
         rule!(
@@ -2185,6 +2274,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #explain : "`EXPLAIN [PIPELINE | GRAPH] <statement>`"
             | #explain_analyze : "`EXPLAIN ANALYZE <statement>`"
             | #show_settings : "`SHOW SETTINGS [<show_limit>]`"
+            | #show_variables : "`SHOW VARIABLES [<show_limit>]`"
             | #show_stages : "`SHOW STAGES`"
             | #show_engines : "`SHOW ENGINES`"
             | #show_process_list : "`SHOW PROCESSLIST`"
@@ -2197,15 +2287,20 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #set_priority: "`SET PRIORITY (HIGH | MEDIUM | LOW) <object_id>`"
             | #system_action: "`SYSTEM (ENABLE | DISABLE) EXCEPTION_BACKTRACE`"
         ),
+        // use
+        rule!(
+                #use_catalog: "`USE CATALOG <catalog>`"
+                | #use_database : "`USE <database>`"
+        ),
         // database
         rule!(
             #show_databases : "`SHOW [FULL] DATABASES [(FROM | IN) <catalog>] [<show_limit>]`"
             | #undrop_database : "`UNDROP DATABASE <database>`"
             | #show_create_database : "`SHOW CREATE DATABASE <database>`"
+            | #show_drop_databases : "`SHOW DROP DATABASES [FROM <database>] [<show_limit>]`"
             | #create_database : "`CREATE [OR REPLACE] DATABASE [IF NOT EXISTS] <database> [ENGINE = <engine>]`"
             | #drop_database : "`DROP DATABASE [IF EXISTS] <database>`"
             | #alter_database : "`ALTER DATABASE [IF EXISTS] <action>`"
-            | #use_database : "`USE <database>`"
         ),
         // network policy / password policy
         rule!(
@@ -2231,6 +2326,22 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #begin
             | #commit
             | #abort
+        ),
+        rule!(
+            #show_users : "`SHOW USERS`"
+            | #describe_user: "`DESCRIBE USER <user_name>`"
+            | #create_user : "`CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`"
+            | #alter_user : "`ALTER USER ('<username>' | USER()) [IDENTIFIED [WITH <auth_type>] [BY <password>]] [WITH <user_option>, ...]`"
+            | #drop_user : "`DROP USER [IF EXISTS] '<username>'`"
+            | #show_roles : "`SHOW ROLES`"
+            | #create_role : "`CREATE ROLE [IF NOT EXISTS] <role_name>`"
+            | #drop_role : "`DROP ROLE [IF EXISTS] <role_name>`"
+            | #create_udf : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <name> {AS (<parameter>, ...) -> <definition expr> | (<arg_type>, ...) RETURNS <return_type> LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address>} [DESC = <description>]`"
+            | #drop_udf : "`DROP FUNCTION [IF EXISTS] <udf_name>`"
+            | #alter_udf : "`ALTER FUNCTION <udf_name> (<parameter>, ...) -> <definition_expr> [DESC = <description>]`"
+            | #set_role: "`SET [DEFAULT] ROLE <role>`"
+            | #set_secondary_roles: "`SET SECONDARY ROLES (ALL | NONE)`"
+            | #show_user_functions : "`SHOW USER FUNCTIONS [<show_limit>]`"
         ),
         rule!(
             #show_tables : "`SHOW [FULL] TABLES [FROM <database>] [<show_limit>]`"
@@ -2261,6 +2372,7 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #drop_dictionary : "`DROP DICTIONARY [IF EXISTS] <dictionary_name>`"
             | #show_create_dictionary : "`SHOW CREATE DICTIONARY <dictionary_name> `"
             | #show_dictionaries : "`SHOW DICTIONARIES [<show_option>, ...]`"
+            | #rename_dictionary: "`RENAME DICTIONARY [<database>.]<old_dict_name> TO <new_dict_name>`"
         ),
         // view,index
         rule!(
@@ -2282,21 +2394,6 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #refresh_virtual_column: "`REFRESH VIRTUAL COLUMN FOR [<database>.]<table>`"
             | #show_virtual_columns : "`SHOW VIRTUAL COLUMNS FROM <table> [FROM|IN <catalog>.<database>] [<show_limit>]`"
             | #sequence
-        ),
-        rule!(
-            #show_users : "`SHOW USERS`"
-            | #create_user : "`CREATE [OR REPLACE] USER [IF NOT EXISTS] '<username>'@'hostname' IDENTIFIED [WITH <auth_type>] [BY <password>] [WITH <user_option>, ...]`"
-            | #alter_user : "`ALTER USER ('<username>'@'hostname' | USER()) [IDENTIFIED [WITH <auth_type>] [BY <password>]] [WITH <user_option>, ...]`"
-            | #drop_user : "`DROP USER [IF EXISTS] '<username>'@'hostname'`"
-            | #show_roles : "`SHOW ROLES`"
-            | #create_role : "`CREATE ROLE [IF NOT EXISTS] <role_name>`"
-            | #drop_role : "`DROP ROLE [IF EXISTS] <role_name>`"
-            | #create_udf : "`CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] <name> {AS (<parameter>, ...) -> <definition expr> | (<arg_type>, ...) RETURNS <return_type> LANGUAGE <language> HANDLER=<handler> ADDRESS=<udf_server_address>} [DESC = <description>]`"
-            | #drop_udf : "`DROP FUNCTION [IF EXISTS] <udf_name>`"
-            | #alter_udf : "`ALTER FUNCTION <udf_name> (<parameter>, ...) -> <definition_expr> [DESC = <description>]`"
-            | #set_role: "`SET [DEFAULT] ROLE <role>`"
-            | #set_secondary_roles: "`SET SECONDARY ROLES (ALL | NONE)`"
-            | #show_user_functions : "`SHOW USER FUNCTIONS [<show_limit>]`"
         ),
         rule!(
             #create_stage: "`CREATE [OR REPLACE] STAGE [ IF NOT EXISTS ] <stage_name>
@@ -2324,22 +2421,10 @@ pub fn statement_body(i: Input) -> IResult<Statement> {
             | #drop_data_mask_policy: "`DROP MASKING POLICY [IF EXISTS] mask_name`"
             | #describe_data_mask_policy: "`DESC MASKING POLICY mask_name`"
         ),
-        // share
-        rule!(
-            #create_share_endpoint: "`CREATE SHARE ENDPOINT [IF NOT EXISTS] <endpoint_name> URL=endpoint_location tenant=tenant_name ARGS=(arg=..) [ COMMENT = '<string_literal>' ]`"
-            | #show_share_endpoints: "`SHOW SHARE ENDPOINT`"
-            | #drop_share_endpoint: "`DROP SHARE ENDPOINT <endpoint_name>`"
-            | #create_share: "`CREATE SHARE [IF NOT EXISTS] <share_name> [ COMMENT = '<string_literal>' ]`"
-            | #drop_share: "`DROP SHARE [IF EXISTS] <share_name>`"
-            | #grant_share_object: "`GRANT { USAGE | SELECT | REFERENCE_USAGE } ON { DATABASE db | TABLE db.table } TO SHARE <share_name>`"
-            | #revoke_share_object: "`REVOKE { USAGE | SELECT | REFERENCE_USAGE } ON { DATABASE db | TABLE db.table } FROM SHARE <share_name>`"
-            | #alter_share_tenants: "`ALTER SHARE [IF EXISTS] <share_name> { ADD | REMOVE } TENANTS = tenant [, tenant, ...]`"
-            | #desc_share: "`{DESC | DESCRIBE} SHARE <share_name>`"
-            | #show_shares: "`SHOW SHARES`"
-        ),
         rule!(
             #set_stmt : "`SET [variable] {<name> = <value> | (<name>, ...) = (<value>, ...)}`"
             | #unset_stmt : "`UNSET [variable] {<name> | (<name>, ...)}`"
+            | #query_setting : "SETTINGS ( {<name> = <value> | (<name>, ...) = (<value>, ...)} )  Statement"
         ),
         // catalog
         rule!(
@@ -2394,6 +2479,11 @@ AS
             | #desc_connection: "`DESC | DESCRIBE CONNECTION  <connection_name>`"
             | #show_connections: "`SHOW CONNECTIONS`"
             | #execute_immediate : "`EXECUTE IMMEDIATE $$ <script> $$`"
+            | #create_procedure : "`CREATE [ OR REPLACE ] PROCEDURE <procedure_name>() RETURNS { <result_data_type> [ NOT NULL ] | TABLE(<var_name> <data_type>, ...)} LANGUAGE SQL [ COMMENT = '<string_literal>' ] AS <procedure_definition>`"
+            | #drop_procedure : "`DROP PROCEDURE <procedure_name>()`"
+            | #show_procedures : "`SHOW PROCEDURES [<show_options>]()`"
+            | #describe_procedure : "`DESC PROCEDURE <procedure_name>()`"
+            | #call_procedure : "`CALL PROCEDURE <procedure_name>()`"
         ),
     ))(i)
 }
@@ -2670,11 +2760,12 @@ pub fn merge_source(i: Input) -> IResult<MergeSource> {
     });
 
     let source_table = map(
-        rule!(#dot_separated_idents_1_to_3 ~ #table_alias?),
-        |((catalog, database, table), alias)| MergeSource::Table {
+        rule!(#dot_separated_idents_1_to_3 ~ #with_options? ~ #table_alias?),
+        |((catalog, database, table), with_options, alias)| MergeSource::Table {
             catalog,
             database,
             table,
+            with_options,
             alias,
         },
     );
@@ -2741,6 +2832,36 @@ pub fn hint(i: Input) -> IResult<Hint> {
     rule!(#hint|#invalid_hint)(i)
 }
 
+pub fn query_setting(i: Input) -> IResult<(Identifier, Expr)> {
+    map(
+        rule! {
+            #ident ~ "=" ~ #subexpr(0)
+        },
+        |(id, _, value)| (id, value),
+    )(i)
+}
+
+pub fn query_statement_setting(i: Input) -> IResult<Settings> {
+    let query_set = map(
+        rule! {
+            "(" ~ #comma_separated_list0(query_setting) ~ ")"
+        },
+        |(_, query_setting, _)| {
+            let mut ids = Vec::with_capacity(query_setting.len());
+            let mut values = Vec::with_capacity(query_setting.len());
+            for (id, value) in query_setting {
+                ids.push(id);
+                values.push(value);
+            }
+            Settings {
+                set_type: SetType::SettingsQuery,
+                identifiers: ids,
+                values: SetValues::Expr(values.into_iter().map(|x| x.into()).collect()),
+            }
+        },
+    );
+    rule!(#query_set: "(SETTING_NAME = VALUE, ...)")(i)
+}
 pub fn top_n(i: Input) -> IResult<u64> {
     map(
         rule! {
@@ -3020,37 +3141,6 @@ pub fn alter_add_share_accounts(i: Input) -> IResult<bool> {
     alt((value(true, rule! { ADD }), value(false, rule! { REMOVE })))(i)
 }
 
-pub fn grant_share_object_name(i: Input) -> IResult<ShareGrantObjectName> {
-    let database = map(
-        rule! {
-            DATABASE ~ #ident
-        },
-        |(_, database)| ShareGrantObjectName::Database(database),
-    );
-
-    // `db01`.'tb1' or `db01`.`tb1` or `db01`.tb1
-    let table = map(
-        rule! {
-            TABLE ~  #ident ~ "." ~ #ident
-        },
-        |(_, database, _, table)| ShareGrantObjectName::Table(database, table),
-    );
-
-    // `db01`.'tb1' or `db01`.`tb1` or `db01`.tb1
-    let view = map(
-        rule! {
-            VIEW ~  #ident ~ "." ~ #ident
-        },
-        |(_, database, _, table)| ShareGrantObjectName::View(database, table),
-    );
-
-    rule!(
-        #database : "DATABASE <database>"
-        | #table : "TABLE <database>.<table>"
-        | #view : "TABLE <database>.<view>"
-    )(i)
-}
-
 pub fn on_object_name(i: Input) -> IResult<GrantObjectName> {
     let database = map(
         rule! {
@@ -3208,17 +3298,9 @@ pub fn show_grant_option(i: Input) -> IResult<ShowGrantOption> {
         |(_, object_name)| ShowGrantOption::GrantObjectName(object_name),
     );
 
-    let share_name = map(
-        rule! {
-            OF ~ SHARE ~ #ident
-        },
-        |(_, _, share_name)| ShowGrantOption::ShareName(share_name.to_string()),
-    );
-
     rule!(
         #grant_role: "FOR  { ROLE <role_name> | [USER] <user> }"
         | #share_object_name: "ON {DATABASE <db_name> | TABLE <db_name>.<table_name> | UDF <udf_name> | STAGE <stage_name> }"
-        | #share_name: "OF SHARE <share_name>"
     )(i)
 }
 
@@ -3499,6 +3581,13 @@ pub fn alter_table_action(i: Input) -> IResult<AlterTableAction> {
         |(_, _, _, set_options, _)| AlterTableAction::SetOptions { set_options },
     );
 
+    let unset_table_options = map(
+        rule! {
+            UNSET ~ OPTIONS ~ #unset_source
+        },
+        |(_, _, targets)| AlterTableAction::UnsetOptions { targets },
+    );
+
     rule!(
         #alter_table_cluster_key
         | #drop_table_cluster_key
@@ -3511,6 +3600,7 @@ pub fn alter_table_action(i: Input) -> IResult<AlterTableAction> {
         | #recluster_table
         | #revert_table
         | #set_table_options
+        | #unset_table_options
     )(i)
 }
 
@@ -3978,7 +4068,7 @@ pub fn set_table_option(i: Input) -> IResult<BTreeMap<String, String>> {
     })(i)
 }
 
-fn option_to_string(i: Input) -> IResult<String> {
+pub fn option_to_string(i: Input) -> IResult<String> {
     let bool_to_string = |i| map(literal_bool, |v| v.to_string())(i);
 
     rule!(
@@ -4028,7 +4118,6 @@ pub fn catalog_type(i: Input) -> IResult<CatalogType> {
         value(CatalogType::Default, rule! { DEFAULT }),
         value(CatalogType::Hive, rule! { HIVE }),
         value(CatalogType::Iceberg, rule! { ICEBERG }),
-        value(CatalogType::Share, rule! { SHARE }),
     ))(i)
 }
 
@@ -4158,7 +4247,7 @@ pub fn table_reference_with_alias(i: Input) -> IResult<TableReference> {
                 columns: vec![],
             }),
             temporal: None,
-            consume: false,
+            with_options: None,
             pivot: None,
             unpivot: None,
             sample: None,
@@ -4178,7 +4267,7 @@ pub fn table_reference_only(i: Input) -> IResult<TableReference> {
             table,
             alias: None,
             temporal: None,
-            consume: false,
+            with_options: None,
             pivot: None,
             unpivot: None,
             sample: None,

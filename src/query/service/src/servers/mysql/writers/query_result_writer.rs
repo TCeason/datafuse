@@ -236,13 +236,14 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
 
                     let num_rows = block.num_rows();
                     let encoder = FieldEncoderValues::create_for_mysql_handler(
+                        format.jiff_timezone.clone(),
                         format.timezone,
                         format.geometry_format,
                     );
                     let mut buf = Vec::<u8>::new();
 
                     let columns = block
-                        .convert_to_full()
+                        .consume_convert_to_full()
                         .columns()
                         .iter()
                         .map(|column| column.value.clone().into_column().unwrap())

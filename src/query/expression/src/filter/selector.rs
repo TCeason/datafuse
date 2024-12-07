@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// use std::time::Instant;
-
 use std::time::Instant;
 
 use databend_common_exception::ErrorCode;
@@ -123,10 +121,9 @@ impl<'a> Selector<'a> {
                 select_strategy,
                 count,
             )?,
-            SelectExpr::Like((column_ref, like_pattern, like_str, not)) => self.process_like(
+            SelectExpr::Like((column_ref, like_pattern, not)) => self.process_like(
                 column_ref,
-                like_pattern,
-                like_str,
+                like_pattern.as_ref(),
                 *not,
                 true_selection,
                 false_selection,
@@ -328,7 +325,6 @@ impl<'a> Selector<'a> {
         &self,
         column_ref: &Expr,
         like_pattern: &LikePattern,
-        like_str: &String,
         not: bool,
         true_selection: &mut [u32],
         false_selection: (&mut [u32], bool),
@@ -357,7 +353,6 @@ impl<'a> Selector<'a> {
             column,
             &data_type,
             like_pattern,
-            like_str.as_bytes(),
             not,
             true_selection,
             false_selection,
@@ -514,7 +509,6 @@ impl<'a> Selector<'a> {
                         })
                         .all_equal()
                 );
-                let cols_ref = args.iter().map(Value::as_ref).collect::<Vec<_>>();
                 let mut ctx = EvalContext {
                     generics,
                     num_rows: self.evaluator.data_block().num_rows(),
@@ -524,7 +518,7 @@ impl<'a> Selector<'a> {
                     suppress_error: eval_options.suppress_error,
                 };
                 let (_, eval) = function.eval.as_scalar().unwrap();
-                let result = (eval)(cols_ref.as_slice(), &mut ctx);
+                let result = (eval)(&args, &mut ctx);
                 ctx.render_error(
                     *span,
                     id.params(),

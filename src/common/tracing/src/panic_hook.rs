@@ -15,10 +15,8 @@
 use std::panic::PanicHookInfo;
 use std::sync::atomic::Ordering;
 
-use backtrace::trace;
 use backtrace::Backtrace;
 use backtrace::BacktraceFrame;
-use color_backtrace::BacktracePrinter;
 use databend_common_base::runtime::LimitMemGuard;
 use databend_common_exception::USER_SET_ENABLE_BACKTRACE;
 use log::error;
@@ -36,6 +34,7 @@ pub fn set_panic_hook() {
     }));
 }
 
+#[allow(dead_code)]
 fn should_backtrace() -> bool {
     // if user not specify or user set to enable, we should backtrace
     match USER_SET_ENABLE_BACKTRACE.load(Ordering::Relaxed) {
@@ -64,32 +63,19 @@ pub fn log_panic(panic: &PanicHookInfo) {
     }
 }
 
-fn captures_frames(size: usize) -> Vec<BacktraceFrame> {
-    let mut frames = Vec::with_capacity(size);
-    trace(|frame| {
-        frames.push(backtrace::BacktraceFrame::from(frame.clone()));
+pub fn captures_frames(frames: &mut Vec<BacktraceFrame>) {
+    backtrace::trace(|frame| {
+        frames.push(BacktraceFrame::from(frame.clone()));
         frames.len() != frames.capacity()
     });
-
-    frames
 }
 
 pub fn backtrace(frames: usize) -> String {
-    if should_backtrace() {
-        let frames = captures_frames(frames);
-        let mut backtrace = Backtrace::from(frames);
-        backtrace.resolve();
-
-        let printer = BacktracePrinter::new()
-            .message("")
-            .lib_verbosity(color_backtrace::Verbosity::Full);
-        let colored = printer
-            .format_trace_to_string(&backtrace)
-            .unwrap_or_default();
-        String::from_utf8_lossy(&strip_ansi_escapes::strip(colored)).into_owned()
-    } else {
-        String::new()
-    }
+    let mut frames = Vec::with_capacity(frames);
+    captures_frames(&mut frames);
+    let mut backtrace = Backtrace::from(frames);
+    backtrace.resolve();
+    format!("{:?}", backtrace)
 }
 
 #[cfg(test)]
@@ -102,7 +88,11 @@ mod tests {
     fn test_captures_frames() {
         fn recursion_f(i: usize, frames: usize) -> Vec<BacktraceFrame> {
             match i - 1 {
-                0 => captures_frames(frames),
+                0 => {
+                    let mut frames = Vec::with_capacity(frames);
+                    captures_frames(&mut frames);
+                    frames
+                }
                 x => recursion_f(x, frames),
             }
         }

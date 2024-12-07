@@ -17,12 +17,11 @@ use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use databend_common_catalog::plan::StageTableInfo;
-use databend_common_config::QUERY_SEMVER;
+use databend_common_config::DATABEND_SEMVER;
 use databend_common_exception::Result;
-use databend_common_expression::converts::arrow::table_schema_to_arrow_schema;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
 use databend_common_pipeline_core::processors::Event;
@@ -47,7 +46,7 @@ pub struct ParquetFileWriter {
     output: Arc<OutputPort>,
 
     table_info: StageTableInfo,
-    arrow_schema: Arc<ArrowSchema>,
+    arrow_schema: Arc<Schema>,
 
     input_data: Vec<DataBlock>,
 
@@ -62,7 +61,7 @@ pub struct ParquetFileWriter {
     unload_output: UnloadOutput,
     unload_output_blocks: Option<VecDeque<DataBlock>>,
 
-    uuid: String,
+    query_id: String,
     group_id: usize,
     batch_id: usize,
 
@@ -74,7 +73,7 @@ const MAX_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;
 
 fn create_writer(
-    arrow_schema: Arc<ArrowSchema>,
+    arrow_schema: Arc<Schema>,
     targe_file_size: Option<usize>,
 ) -> Result<ArrowWriter<Vec<u8>>> {
     let props = WriterProperties::builder()
@@ -84,7 +83,7 @@ fn create_writer(
         .set_dictionary_enabled(false)
         .set_statistics_enabled(EnabledStatistics::None)
         .set_bloom_filter_enabled(false)
-        .set_created_by(format!("Databend {}", *QUERY_SEMVER))
+        .set_created_by(format!("Databend {}", *DATABEND_SEMVER))
         .build();
     let buf_size = match targe_file_size {
         Some(n) if n < MAX_BUFFER_SIZE => n,
@@ -100,14 +99,14 @@ impl ParquetFileWriter {
         output: Arc<OutputPort>,
         table_info: StageTableInfo,
         data_accessor: Operator,
-        uuid: String,
+        query_id: String,
         group_id: usize,
         targe_file_size: Option<usize>,
     ) -> Result<ProcessorPtr> {
         let unload_output =
-            UnloadOutput::create(table_info.stage_info.copy_options.detailed_output);
+            UnloadOutput::create(table_info.copy_into_location_options.detailed_output);
 
-        let arrow_schema = Arc::new(table_schema_to_arrow_schema(&table_info.schema));
+        let arrow_schema = Arc::new(Schema::from(table_info.schema.as_ref()));
         let writer = create_writer(arrow_schema.clone(), targe_file_size)?;
 
         Ok(ProcessorPtr::create(Box::new(ParquetFileWriter {
@@ -122,7 +121,7 @@ impl ParquetFileWriter {
             input_bytes: 0,
             file_to_write: None,
             data_accessor,
-            uuid,
+            query_id,
             group_id,
             batch_id: 0,
             targe_file_size,
@@ -242,7 +241,7 @@ impl Processor for ParquetFileWriter {
         assert!(self.file_to_write.is_some());
         let path = unload_path(
             &self.table_info,
-            &self.uuid,
+            &self.query_id,
             self.group_id,
             self.batch_id,
             None,

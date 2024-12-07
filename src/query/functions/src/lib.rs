@@ -41,10 +41,19 @@ pub fn is_builtin_function(name: &str) -> bool {
         || ASYNC_FUNCTIONS.contains(&name)
 }
 
+// The plan of search function, async function and udf contains some arguments defined in meta,
+// which may be modified by user at any time. Those functions are not not suitable for caching.
+pub fn is_cacheable_function(name: &str) -> bool {
+    BUILTIN_FUNCTIONS.contains(name)
+        || AggregateFunctionFactory::instance().contains(name)
+        || GENERAL_WINDOW_FUNCTIONS.contains(&name)
+        || GENERAL_LAMBDA_FUNCTIONS.contains(&name)
+}
+
 #[ctor]
 pub static BUILTIN_FUNCTIONS: FunctionRegistry = builtin_functions();
 
-pub const ASYNC_FUNCTIONS: [&str; 1] = ["nextval"];
+pub const ASYNC_FUNCTIONS: [&str; 2] = ["nextval", "dict_get"];
 
 pub const GENERAL_WINDOW_FUNCTIONS: [&str; 13] = [
     "row_number",
@@ -62,12 +71,26 @@ pub const GENERAL_WINDOW_FUNCTIONS: [&str; 13] = [
     "cume_dist",
 ];
 
-pub const GENERAL_LAMBDA_FUNCTIONS: [&str; 5] = [
+pub const RANK_WINDOW_FUNCTIONS: [&str; 5] =
+    ["first_value", "first", "last_value", "last", "nth_value"];
+
+pub const GENERAL_LAMBDA_FUNCTIONS: [&str; 16] = [
     "array_transform",
     "array_apply",
     "array_map",
     "array_filter",
     "array_reduce",
+    "json_array_transform",
+    "json_array_apply",
+    "json_array_map",
+    "json_array_filter",
+    "json_array_reduce",
+    "map_filter",
+    "map_transform_keys",
+    "map_transform_values",
+    "json_map_filter",
+    "json_map_transform_keys",
+    "json_map_transform_values",
 ];
 
 pub const GENERAL_SEARCH_FUNCTIONS: [&str; 3] = ["match", "query", "score"];
