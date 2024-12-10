@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
-use databend_common_arrow::arrow::buffer::Buffer;
+use databend_common_column::buffer::Buffer;
 use databend_common_expression::types::binary::BinaryColumnBuilder;
 use databend_common_expression::types::decimal::Decimal;
 use databend_common_expression::types::number::Number;
@@ -68,7 +68,7 @@ pub struct BinaryKeysColumnBuilder<'a> {
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> BinaryKeysColumnBuilder<'a> {
+impl BinaryKeysColumnBuilder<'_> {
     pub fn create(capacity: usize, value_capacity: usize) -> Self {
         BinaryKeysColumnBuilder {
             inner_builder: BinaryColumnBuilder::with_capacity(capacity, value_capacity),
@@ -138,7 +138,7 @@ pub struct DictionaryBinaryKeysColumnBuilder<'a> {
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> DictionaryBinaryKeysColumnBuilder<'a> {
+impl DictionaryBinaryKeysColumnBuilder<'_> {
     pub fn create(_: usize, _: usize) -> Self {
         DictionaryBinaryKeysColumnBuilder {
             bytes_size: 0,

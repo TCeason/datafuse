@@ -14,6 +14,7 @@
 
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::len_without_is_empty)]
+#![allow(clippy::missing_transmute_annotations)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(internal_features)]
 // FIXME: we should avoid this by implementing Ord correctly.
@@ -22,13 +23,11 @@
 #![feature(fmt_internals)]
 #![feature(const_try)]
 #![feature(iterator_try_reduce)]
-#![feature(const_fmt_arguments_new)]
 #![feature(box_patterns)]
 #![feature(type_ascription)]
+#![allow(clippy::type_complexity)]
 #![feature(associated_type_defaults)]
-#![feature(const_maybe_uninit_as_mut_ptr)]
 #![feature(anonymous_lifetime_in_impl_trait)]
-#![feature(const_mut_refs)]
 #![feature(generic_const_exprs)]
 #![feature(trait_alias)]
 #![feature(vec_into_raw_parts)]

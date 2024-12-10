@@ -20,15 +20,17 @@ use std::time::Duration;
 use databend_common_base::base::convert_byte_size;
 use databend_common_base::base::convert_number_size;
 use databend_common_base::base::uuid::Uuid;
+use databend_common_base::base::OrderedFloat;
 use databend_common_expression::error_to_null;
 use databend_common_expression::types::boolean::BooleanDomain;
 use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::number::Float32Type;
 use databend_common_expression::types::number::Float64Type;
 use databend_common_expression::types::number::Int64Type;
 use databend_common_expression::types::number::UInt32Type;
 use databend_common_expression::types::number::UInt8Type;
 use databend_common_expression::types::number::F64;
-use databend_common_expression::types::string::StringColumn;
+use databend_common_expression::types::string::StringColumnBuilder;
 use databend_common_expression::types::ArgType;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::DateType;
@@ -44,6 +46,7 @@ use databend_common_expression::types::StringType;
 use databend_common_expression::types::TimestampType;
 use databend_common_expression::types::ValueType;
 use databend_common_expression::vectorize_with_builder_1_arg;
+use databend_common_expression::vectorize_with_builder_2_arg;
 use databend_common_expression::Column;
 use databend_common_expression::Domain;
 use databend_common_expression::EvalContext;
@@ -54,10 +57,8 @@ use databend_common_expression::FunctionProperty;
 use databend_common_expression::FunctionRegistry;
 use databend_common_expression::FunctionSignature;
 use databend_common_expression::Scalar;
-use databend_common_expression::ScalarRef;
 use databend_common_expression::Value;
-use databend_common_expression::ValueRef;
-use ordered_float::OrderedFloat;
+use databend_common_io::number::FmtCacheEntry;
 use rand::Rng;
 use rand::SeedableRng;
 
@@ -73,6 +74,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     register_inet_ntoa(registry);
     register_run_diff(registry);
     register_grouping(registry);
+    register_num_to_char(registry);
 
     registry.properties.insert(
         "rand".to_string(),
@@ -89,8 +91,7 @@ pub fn register(registry: &mut FunctionRegistry) {
         |_, _| FunctionDomain::Full,
         vectorize_with_builder_1_arg::<Float64Type, StringType>(move |val, output, _| {
             let new_val = convert_byte_size(val.into());
-            output.put_str(&new_val);
-            output.commit_row();
+            output.put_and_commit(new_val);
         }),
     );
 
@@ -99,8 +100,7 @@ pub fn register(registry: &mut FunctionRegistry) {
         |_, _| FunctionDomain::Full,
         vectorize_with_builder_1_arg::<Float64Type, StringType>(move |val, output, _| {
             let new_val = convert_number_size(val.into());
-            output.put_str(&new_val);
-            output.commit_row();
+            output.put_and_commit(new_val);
         }),
     );
 
@@ -205,9 +205,9 @@ pub fn register(registry: &mut FunctionRegistry) {
                 .unwrap_or(FunctionDomain::Full)
         },
         |val, ctx| match val {
-            ValueRef::Scalar(None) => Value::Scalar(Scalar::default_value(&ctx.generics[0])),
-            ValueRef::Scalar(Some(scalar)) => Value::Scalar(scalar.to_owned()),
-            ValueRef::Column(NullableColumn { column, .. }) => Value::Column(column),
+            Value::Scalar(None) => Value::Scalar(Scalar::default_value(&ctx.generics[0])),
+            Value::Scalar(Some(scalar)) => Value::Scalar(scalar.to_owned()),
+            Value::Column(NullableColumn { column, .. }) => Value::Column(column),
         },
     );
 
@@ -228,17 +228,15 @@ pub fn register(registry: &mut FunctionRegistry) {
         "gen_random_uuid",
         |_| FunctionDomain::Full,
         |ctx| {
-            let mut values: Vec<u8> = Vec::with_capacity(ctx.num_rows * 36);
-            let mut offsets: Vec<u64> = Vec::with_capacity(ctx.num_rows);
-            offsets.push(0);
+            let mut builder = StringColumnBuilder::with_capacity(ctx.num_rows);
 
             for _ in 0..ctx.num_rows {
-                let value = Uuid::new_v4();
-                offsets.push(offsets.last().unwrap() + 36u64);
-                write!(&mut values, "{:x}", value).unwrap();
+                let value = Uuid::now_v7();
+                write!(&mut builder.row_buffer, "{}", value).unwrap();
+                builder.commit_row();
             }
-            let col = StringColumn::new(values.into(), offsets.into());
-            Value::Column(col)
+
+            Value::Column(builder.build())
         },
     );
 }
@@ -256,7 +254,7 @@ fn register_inet_aton(registry: &mut FunctionRegistry) {
         error_to_null(eval_inet_aton),
     );
 
-    fn eval_inet_aton(val: ValueRef<StringType>, ctx: &mut EvalContext) -> Value<UInt32Type> {
+    fn eval_inet_aton(val: Value<StringType>, ctx: &mut EvalContext) -> Value<UInt32Type> {
         vectorize_with_builder_1_arg::<StringType, UInt32Type>(|addr_str, output, ctx| {
             match addr_str.parse::<Ipv4Addr>() {
                 Ok(addr) => {
@@ -285,13 +283,12 @@ fn register_inet_ntoa(registry: &mut FunctionRegistry) {
         error_to_null(eval_inet_ntoa),
     );
 
-    fn eval_inet_ntoa(val: ValueRef<Int64Type>, ctx: &mut EvalContext) -> Value<StringType> {
+    fn eval_inet_ntoa(val: Value<Int64Type>, ctx: &mut EvalContext) -> Value<StringType> {
         vectorize_with_builder_1_arg::<Int64Type, StringType>(|val, output, ctx| {
             match num_traits::cast::cast::<i64, u32>(val) {
                 Some(val) => {
                     let addr_str = Ipv4Addr::from(val.to_be_bytes()).to_string();
-                    output.put_str(&addr_str);
-                    output.commit_row();
+                    output.put_and_commit(addr_str);
                 }
                 None => {
                     ctx.set_error(
@@ -311,13 +308,13 @@ macro_rules! register_simple_domain_type_run_diff {
             "running_difference",
             |_, _| FunctionDomain::MayThrow,
             move |arg1, ctx| match arg1 {
-                ValueRef::Scalar(_val) => {
+                Value::Scalar(_val) => {
                     let mut builder =
                         NumberType::<$source_primitive_type>::create_builder(1, ctx.generics);
                     builder.push($zero);
                     Value::Scalar(NumberType::<$source_primitive_type>::build_scalar(builder))
                 }
-                ValueRef::Column(col) => {
+                Value::Column(col) => {
                     let a_iter = NumberType::<$source_primitive_type>::iter_column(&col);
                     let b_iter = NumberType::<$source_primitive_type>::iter_column(&col);
                     let size = col.len();
@@ -367,10 +364,10 @@ fn register_grouping(registry: &mut FunctionRegistry) {
             eval: FunctionEval::Scalar {
                 calc_domain: Box::new(|_, _| FunctionDomain::Full),
                 eval: Box::new(move |args, _| match &args[0] {
-                    ValueRef::Scalar(ScalarRef::Number(NumberScalar::UInt32(v))) => Value::Scalar(
+                    Value::Scalar(Scalar::Number(NumberScalar::UInt32(v))) => Value::Scalar(
                         Scalar::Number(NumberScalar::UInt32(compute_grouping(&params, *v))),
                     ),
-                    ValueRef::Column(Column::Number(NumberColumn::UInt32(col))) => {
+                    Value::Column(Column::Number(NumberColumn::UInt32(col))) => {
                         let output = col
                             .iter()
                             .map(|v| compute_grouping(&params, *v))
@@ -382,6 +379,97 @@ fn register_grouping(registry: &mut FunctionRegistry) {
             },
         }))
     })
+}
+
+fn register_num_to_char(registry: &mut FunctionRegistry) {
+    registry.register_passthrough_nullable_2_arg::<Int64Type, StringType, StringType, _, _>(
+        "to_char",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<Int64Type, StringType, StringType>(
+            |value, fmt, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
+                }
+
+                // TODO: We should cache FmtCacheEntry
+                match fmt
+                    .parse::<FmtCacheEntry>()
+                    .and_then(|entry| entry.process_i64(value))
+                {
+                    Ok(s) => {
+                        builder.put_and_commit(s);
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                        builder.commit_row()
+                    }
+                }
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg::<Float32Type, StringType, StringType, _, _>(
+        "to_char",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<Float32Type, StringType, StringType>(
+            |value, fmt, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
+                }
+
+                // TODO: We should cache FmtCacheEntry
+                match fmt
+                    .parse::<FmtCacheEntry>()
+                    .and_then(|entry| entry.process_f32(*value))
+                {
+                    Ok(s) => {
+                        builder.put_str(&s);
+                        builder.commit_row()
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                        builder.commit_row()
+                    }
+                }
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg::<Float64Type, StringType, StringType, _, _>(
+        "to_char",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<Float64Type, StringType, StringType>(
+            |value, fmt, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
+                }
+
+                // TODO: We should cache FmtCacheEntry
+                match fmt
+                    .parse::<FmtCacheEntry>()
+                    .and_then(|entry| entry.process_f64(*value))
+                {
+                    Ok(s) => {
+                        builder.put_str(&s);
+                        builder.commit_row()
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                        builder.commit_row()
+                    }
+                }
+            },
+        ),
+    );
 }
 
 /// Compute `grouping` by `grouping_id` and `cols`.

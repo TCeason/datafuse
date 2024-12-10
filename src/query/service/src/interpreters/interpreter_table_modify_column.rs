@@ -26,7 +26,7 @@ use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
 use databend_common_license::license::Feature::ComputedColumn;
 use databend_common_license::license::Feature::DataMask;
-use databend_common_license::license_manager::get_license_manager;
+use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::DatabaseType;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyAction;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
@@ -43,7 +43,6 @@ use databend_common_sql::plans::Plan;
 use databend_common_sql::BloomIndexColumns;
 use databend_common_sql::Planner;
 use databend_common_storages_fuse::FuseTable;
-use databend_common_storages_share::update_share_table_info;
 use databend_common_storages_stream::stream_table::STREAM_ENGINE;
 use databend_common_storages_view::view_table::VIEW_ENGINE;
 use databend_common_users::UserApiProvider;
@@ -76,9 +75,7 @@ impl ModifyTableColumnInterpreter {
         column: String,
         mask_name: String,
     ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager
-            .manager
+        LicenseManagerSwitch::instance()
             .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)?;
 
         if table.is_temp() {
@@ -251,28 +248,16 @@ impl ModifyTableColumnInterpreter {
                 new_table_meta: table_info.meta,
             };
 
-            let resp = catalog
+            let _resp = catalog
                 .update_single_table_meta(req, table.get_table_info())
                 .await?;
-            if let Some(share_vec_table_infos) = &resp.share_vec_table_infos {
-                for (share_name_vec, db_id, share_table_info) in share_vec_table_infos {
-                    update_share_table_info(
-                        self.ctx.get_tenant().tenant_name(),
-                        self.ctx.get_application_level_data_operator()?.operator(),
-                        share_name_vec,
-                        *db_id,
-                        share_table_info,
-                    )
-                    .await?;
-                }
-            }
 
             return Ok(PipelineBuildResult::create());
         }
 
-        // if alter column from string to binary, we don't need to rebuild table
-        let is_alter_column_string_to_binary =
-            schema
+        // if alter column from string to binary in parquet, we don't need to rebuild table
+        let is_alter_column_string_to_binary = table.storage_format_as_parquet()
+            && schema
                 .fields()
                 .iter()
                 .zip(new_schema.fields())
@@ -343,21 +328,9 @@ impl ModifyTableColumnInterpreter {
                 new_table_meta: table_info.meta,
             };
 
-            let resp = catalog
+            let _resp = catalog
                 .update_single_table_meta(req, table.get_table_info())
                 .await?;
-            if let Some(share_vec_table_infos) = &resp.share_vec_table_infos {
-                for (share_name_vec, db_id, share_table_info) in share_vec_table_infos {
-                    update_share_table_info(
-                        self.ctx.get_tenant().tenant_name(),
-                        self.ctx.get_application_level_data_operator()?.operator(),
-                        share_name_vec,
-                        *db_id,
-                        share_table_info,
-                    )
-                    .await?;
-                }
-            }
 
             return Ok(PipelineBuildResult::create());
         }
@@ -443,9 +416,7 @@ impl ModifyTableColumnInterpreter {
         table: Arc<dyn Table>,
         column: String,
     ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager
-            .manager
+        LicenseManagerSwitch::instance()
             .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)?;
 
         let table_info = table.get_table_info();
@@ -468,17 +439,7 @@ impl ModifyTableColumnInterpreter {
                 action: SetTableColumnMaskPolicyAction::Unset(prev_column_mask_name),
             };
 
-            let resp = catalog.set_table_column_mask_policy(req).await?;
-            if let Some((share_name_vec, db_id, share_table_info)) = resp.share_vec_table_info {
-                update_share_table_info(
-                    self.ctx.get_tenant().tenant_name(),
-                    self.ctx.get_application_level_data_operator()?.operator(),
-                    &share_name_vec,
-                    db_id,
-                    &share_table_info,
-                )
-                .await?;
-            }
+            let _resp = catalog.set_table_column_mask_policy(req).await?;
         }
 
         Ok(PipelineBuildResult::create())
@@ -491,9 +452,7 @@ impl ModifyTableColumnInterpreter {
         table_meta: TableMeta,
         column: String,
     ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager
-            .manager
+        LicenseManagerSwitch::instance()
             .check_enterprise_enabled(self.ctx.get_license_key(), ComputedColumn)?;
 
         let table_info = table.get_table_info();
@@ -532,19 +491,7 @@ impl ModifyTableColumnInterpreter {
             new_table_meta,
         };
 
-        let resp = catalog.update_single_table_meta(req, table_info).await?;
-        if let Some(share_vec_table_infos) = &resp.share_vec_table_infos {
-            for (share_name_vec, db_id, share_table_info) in share_vec_table_infos {
-                update_share_table_info(
-                    self.ctx.get_tenant().tenant_name(),
-                    self.ctx.get_application_level_data_operator()?.operator(),
-                    share_name_vec,
-                    *db_id,
-                    share_table_info,
-                )
-                .await?;
-            }
-        }
+        let _resp = catalog.update_single_table_meta(req, table_info).await?;
 
         Ok(PipelineBuildResult::create())
     }

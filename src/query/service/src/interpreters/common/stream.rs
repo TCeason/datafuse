@@ -19,7 +19,7 @@ use chrono::Utc;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_license::license::Feature;
-use databend_common_license::license_manager::get_license_manager;
+use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::schema::UpdateStreamMetaReq;
 use databend_common_meta_app::schema::UpdateTableMetaReq;
@@ -49,9 +49,7 @@ pub async fn dml_build_update_stream_req(
         return Ok(vec![]);
     }
 
-    let license_manager = get_license_manager();
-    license_manager
-        .manager
+    LicenseManagerSwitch::instance()
         .check_enterprise_enabled(ctx.get_license_key(), Feature::Stream)?;
 
     let mut reqs = Vec::with_capacity(tables.len());
@@ -65,7 +63,7 @@ pub async fn dml_build_update_stream_req(
         let table_version = inner_fuse.get_table_info().ident.seq;
         let mut options = stream.options().clone();
         options.insert(OPT_KEY_TABLE_VER.to_string(), table_version.to_string());
-        if let Some(snapshot_loc) = inner_fuse.snapshot_loc().await? {
+        if let Some(snapshot_loc) = inner_fuse.snapshot_loc() {
             options.insert(OPT_KEY_SNAPSHOT_LOCATION.to_string(), snapshot_loc);
         }
 
@@ -134,9 +132,7 @@ pub async fn query_build_update_stream_req(
         return Ok(None);
     }
 
-    let license_manager = get_license_manager();
-    license_manager
-        .manager
+    LicenseManagerSwitch::instance()
         .check_enterprise_enabled(ctx.get_license_key(), Feature::Stream)?;
 
     let cap = streams.len();
@@ -151,7 +147,7 @@ pub async fn query_build_update_stream_req(
         let table_version = inner_fuse.get_table_info().ident.seq;
         let mut options = stream.options().clone();
         options.insert(OPT_KEY_TABLE_VER.to_string(), table_version.to_string());
-        if let Some(snapshot_loc) = inner_fuse.snapshot_loc().await? {
+        if let Some(snapshot_loc) = inner_fuse.snapshot_loc() {
             options.insert(OPT_KEY_SNAPSHOT_LOCATION.to_string(), snapshot_loc);
         }
         let mut new_table_meta = stream_info.meta.clone();

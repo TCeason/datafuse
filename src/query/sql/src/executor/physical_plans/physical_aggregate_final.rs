@@ -22,6 +22,7 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_expression::DataSchemaRefExt;
 use databend_common_expression::RemoteExpr;
 
+use super::SortDesc;
 use crate::executor::explain::PlanStatsInfo;
 use crate::executor::physical_plans::AggregateExpand;
 use crate::executor::physical_plans::AggregateFunctionDesc;
@@ -45,8 +46,6 @@ pub struct AggregateFinal {
     pub group_by: Vec<IndexType>,
     pub agg_funcs: Vec<AggregateFunctionDesc>,
     pub before_group_by_schema: DataSchemaRef,
-    pub limit: Option<usize>,
-
     pub group_by_display: Vec<String>,
 
     // Only used for explain
@@ -105,7 +104,7 @@ impl PhysicalPlanBuilder {
             aggregate_functions: used,
             from_distinct: agg.from_distinct,
             mode: agg.mode,
-            limit: agg.limit,
+            rank_limit: agg.rank_limit.clone(),
             grouping_sets: agg.grouping_sets.clone(),
         };
 
@@ -162,12 +161,12 @@ impl PhysicalPlanBuilder {
 
                 if let Some(grouping_sets) = agg.grouping_sets.as_ref() {
                     assert_eq!(grouping_sets.dup_group_items.len(), group_items.len() - 1); // ignore `_grouping_id`.
-                    // If the aggregation function argument if a group item,
-                    // we cannot use the group item directly.
-                    // It's because the group item will be wrapped with nullable and fill dummy NULLs (in `AggregateExpand` plan),
-                    // which will cause panic while executing aggregation function.
-                    // To avoid the panic, we will duplicate (`Arc::clone`) original group item columns in `AggregateExpand`,
-                    // we should use these columns instead.
+                                                                                            // If the aggregation function argument if a group item,
+                                                                                            // we cannot use the group item directly.
+                                                                                            // It's because the group item will be wrapped with nullable and fill dummy NULLs (in `AggregateExpand` plan),
+                                                                                            // which will cause panic while executing aggregation function.
+                                                                                            // To avoid the panic, we will duplicate (`Arc::clone`) original group item columns in `AggregateExpand`,
+                                                                                            // we should use these columns instead.
                     for func in agg_funcs.iter_mut() {
                         for arg in func.arg_indices.iter_mut() {
                             if let Some(pos) = group_items.iter().position(|g| g == arg) {
@@ -176,6 +175,19 @@ impl PhysicalPlanBuilder {
                         }
                     }
                 }
+
+                let rank_limit = agg.rank_limit.map(|(item, limit)| {
+                    let desc = item
+                        .iter()
+                        .map(|v| SortDesc {
+                            asc: v.asc,
+                            nulls_first: v.nulls_first,
+                            order_by: v.index,
+                            display_name: self.metadata.read().column(v.index).name(),
+                        })
+                        .collect::<Vec<_>>();
+                    (desc, limit)
+                });
 
                 match input {
                     PhysicalPlan::Exchange(Exchange { input, kind, .. })
@@ -197,6 +209,7 @@ impl PhysicalPlanBuilder {
                                 group_by_display,
                                 group_by: group_items,
                                 stat_info: Some(stat_info),
+                                rank_limit: None,
                             }
                         } else {
                             AggregatePartial {
@@ -207,6 +220,7 @@ impl PhysicalPlanBuilder {
                                 group_by_display,
                                 group_by: group_items,
                                 stat_info: Some(stat_info),
+                                rank_limit,
                             }
                         };
 
@@ -275,6 +289,7 @@ impl PhysicalPlanBuilder {
                                 group_by: group_items,
                                 input: Box::new(PhysicalPlan::AggregateExpand(expand)),
                                 stat_info: Some(stat_info),
+                                rank_limit: None,
                             })
                         } else {
                             PhysicalPlan::AggregatePartial(AggregatePartial {
@@ -285,6 +300,7 @@ impl PhysicalPlanBuilder {
                                 group_by: group_items,
                                 input: Box::new(input),
                                 stat_info: Some(stat_info),
+                                rank_limit,
                             })
                         }
                     }
@@ -358,7 +374,7 @@ impl PhysicalPlanBuilder {
                 match input {
                     PhysicalPlan::AggregatePartial(ref partial) => {
                         let before_group_by_schema = partial.input.output_schema()?;
-                        let limit = agg.limit;
+
                         PhysicalPlan::AggregateFinal(AggregateFinal {
                             plan_id: 0,
                             group_by_display: partial.group_by_display.clone(),
@@ -368,7 +384,6 @@ impl PhysicalPlanBuilder {
                             before_group_by_schema,
 
                             stat_info: Some(stat_info),
-                            limit,
                         })
                     }
 
@@ -377,7 +392,6 @@ impl PhysicalPlanBuilder {
                         ..
                     }) => {
                         let before_group_by_schema = partial.input.output_schema()?;
-                        let limit = agg.limit;
 
                         PhysicalPlan::AggregateFinal(AggregateFinal {
                             plan_id: 0,
@@ -388,7 +402,6 @@ impl PhysicalPlanBuilder {
                             before_group_by_schema,
 
                             stat_info: Some(stat_info),
-                            limit,
                         })
                     }
 

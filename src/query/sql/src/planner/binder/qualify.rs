@@ -53,8 +53,6 @@ impl Binder {
             &self.name_resolution_ctx,
             self.metadata.clone(),
             aliases,
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
         );
         let (mut scalar, _) = scalar_binder.bind(qualify)?;
         let mut rewriter = WindowRewriter::new(bind_context, self.metadata.clone());
@@ -114,7 +112,7 @@ impl<'a> QualifyChecker<'a> {
     }
 }
 
-impl<'a> VisitorMut<'_> for QualifyChecker<'a> {
+impl VisitorMut<'_> for QualifyChecker<'_> {
     fn visit(&mut self, expr: &mut ScalarExpr) -> Result<()> {
         if let ScalarExpr::WindowFunction(window) = expr {
             if let Some(column) = self

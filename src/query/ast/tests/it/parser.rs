@@ -18,22 +18,15 @@ use std::io::Write;
 
 use databend_common_ast::ast::quote::ident_needs_quote;
 use databend_common_ast::ast::quote::QuotedIdent;
-use databend_common_ast::parser::display_parser_error;
 use databend_common_ast::parser::expr::*;
-use databend_common_ast::parser::parse_sql;
 use databend_common_ast::parser::query::*;
 use databend_common_ast::parser::script::script_block;
 use databend_common_ast::parser::script::script_stmt;
 use databend_common_ast::parser::statement::insert_stmt;
 use databend_common_ast::parser::token::*;
-use databend_common_ast::parser::tokenize_sql;
-use databend_common_ast::parser::Backtrace;
-use databend_common_ast::parser::Dialect;
-use databend_common_ast::parser::IResult;
-use databend_common_ast::parser::Input;
-use databend_common_ast::parser::ParseMode;
-use databend_common_ast::rule;
+use databend_common_ast::parser::*;
 use goldenfile::Mint;
+use nom_rule::rule;
 
 fn run_parser<P, O>(file: &mut dyn Write, parser: P, src: &str)
 where
@@ -94,6 +87,8 @@ fn test_statement() {
     let file = &mut mint.new_goldenfile("stmt.txt").unwrap();
     let cases = &[
         r#"show databases"#,
+        r#"show drop databases"#,
+        r#"show drop databases like 'db%'"#,
         r#"show databases format TabSeparatedWithNamesAndTypes;"#,
         r#"show tables"#,
         r#"show drop tables"#,
@@ -136,18 +131,14 @@ fn test_statement() {
         r#"create table a.b like c.d;"#,
         r#"create table t like t2 engine = memory;"#,
         r#"create table if not exists a.b (a int) 's3://testbucket/admin/data/' connection=(aws_key_id='minioadmin' aws_secret_key='minioadmin' endpoint_url='http://127.0.0.1:9900');"#,
-        r#"
-            create table if not exists a.b (a int) 's3://testbucket/admin/data/'
-                connection=(aws_key_id='minioadmin' aws_secret_key='minioadmin' endpoint_url='http://127.0.0.1:9900')
-                location_prefix = 'db';
-        "#,
         r#"truncate table a;"#,
         r#"truncate table "a".b;"#,
         r#"drop table a;"#,
         r#"drop table if exists a."b";"#,
         r#"use "a";"#,
         r#"create catalog ctl type=hive connection=(url='<hive-meta-store>' thrift_protocol='binary');"#,
-        r#"create catalog ctl type=share connection=(name='provider.test_share' endpoint='endpoint_name');"#,
+        r#"select current_catalog();"#,
+        r#"use catalog ctl;"#,
         r#"create database if not exists a;"#,
         r#"create database ctl.t engine = Default;"#,
         r#"create database t engine = Default;"#,
@@ -208,6 +199,8 @@ fn test_statement() {
         r#"select * from a semi join b on a.a = b.a;"#,
         r#"select * from a left anti join b on a.a = b.a;"#,
         r#"select * from a anti join b on a.a = b.a;"#,
+        r#"SETTINGS (max_thread=1, timezone='Asia/Shanghai') select 1;"#,
+        r#"SETTINGS (max_thread=1) select * from a anti join b on a.a = b.a;"#,
         r#"select * from a right semi join b on a.a = b.a;"#,
         r#"select * from a right anti join b on a.a = b.a;"#,
         r#"select * from a full outer join b on a.a = b.a;"#,
@@ -232,10 +225,11 @@ fn test_statement() {
         r#"select * from t sample row (99);"#,
         r#"select * from t sample block (99);"#,
         r#"select * from t sample row (10 rows);"#,
-        r#"select * from t sample block (10 rows);"#,
         r#"select * from numbers(1000) sample row (99);"#,
         r#"select * from numbers(1000) sample block (99);"#,
         r#"select * from numbers(1000) sample row (10 rows);"#,
+        r#"select * from numbers(1000) sample block (99) row (10 rows);"#,
+        r#"select * from numbers(1000) sample block (99) row (10);"#,
         r#"insert into t (c1, c2) values (1, 2), (3, 4);"#,
         r#"insert into t (c1, c2) values (1, 2);"#,
         r#"insert into table t select * from t2;"#,
@@ -551,14 +545,6 @@ fn test_statement() {
         r#"PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200"#,
         r#"PRESIGN UPLOAD @my_stage/path/to/file EXPIRE=7200 CONTENT_TYPE='application/octet-stream'"#,
         r#"PRESIGN UPLOAD @my_stage/path/to/file CONTENT_TYPE='application/octet-stream' EXPIRE=7200"#,
-        r#"CREATE SHARE ENDPOINT IF NOT EXISTS t URL='http://127.0.0.1' CREDENTIAL=(TYPE='HMAC' KEY='hello') ARGS=(jwks_key_file="https://eks.public/keys" ssl_cert="cert.pem") COMMENT='share endpoint comment';"#,
-        r#"CREATE OR REPLACE SHARE ENDPOINT t URL='http://127.0.0.1' CREDENTIAL=(TYPE='HMAC' KEY='hello') ARGS=(jwks_key_file="https://eks.public/keys" ssl_cert="cert.pem") COMMENT='share endpoint comment';"#,
-        r#"CREATE SHARE t COMMENT='share comment';"#,
-        r#"CREATE SHARE IF NOT EXISTS t;"#,
-        r#"DROP SHARE a;"#,
-        r#"DROP SHARE IF EXISTS a;"#,
-        r#"GRANT USAGE ON DATABASE db1 TO SHARE a;"#,
-        r#"GRANT SELECT ON TABLE db1.tb1 TO SHARE a;"#,
         r#"GRANT all ON stage s1 TO a;"#,
         r#"GRANT read ON stage s1 TO a;"#,
         r#"GRANT write ON stage s1 TO a;"#,
@@ -567,17 +553,8 @@ fn test_statement() {
         r#"GRANT usage ON UDF a TO 'test-grant';"#,
         r#"REVOKE usage ON UDF a FROM 'test-grant';"#,
         r#"REVOKE all ON UDF a FROM 'test-grant';"#,
-        r#"REVOKE USAGE ON DATABASE db1 FROM SHARE a;"#,
-        r#"REVOKE SELECT ON TABLE db1.tb1 FROM SHARE a;"#,
-        r#"ALTER SHARE a ADD TENANTS = b,c;"#,
-        r#"ALTER SHARE IF EXISTS a ADD TENANTS = b,c;"#,
-        r#"ALTER SHARE IF EXISTS a REMOVE TENANTS = b,c;"#,
-        r#"DESC SHARE b;"#,
-        r#"DESCRIBE SHARE b;"#,
-        r#"SHOW SHARES;"#,
         r#"SHOW GRANTS ON TABLE db1.tb1;"#,
         r#"SHOW GRANTS ON DATABASE db;"#,
-        r#"SHOW GRANTS OF SHARE t;"#,
         r#"UPDATE db1.tb1 set a = a + 1, b = 2 WHERE c > 3;"#,
         r#"select $abc + 3"#,
         r#"select IDENTIFIER($abc)"#,
@@ -589,6 +566,8 @@ fn test_statement() {
         r#"UNSET (max_threads, sql_dialect);"#,
         r#"UNSET session (max_threads, sql_dialect);"#,
         r#"SET variable a = 3"#,
+        r#"show variables"#,
+        r#"show variables like 'v%'"#,
         r#"SET variable a = select 3"#,
         r#"SET variable a = (select max(number) from numbers(10))"#,
         r#"select $1 FROM '@my_stage/my data/'"#,
@@ -612,12 +591,16 @@ fn test_statement() {
         "#,
         r#"SHOW FILE FORMATS"#,
         r#"DROP FILE FORMAT my_csv"#,
+        r#"SELECT * FROM t GROUP BY all"#,
+        r#"SELECT * FROM t GROUP BY a, b, c, d"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS (a, b, c, d)"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS (a, b, (c, d))"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b), (c), (d, e))"#,
         r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b), (), (d, e))"#,
         r#"SELECT * FROM t GROUP BY CUBE (a, b, c)"#,
         r#"SELECT * FROM t GROUP BY ROLLUP (a, b, c)"#,
+        r#"SELECT * FROM t GROUP BY a, ROLLUP (b, c)"#,
+        r#"SELECT * FROM t GROUP BY GROUPING SETS ((a, b)), a, ROLLUP (b, c)"#,
         r#"CREATE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN ('ANALYST') THEN VAL ELSE '*********'END comment = 'this is a masking policy'"#,
         r#"CREATE OR REPLACE MASKING POLICY email_mask AS (val STRING) RETURNS STRING -> CASE WHEN current_role() IN ('ANALYST') THEN VAL ELSE '*********'END comment = 'this is a masking policy'"#,
         r#"DESC MASKING POLICY email_mask"#,
@@ -811,7 +794,7 @@ fn test_statement() {
         r#"DROP FUNCTION binary_reverse;"#,
         r#"DROP FUNCTION isnotempty;"#,
         r#"
-            EXECUTE IMMEDIATE 
+            EXECUTE IMMEDIATE
             $$
             BEGIN
                 LOOP
@@ -841,6 +824,60 @@ fn test_statement() {
             PRIMARY KEY username
             SOURCE (mysql(host='localhost' username='root' password='1234'))
             COMMENT 'This is a comment';"#,
+        // Stored Procedure
+        r#"describe PROCEDURE p1()"#,
+        r#"describe PROCEDURE p1(string, timestamp)"#,
+        r#"drop PROCEDURE p1()"#,
+        r#"drop PROCEDURE if exists p1()"#,
+        r#"drop PROCEDURE p1(int, string)"#,
+        r#"call PROCEDURE p1()"#,
+        r#"call PROCEDURE p1(1, 'x', '2022-02-02'::Date)"#,
+        r#"show PROCEDURES like 'p1%'"#,
+        r#"create or replace PROCEDURE p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE if not exists p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1() returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1(a int, b string) returns string not null language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1() returns table(a string not null, b int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
     ];
 
     for case in cases {
@@ -959,6 +996,30 @@ fn test_statement_error() {
         PRIMARY KEY username
         SOURCE ()
         COMMENT 'This is a comment';"#,
+        // Stored Procedure
+        r#"desc procedure p1"#,
+        r#"desc procedure p1(array, c int)"#,
+        r#"drop procedure p1"#,
+        r#"drop procedure p1(a int)"#,
+        r#"call procedure p1"#,
+        r#"create PROCEDURE p1() returns table(string not null, int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
+        r#"create PROCEDURE p1(int, string) returns table(string not null, int null) language sql comment = 'test' as $$
+            BEGIN
+                LET sum := 0;
+                FOR x IN SELECT * FROM numbers(100) DO
+                    sum := sum + x.number;
+                END FOR;
+                RETURN sum;
+            END;
+            $$;"#,
     ];
 
     for case in cases {
@@ -1036,7 +1097,11 @@ fn test_query() {
         r#"SELECT * FROM (((SELECT *) EXCEPT (SELECT *))) foo"#,
         r#"SELECT * FROM (SELECT * FROM xyu ORDER BY x, y) AS xyu"#,
         r#"select * from monthly_sales pivot(sum(amount) for month in ('JAN', 'FEB', 'MAR', 'APR')) order by empid"#,
+        r#"select * from (select * from monthly_sales) pivot(sum(amount) for month in ('JAN', 'FEB', 'MAR', 'APR')) order by empid"#,
+        r#"select * from monthly_sales pivot(sum(amount) for month in (select distinct month from monthly_sales)) order by empid"#,
+        r#"select * from (select * from monthly_sales) pivot(sum(amount) for month in ((select distinct month from monthly_sales))) order by empid"#,
         r#"select * from monthly_sales_1 unpivot(sales for month in (jan, feb, mar, april)) order by empid"#,
+        r#"select * from (select * from monthly_sales_1) unpivot(sales for month in (jan, feb, mar, april)) order by empid"#,
         r#"select * from range(1, 2)"#,
         r#"select sum(a) over w from customer window w as (partition by a order by b)"#,
         r#"select a, sum(a) over w, sum(a) over w1, sum(a) over w2 from t1 window w as (partition by a), w2 as (w1 rows current row), w1 as (w order by a) order by a"#,
@@ -1165,6 +1230,9 @@ fn test_expr() {
         r#"ARRAY_FILTER(col, y -> y % 2 = 0)"#,
         r#"(current_timestamp, current_timestamp(), now())"#,
         r#"ARRAY_REDUCE([1,2,3], (acc,t) -> acc + t)"#,
+        r#"MAP_FILTER({1:1,2:2,3:4}, (k, v) -> k > v)"#,
+        r#"MAP_TRANSFORM_KEYS({1:10,2:20,3:30}, (k, v) -> k + 1)"#,
+        r#"MAP_TRANSFORM_VALUES({1:10,2:20,3:30}, (k, v) -> v + 1)"#,
     ];
 
     for case in cases {
@@ -1184,6 +1252,7 @@ fn test_expr_error() {
         r#"1 a"#,
         r#"CAST(col1)"#,
         r#"a.add(b)"#,
+        r#"$ abc + 3"#,
         r#"[ x * 100 FOR x in [1,2,3] if x % 2 = 0 ]"#,
         r#"
             G.E.B IS NOT NULL

@@ -14,6 +14,8 @@
 
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::Hash;
 
 use dashmap::DashMap;
@@ -30,7 +32,7 @@ use databend_common_expression::ColumnId;
 use databend_common_expression::DataField;
 use databend_common_expression::DataSchemaRef;
 use databend_common_expression::DataSchemaRefExt;
-use databend_common_meta_app::schema::ShareDBParams;
+use databend_common_expression::TableDataType;
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -38,11 +40,11 @@ use itertools::Itertools;
 use super::AggregateInfo;
 use super::INTERNAL_COLUMN_FACTORY;
 use crate::binder::column_binding::ColumnBinding;
+use crate::binder::project_set::SetReturningInfo;
 use crate::binder::window::WindowInfo;
 use crate::binder::ColumnBindingBuilder;
 use crate::normalize_identifier;
 use crate::plans::ScalarExpr;
-use crate::plans::ScalarItem;
 use crate::ColumnSet;
 use crate::IndexType;
 use crate::MetadataRef;
@@ -104,6 +106,25 @@ pub enum NameResolutionResult {
     Alias { alias: String, scalar: ScalarExpr },
 }
 
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+pub struct VirtualColumnContext {
+    /// Whether allow rewrite as virtual column and pushdown.
+    pub allow_pushdown: bool,
+    /// The table indics of the virtual column has been readded,
+    /// used to avoid repeated reading
+    pub table_indices: HashSet<IndexType>,
+    /// Mapping: (table index) -> (derived virtual column indices)
+    /// This is used to add virtual column indices to Scan plan
+    pub virtual_column_indices: HashMap<IndexType, Vec<IndexType>>,
+    /// Mapping: (table index) -> (virtual column names and data types)
+    /// This is used to check whether the virtual column has be created
+    pub virtual_column_names: HashMap<IndexType, HashMap<String, TableDataType>>,
+    /// Mapping: (table index) -> (next virtual column id)
+    /// The is used to generate virtual column id for virtual columns.
+    /// Not a real column id, only used to identify a virtual column.
+    pub next_column_ids: HashMap<IndexType, u32>,
+}
+
 /// `BindContext` stores all the free variables in a query and tracks the context of binding procedure.
 #[derive(Clone, Debug)]
 pub struct BindContext {
@@ -118,10 +139,10 @@ pub struct BindContext {
 
     pub windows: WindowInfo,
 
-    /// If the `BindContext` is created from a CTE, record the cte name
-    pub cte_name: Option<String>,
+    /// Set-returning functions info in current context.
+    pub srf_info: SetReturningInfo,
 
-    pub cte_map_ref: Box<IndexMap<String, CteInfo>>,
+    pub cte_context: CteContext,
 
     /// True if there is aggregation in current context, which means
     /// non-grouping columns cannot be referenced outside aggregation
@@ -133,9 +154,6 @@ pub struct BindContext {
     /// It's used to check if the view has a loop dependency.
     pub view_info: Option<(String, String)>,
 
-    /// Set-returning functions in current context.
-    pub srfs: Vec<ScalarItem>,
-
     /// True if there is async function in current context, need rewrite.
     pub have_async_func: bool,
     /// True if there is udf script in current context, need rewrite.
@@ -145,6 +163,8 @@ pub struct BindContext {
 
     pub inverted_index_map: Box<IndexMap<IndexType, InvertedIndexInfo>>,
 
+    pub virtual_column_context: VirtualColumnContext,
+
     pub expr_context: ExprContext,
 
     /// If true, the query is planning for aggregate index.
@@ -152,9 +172,35 @@ pub struct BindContext {
     pub planning_agg_index: bool,
 
     pub window_definitions: DashMap<String, WindowSpec>,
+}
 
-    // when access a share view, save share db params to access all the table referenced by the view
-    pub share_paramas: Option<ShareDBParams>,
+#[derive(Clone, Debug, Default)]
+pub struct CteContext {
+    /// If the `BindContext` is created from a CTE, record the cte name
+    pub cte_name: Option<String>,
+    pub cte_map: Box<IndexMap<String, CteInfo>>,
+}
+
+impl CteContext {
+    // Merge two `CteContext` into one.
+    pub fn merge(&mut self, other: CteContext) {
+        let mut merged_cte_map = IndexMap::new();
+        for (left_key, left_value) in self.cte_map.iter() {
+            if let Some(right_value) = other.cte_map.get(left_key) {
+                let mut merged_value = left_value.clone();
+                if left_value.columns.is_empty() {
+                    merged_value.columns = right_value.columns.clone()
+                }
+                merged_cte_map.insert(left_key.clone(), merged_value);
+            }
+        }
+        self.cte_map = Box::new(merged_cte_map);
+    }
+
+    // Set cte context to current `BindContext`.
+    pub fn set_cte_context(&mut self, cte_context: CteContext) {
+        self.cte_map = cte_context.cte_map;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -164,8 +210,6 @@ pub struct CteInfo {
     pub materialized: bool,
     pub recursive: bool,
     pub cte_idx: IndexType,
-    // Record how many times this cte is used
-    pub used_count: usize,
     // If cte is materialized, save its columns
     pub columns: Vec<ColumnBinding>,
 }
@@ -178,19 +222,18 @@ impl BindContext {
             bound_internal_columns: BTreeMap::new(),
             aggregate_info: AggregateInfo::default(),
             windows: WindowInfo::default(),
-            cte_name: None,
-            cte_map_ref: Box::default(),
+            srf_info: SetReturningInfo::default(),
+            cte_context: CteContext::default(),
             in_grouping: false,
             view_info: None,
-            srfs: Vec::new(),
             have_async_func: false,
             have_udf_script: false,
             have_udf_server: false,
             inverted_index_map: Box::default(),
+            virtual_column_context: VirtualColumnContext::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
             window_definitions: DashMap::new(),
-            share_paramas: None,
         }
     }
 
@@ -201,19 +244,18 @@ impl BindContext {
             bound_internal_columns: BTreeMap::new(),
             aggregate_info: Default::default(),
             windows: Default::default(),
-            cte_name: parent.cte_name,
-            cte_map_ref: parent.cte_map_ref.clone(),
+            srf_info: Default::default(),
+            cte_context: parent.cte_context.clone(),
             in_grouping: false,
             view_info: None,
-            srfs: Vec::new(),
             have_async_func: false,
             have_udf_script: false,
             have_udf_server: false,
             inverted_index_map: Box::default(),
+            virtual_column_context: Default::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
             window_definitions: DashMap::new(),
-            share_paramas: None,
         }
     }
 
@@ -221,8 +263,7 @@ impl BindContext {
     pub fn replace(&self) -> Self {
         let mut bind_context = BindContext::new();
         bind_context.parent = self.parent.clone();
-        bind_context.cte_name = self.cte_name.clone();
-        bind_context.cte_map_ref = self.cte_map_ref.clone();
+        bind_context.cte_context = self.cte_context.clone();
         bind_context
     }
 

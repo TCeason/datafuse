@@ -29,6 +29,7 @@ use databend_common_meta_app::principal::StageType;
 use databend_common_meta_app::principal::UserGrantSet;
 use databend_common_meta_app::principal::UserPrivilegeSet;
 use databend_common_meta_app::principal::UserPrivilegeType;
+use databend_common_meta_app::principal::SYSTEM_TABLES_ALLOW_LIST;
 use databend_common_meta_app::tenant::Tenant;
 use databend_common_meta_types::seq_value::SeqV;
 use databend_common_sql::binder::MutationType;
@@ -57,31 +58,6 @@ enum ObjectId {
     Database(u64),
     Table(u64, u64),
 }
-
-// some statements like `SELECT 1`, `SHOW USERS`, `SHOW ROLES`, `SHOW TABLES` will be
-// rewritten to the queries on the system tables, we need to skip the privilege check on
-// these tables.
-const SYSTEM_TABLES_ALLOW_LIST: [&str; 19] = [
-    "catalogs",
-    "columns",
-    "databases",
-    "tables",
-    "views",
-    "tables_with_history",
-    "views_with_history",
-    "password_policies",
-    "streams",
-    "streams_terse",
-    "virtual_columns",
-    "users",
-    "roles",
-    "stages",
-    "one",
-    "processes",
-    "user_functions",
-    "functions",
-    "indexes",
-];
 
 // table functions that need `Super` privilege
 const SYSTEM_TABLE_FUNCTIONS: [&str; 1] = ["fuse_amend"];
@@ -707,9 +683,11 @@ impl AccessChecker for PrivilegeAccess {
             } => {
                 match rewrite_kind {
                     Some(RewriteKind::ShowDatabases)
+                    | Some(RewriteKind::ShowDropDatabases)
                     | Some(RewriteKind::ShowEngines)
                     | Some(RewriteKind::ShowFunctions)
-                    | Some(RewriteKind::ShowUserFunctions) => {
+                    | Some(RewriteKind::ShowUserFunctions)
+                    | Some(RewriteKind::ShowDictionaries(_)) => {
                         return Ok(());
                     }
                     | Some(RewriteKind::ShowTableFunctions) => {
@@ -962,6 +940,9 @@ impl AccessChecker for PrivilegeAccess {
             Plan::SetOptions(plan) => {
                 self.validate_table_access(&plan.catalog, &plan.database, &plan.table, UserPrivilegeType::Alter, false, false).await?
             }
+            Plan::UnsetOptions(plan) => {
+                self.validate_table_access(&plan.catalog, &plan.database, &plan.table, UserPrivilegeType::Alter, false, false).await?
+            }
             Plan::AddTableColumn(plan) => {
                 self.validate_table_access(&plan.catalog, &plan.database, &plan.table, UserPrivilegeType::Alter, false, false).await?
             }
@@ -1016,7 +997,8 @@ impl AccessChecker for PrivilegeAccess {
             // Dictionary
             Plan::ShowCreateDictionary(_)
             | Plan::CreateDictionary(_)
-            | Plan::DropDictionary(_) => {
+            | Plan::DropDictionary(_)
+            | Plan::RenameDictionary(_) => {
                 self.validate_access(&GrantObject::Global, UserPrivilegeType::Super, false, false)
                     .await?;
             }
@@ -1161,11 +1143,7 @@ impl AccessChecker for PrivilegeAccess {
                 )
                     .await?;
             }
-            Plan::GrantShareObject(_)
-            | Plan::RevokeShareObject(_)
-            | Plan::ShowObjectGrantPrivileges(_)
-            | Plan::ShowGrantTenantsOfShare(_)
-            | Plan::GrantRole(_)
+            Plan::GrantRole(_)
             | Plan::GrantPriv(_)
             | Plan::RevokePriv(_)
             | Plan::RevokeRole(_) => {
@@ -1180,7 +1158,6 @@ impl AccessChecker for PrivilegeAccess {
             Plan::RenameDatabase(_)
             | Plan::RevertTable(_)
             | Plan::AlterUDF(_)
-            | Plan::AlterShareTenants(_)
             | Plan::RefreshIndex(_)
             | Plan::RefreshTableIndex(_)
             | Plan::AlterUser(_) => {
@@ -1202,16 +1179,10 @@ impl AccessChecker for PrivilegeAccess {
             Plan::RemoveStage(plan) => {
                 self.validate_stage_access(&plan.stage, UserPrivilegeType::Write).await?;
             }
-            Plan::CreateShareEndpoint(_)
-            | Plan::ShowShareEndpoint(_)
-            | Plan::DropShareEndpoint(_)
-            | Plan::CreateShare(_)
-            | Plan::DropShare(_)
-            | Plan::DescShare(_)
-            | Plan::ShowShares(_)
-            | Plan::ShowCreateCatalog(_)
+            Plan::ShowCreateCatalog(_)
             | Plan::CreateCatalog(_)
             | Plan::DropCatalog(_)
+            | Plan::UseCatalog(_)
             | Plan::CreateFileFormat(_)
             | Plan::DropFileFormat(_)
             | Plan::ShowFileFormats(_)
@@ -1234,6 +1205,7 @@ impl AccessChecker for PrivilegeAccess {
             | Plan::DropNotification(_)
             | Plan::DescNotification(_)
             | Plan::AlterNotification(_)
+            | Plan::DescUser(_)
             | Plan::CreateTask(_)   // TODO: need to build ownership info for task
             | Plan::ShowTasks(_)    // TODO: need to build ownership info for task
             | Plan::DescribeTask(_) // TODO: need to build ownership info for task
@@ -1271,9 +1243,17 @@ impl AccessChecker for PrivilegeAccess {
             Plan::ExistsTable(_) => {}
             Plan::DescDatamaskPolicy(_) => {}
             Plan::Begin => {}
+            Plan::ExecuteImmediate(_)
+            | Plan::CallProcedure(_)
+            | Plan::CreateProcedure(_)
+            | Plan::DropProcedure(_)
+            /*| Plan::ShowCreateProcedure(_)
+            | Plan::RenameProcedure(_)*/ => {
+                self.validate_access(&GrantObject::Global, UserPrivilegeType::Super, false, false)
+                    .await?;
+            }
             Plan::Commit => {}
             Plan::Abort => {}
-            Plan::ExecuteImmediate(_) => {}
         }
 
         Ok(())
@@ -1339,7 +1319,9 @@ async fn has_priv(
     }
     if db_name.to_lowercase() == "system" {
         if let Some(table_name) = table_name {
-            return Ok(SYSTEM_TABLES_ALLOW_LIST.contains(&table_name));
+            if SYSTEM_TABLES_ALLOW_LIST.contains(&table_name) {
+                return Ok(true);
+            }
         }
     }
 
