@@ -116,7 +116,7 @@ pub struct ShowDropTablesStmt {
 
 impl Display for ShowDropTablesStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "SHOW DROP TABLE")?;
+        write!(f, "SHOW DROP TABLES")?;
         if let Some(database) = &self.database {
             write!(f, " FROM {database}")?;
         }
@@ -426,6 +426,9 @@ pub enum AlterTableAction {
     SetOptions {
         set_options: BTreeMap<String, String>,
     },
+    UnsetOptions {
+        targets: Vec<Identifier>,
+    },
 }
 
 impl Display for AlterTableAction {
@@ -436,6 +439,7 @@ impl Display for AlterTableAction {
                 write_comma_separated_string_map(f, set_options)?;
                 write!(f, ")")?;
             }
+
             AlterTableAction::RenameTable { new_table } => {
                 write!(f, "RENAME TO {new_table}")?;
             }
@@ -481,6 +485,18 @@ impl Display for AlterTableAction {
             }
             AlterTableAction::FlashbackTo { point } => {
                 write!(f, "FLASHBACK TO {}", point)?;
+            }
+            AlterTableAction::UnsetOptions {
+                targets: unset_targets,
+            } => {
+                write!(f, "UNSET OPTIONS ")?;
+                if unset_targets.len() == 1 {
+                    write!(f, "{}", unset_targets[0])?;
+                } else {
+                    write!(f, "(")?;
+                    write_comma_separated_list(f, unset_targets)?;
+                    write!(f, ")")?;
+                }
             }
         };
         Ok(())

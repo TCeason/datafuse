@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -25,8 +27,10 @@ use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::NumberScalar;
+use databend_common_expression::FunctionKind;
 use databend_common_expression::RemoteExpr;
 use databend_common_expression::Scalar;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_meta_app::schema::GetSequenceNextValueReq;
 use databend_common_meta_app::schema::SequenceIdent;
 use databend_common_meta_app::tenant::Tenant;
@@ -82,7 +86,9 @@ impl PartialEq for ScalarExpr {
     #[recursive::recursive]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ScalarExpr::BoundColumnRef(l), ScalarExpr::BoundColumnRef(r)) => l.eq(r),
+            (ScalarExpr::BoundColumnRef(l), ScalarExpr::BoundColumnRef(r)) => {
+                l.column.index == r.column.index && l.column.table_index == r.column.table_index
+            }
             (ScalarExpr::ConstantExpr(l), ScalarExpr::ConstantExpr(r)) => l.eq(r),
             (ScalarExpr::WindowFunction(l), ScalarExpr::WindowFunction(r)) => l.eq(r),
             (ScalarExpr::AggregateFunction(l), ScalarExpr::AggregateFunction(r)) => l.eq(r),
@@ -102,7 +108,10 @@ impl Hash for ScalarExpr {
     #[recursive::recursive]
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            ScalarExpr::BoundColumnRef(v) => v.hash(state),
+            ScalarExpr::BoundColumnRef(v) => {
+                v.column.index.hash(state);
+                v.column.table_index.hash(state);
+            }
             ScalarExpr::ConstantExpr(v) => v.hash(state),
             ScalarExpr::WindowFunction(v) => v.hash(state),
             ScalarExpr::AggregateFunction(v) => v.hash(state),
@@ -185,11 +194,14 @@ impl ScalarExpr {
                     .into_option()?;
                 Some(Range { start, end })
             }),
+            ScalarExpr::WindowFunction(expr) => expr.span,
+            ScalarExpr::AggregateFunction(expr) => expr.span,
+            ScalarExpr::LambdaFunction(expr) => expr.span,
             ScalarExpr::CastExpr(expr) => expr.span.or(expr.argument.span()),
             ScalarExpr::SubqueryExpr(expr) => expr.span,
             ScalarExpr::UDFCall(expr) => expr.span,
             ScalarExpr::UDFLambdaCall(expr) => expr.span,
-            _ => None,
+            ScalarExpr::AsyncFunctionCall(expr) => expr.span,
         }
     }
 
@@ -200,6 +212,20 @@ impl ScalarExpr {
         }
 
         impl<'a> Visitor<'a> for EvaluableVisitor {
+            fn visit_function_call(&mut self, func: &'a FunctionCall) -> Result<()> {
+                if BUILTIN_FUNCTIONS
+                    .get_property(&func.func_name)
+                    .map(|property| property.kind == FunctionKind::SRF)
+                    .unwrap_or(false)
+                {
+                    self.evaluable = false;
+                } else {
+                    for expr in &func.arguments {
+                        self.visit(expr)?;
+                    }
+                }
+                Ok(())
+            }
             fn visit_window_function(&mut self, _: &'a WindowFunc) -> Result<()> {
                 self.evaluable = false;
                 Ok(())
@@ -217,6 +243,10 @@ impl ScalarExpr {
                 Ok(())
             }
             fn visit_udf_lambda_call(&mut self, _: &'a UDFLambdaCall) -> Result<()> {
+                self.evaluable = false;
+                Ok(())
+            }
+            fn visit_async_function_call(&mut self, _: &'a AsyncFunctionCall) -> Result<()> {
                 self.evaluable = false;
                 Ok(())
             }
@@ -590,8 +620,11 @@ impl<'a> TryFrom<&'a BinaryOperator> for ComparisonOp {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Debug, Educe)]
+#[educe(PartialEq, Eq, Hash)]
 pub struct AggregateFunction {
+    #[educe(PartialEq(ignore), Eq(ignore), Hash(ignore))]
+    pub span: Span,
     pub func_name: String,
     pub distinct: bool,
     pub params: Vec<Scalar>,
@@ -778,6 +811,60 @@ pub enum AsyncFunctionArgument {
     // Used by `nextval` function to call meta's `get_sequence_next_value` api
     // to get incremental values.
     SequenceFunction(String),
+    // The dictionary argument is connection URL of remote source, like Redis, MySQL ...
+    // Used by `dict_get` function to connect source and read data.
+    DictGetFunction(DictGetFunctionArgument),
+}
+
+#[derive(Clone, Debug, Educe, serde::Serialize, serde::Deserialize)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct RedisSource {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub db_index: Option<i64>,
+}
+
+impl Display for RedisSource {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "redis://")?;
+        if let Some(username) = &self.username {
+            write!(f, "{}:", username)?
+        }
+        if let Some(password) = &self.password {
+            write!(f, "{}@", password)?;
+        }
+        write!(f, "{}:{}", self.host, self.port)?;
+        if let Some(db_index) = &self.db_index {
+            write!(f, "/{}", db_index)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Educe, serde::Serialize, serde::Deserialize)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct SqlSource {
+    // SQL source connection URL, like `mysql://user:password@localhost:3306/db`
+    pub connection_url: String,
+    pub table: String,
+    pub key_field: String,
+    pub value_field: String,
+}
+
+#[derive(Clone, Debug, Educe, EnumAsInner, serde::Serialize, serde::Deserialize)]
+#[educe(PartialEq, Eq, Hash)]
+pub enum DictionarySource {
+    Mysql(SqlSource),
+    Redis(RedisSource),
+}
+
+#[derive(Clone, Debug, Educe, serde::Serialize, serde::Deserialize)]
+#[educe(PartialEq, Eq, Hash)]
+pub struct DictGetFunctionArgument {
+    pub dict_source: DictionarySource,
+    pub default_value: Scalar,
 }
 
 // Asynchronous functions are functions that need to call remote interfaces.
@@ -804,6 +891,9 @@ impl AsyncFunctionCall {
                 // Call meta's api to generate an incremental value.
                 let reply = catalog.get_sequence_next_value(req).await?;
                 Ok(Scalar::Number(NumberScalar::UInt64(reply.start)))
+            }
+            AsyncFunctionArgument::DictGetFunction(_dict_get_function_argument) => {
+                Err(ErrorCode::Internal("Cannot generate dict_get function"))
             }
         }
     }

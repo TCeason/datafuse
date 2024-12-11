@@ -15,23 +15,22 @@
 use std::any::Any;
 use std::io::Cursor;
 
-use chrono_tz::Tz;
-use databend_common_arrow::arrow::bitmap::MutableBitmap;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::serialize::read_decimal_from_json;
 use databend_common_expression::serialize::uniform_date;
 use databend_common_expression::types::array::ArrayColumnBuilder;
 use databend_common_expression::types::binary::BinaryColumnBuilder;
-use databend_common_expression::types::date::check_date;
+use databend_common_expression::types::date::clamp_date;
 use databend_common_expression::types::decimal::Decimal;
 use databend_common_expression::types::decimal::DecimalColumnBuilder;
 use databend_common_expression::types::decimal::DecimalSize;
 use databend_common_expression::types::nullable::NullableColumnBuilder;
 use databend_common_expression::types::number::Number;
 use databend_common_expression::types::string::StringColumnBuilder;
-use databend_common_expression::types::timestamp::check_timestamp;
+use databend_common_expression::types::timestamp::clamp_timestamp;
 use databend_common_expression::types::AnyType;
+use databend_common_expression::types::MutableBitmap;
 use databend_common_expression::types::NumberColumnBuilder;
 use databend_common_expression::with_decimal_type;
 use databend_common_expression::with_number_mapped_type;
@@ -39,8 +38,9 @@ use databend_common_expression::ColumnBuilder;
 use databend_common_io::cursor_ext::BufferReadDateTimeExt;
 use databend_common_io::cursor_ext::DateTimeResType;
 use databend_common_io::geography::geography_from_ewkt;
+use databend_common_io::geometry_from_ewkt;
 use databend_common_io::parse_bitmap;
-use databend_common_io::parse_to_ewkb;
+use jiff::tz::TimeZone;
 use lexical_core::FromLexical;
 use num::cast::AsPrimitive;
 use num_traits::NumCast;
@@ -51,11 +51,10 @@ use crate::FieldDecoder;
 use crate::FileFormatOptionsExt;
 
 pub struct FieldJsonAstDecoder {
-    timezone: Tz,
+    jiff_timezone: TimeZone,
     pub ident_case_sensitive: bool,
     pub is_select: bool,
     is_rounding_mode: bool,
-    enable_dst_hour_fix: bool,
 }
 
 impl FieldDecoder for FieldJsonAstDecoder {
@@ -67,11 +66,10 @@ impl FieldDecoder for FieldJsonAstDecoder {
 impl FieldJsonAstDecoder {
     pub fn create(options: &FileFormatOptionsExt) -> Self {
         FieldJsonAstDecoder {
-            timezone: options.timezone,
+            jiff_timezone: options.jiff_timezone.clone(),
             ident_case_sensitive: options.ident_case_sensitive,
             is_select: options.is_select,
             is_rounding_mode: options.is_rounding_mode,
-            enable_dst_hour_fix: options.enable_dst_hour_fix,
         }
     }
 
@@ -264,16 +262,14 @@ impl FieldJsonAstDecoder {
         match value {
             Value::String(v) => {
                 let mut reader = Cursor::new(v.as_bytes());
-                let date = reader.read_date_text(&self.timezone, self.enable_dst_hour_fix)?;
+                let date = reader.read_date_text(&self.jiff_timezone)?;
                 let days = uniform_date(date);
-                check_date(days as i64)?;
-                column.push(days);
+                column.push(clamp_date(days as i64));
                 Ok(())
             }
             Value::Number(number) => match number.as_i64() {
                 Some(n) => {
-                    let n = check_date(n)?;
-                    column.push(n);
+                    column.push(clamp_date(n));
                     Ok(())
                 }
                 None => Err(ErrorCode::BadArguments("Incorrect date value")),
@@ -287,13 +283,12 @@ impl FieldJsonAstDecoder {
             Value::String(v) => {
                 let v = v.clone();
                 let mut reader = Cursor::new(v.as_bytes());
-                let ts =
-                    reader.read_timestamp_text(&self.timezone, false, self.enable_dst_hour_fix)?;
+                let ts = reader.read_timestamp_text(&self.jiff_timezone)?;
 
                 match ts {
                     DateTimeResType::Datetime(ts) => {
-                        let micros = ts.timestamp_micros();
-                        check_timestamp(micros)?;
+                        let mut micros = ts.timestamp().as_microsecond();
+                        clamp_timestamp(&mut micros);
                         column.push(micros.as_());
                     }
                     _ => unreachable!(),
@@ -301,8 +296,8 @@ impl FieldJsonAstDecoder {
                 Ok(())
             }
             Value::Number(number) => match number.as_i64() {
-                Some(n) => {
-                    check_timestamp(n)?;
+                Some(mut n) => {
+                    clamp_timestamp(&mut n);
                     column.push(n);
                     Ok(())
                 }
@@ -348,7 +343,7 @@ impl FieldJsonAstDecoder {
     fn read_geometry(&self, column: &mut BinaryColumnBuilder, value: &Value) -> Result<()> {
         match value {
             Value::String(v) => {
-                let geom = parse_to_ewkb(v, None)?;
+                let geom = geometry_from_ewkt(v, None)?;
                 column.put_slice(&geom);
                 column.commit_row();
                 Ok(())

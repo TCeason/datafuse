@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_recursion::async_recursion;
@@ -25,9 +24,7 @@ use databend_common_ast::Span;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use indexmap::IndexMap;
 
-use crate::binder::CteInfo;
 use crate::binder::Finder;
 use crate::binder::JoinPredicate;
 use crate::binder::Visibility;
@@ -50,7 +47,6 @@ use crate::plans::ScalarExpr;
 use crate::plans::Visitor;
 use crate::BindContext;
 use crate::ColumnBinding;
-use crate::IndexType;
 use crate::MetadataRef;
 
 pub struct JoinConditions {
@@ -89,6 +85,10 @@ impl Binder {
         let (right_child, right_context) = if join.right.is_lateral_subquery() {
             self.bind_table_reference(&mut left_context, &join.right)?
         } else {
+            // Merge cte info from left context to `bind_context`
+            bind_context
+                .cte_context
+                .merge(left_context.cte_context.clone());
             self.bind_table_reference(bind_context, &join.right)?
         };
 
@@ -122,8 +122,16 @@ impl Binder {
             build_side_cache_info,
         )?;
 
-        let bind_context = join_bind_context(&join_type, bind_context, left_context, right_context);
+        let mut bind_context = join_bind_context(
+            &join_type,
+            bind_context,
+            left_context.clone(),
+            right_context.clone(),
+        );
 
+        bind_context
+            .cte_context
+            .set_cte_context(right_context.cte_context);
         Ok((s_expr, bind_context))
     }
 
@@ -164,8 +172,12 @@ impl Binder {
             right_child,
             None,
         )?;
-        let bind_context = join_bind_context(&join_type, bind_context, left_context, right_context);
-
+        let bind_context = join_bind_context(
+            &join_type,
+            bind_context,
+            left_context.clone(),
+            right_context,
+        );
         Ok((s_expr, bind_context))
     }
 
@@ -185,8 +197,6 @@ impl Binder {
             self.ctx.clone(),
             &self.name_resolution_ctx,
             self.metadata.clone(),
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
             join_op.clone(),
             left_column_bindings,
             right_column_bindings,
@@ -243,8 +253,7 @@ impl Binder {
         let mut is_null_equal = Vec::new();
         if !right_prop.outer_columns.is_empty() {
             // If there are outer columns in right child, then the join is a correlated lateral join
-            let mut decorrelator =
-                SubqueryRewriter::new(self.ctx.clone(), self.metadata.clone(), Some(self.clone()));
+            let mut decorrelator = SubqueryRewriter::new(self.metadata.clone(), Some(self.clone()));
             right_child = decorrelator.flatten_plan(
                 &right_child,
                 &right_prop.outer_columns,
@@ -516,8 +525,6 @@ struct JoinConditionResolver<'a> {
     ctx: Arc<dyn TableContext>,
     name_resolution_ctx: &'a NameResolutionContext,
     metadata: MetadataRef,
-    m_cte_bound_ctx: HashMap<IndexType, BindContext>,
-    ctes_map: Box<IndexMap<String, CteInfo>>,
     join_op: JoinOperator,
     left_column_bindings: &'a [ColumnBinding],
     right_column_bindings: &'a [ColumnBinding],
@@ -531,8 +538,6 @@ impl<'a> JoinConditionResolver<'a> {
         ctx: Arc<dyn TableContext>,
         name_resolution_ctx: &'a NameResolutionContext,
         metadata: MetadataRef,
-        m_cte_bound_ctx: HashMap<IndexType, BindContext>,
-        ctes_map: Box<IndexMap<String, CteInfo>>,
         join_op: JoinOperator,
         left_column_bindings: &'a [ColumnBinding],
         right_column_bindings: &'a [ColumnBinding],
@@ -543,8 +548,6 @@ impl<'a> JoinConditionResolver<'a> {
             ctx,
             name_resolution_ctx,
             metadata,
-            m_cte_bound_ctx,
-            ctes_map,
             join_op,
             left_column_bindings,
             right_column_bindings,
@@ -690,8 +693,6 @@ impl<'a> JoinConditionResolver<'a> {
             self.name_resolution_ctx,
             self.metadata.clone(),
             &[],
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
         );
         // Given two tables: t1(a, b), t2(a, b)
         // A predicate can be regarded as an equi-predicate iff:
@@ -700,7 +701,7 @@ impl<'a> JoinConditionResolver<'a> {
         //   - Each side of `=` only contains columns from one table and the both sides are disjoint.
         //     For example, `t1.a + t1.b = t2.a` is a valid one while `t1.a + t2.a = t2.b` isn't.
         //
-        // Only equi-predicate can be exploited by common join algorithms(e.g. sort-merge join, hash join).
+        // Only equi-predicate can be exploited by common join algorithms(e.g. sort-range join, hash join).
 
         let mut added = if let Some((left, right)) = split_equivalent_predicate_expr(predicate) {
             let (left, _) = scalar_binder.bind(&left)?;
@@ -841,8 +842,6 @@ impl<'a> JoinConditionResolver<'a> {
             self.name_resolution_ctx,
             self.metadata.clone(),
             &[],
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
         );
         let (predicate, _) = scalar_binder.bind(predicate)?;
         let predicate_used_columns = predicate.used_columns();

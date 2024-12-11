@@ -33,7 +33,6 @@ use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::schema::TruncateTableReply;
 use databend_common_meta_app::schema::TruncateTableReq;
-use databend_common_meta_app::schema::UndropTableReply;
 use databend_common_meta_app::schema::UndropTableReq;
 use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
 use databend_common_meta_app::schema::UpdateMultiTableMetaResult;
@@ -95,12 +94,18 @@ pub trait Database: DynClone + Sync + Send {
         )))
     }
 
+    // Get one table history by db and table name.
     #[async_backtrace::framed]
-    async fn list_tables(&self) -> Result<Vec<Arc<dyn Table>>> {
+    async fn get_table_history(&self, _table_name: &str) -> Result<Vec<Arc<dyn Table>>> {
         Err(ErrorCode::Unimplemented(format!(
-            "UnImplement list_tables in {} Database",
+            "UnImplement get_table in {} Database",
             self.name()
         )))
+    }
+
+    #[async_backtrace::framed]
+    async fn list_tables(&self) -> Result<Vec<Arc<dyn Table>>> {
+        Ok(vec![])
     }
 
     #[async_backtrace::framed]
@@ -128,7 +133,7 @@ pub trait Database: DynClone + Sync + Send {
     }
 
     #[async_backtrace::framed]
-    async fn undrop_table(&self, _req: UndropTableReq) -> Result<UndropTableReply> {
+    async fn undrop_table(&self, _req: UndropTableReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(format!(
             "UnImplement undrop_table in {} Database",
             self.name()

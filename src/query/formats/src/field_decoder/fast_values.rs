@@ -22,22 +22,22 @@ use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 use bstr::ByteSlice;
-use databend_common_arrow::arrow::bitmap::MutableBitmap;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::serialize::read_decimal_with_size;
 use databend_common_expression::serialize::uniform_date;
 use databend_common_expression::types::array::ArrayColumnBuilder;
 use databend_common_expression::types::binary::BinaryColumnBuilder;
-use databend_common_expression::types::date::check_date;
+use databend_common_expression::types::date::clamp_date;
 use databend_common_expression::types::decimal::Decimal;
 use databend_common_expression::types::decimal::DecimalColumnBuilder;
 use databend_common_expression::types::decimal::DecimalSize;
 use databend_common_expression::types::nullable::NullableColumnBuilder;
 use databend_common_expression::types::number::Number;
 use databend_common_expression::types::string::StringColumnBuilder;
-use databend_common_expression::types::timestamp::check_timestamp;
+use databend_common_expression::types::timestamp::clamp_timestamp;
 use databend_common_expression::types::AnyType;
+use databend_common_expression::types::MutableBitmap;
 use databend_common_expression::types::NumberColumnBuilder;
 use databend_common_expression::with_decimal_type;
 use databend_common_expression::with_number_mapped_type;
@@ -87,6 +87,7 @@ impl FastFieldDecoderValues {
                     NAN_BYTES_LOWER.as_bytes().to_vec(),
                 ],
                 timezone: format.timezone,
+                jiff_timezone: format.jiff_timezone,
                 disable_variant_check: false,
                 binary_format: Default::default(),
                 is_rounding_mode,
@@ -247,7 +248,7 @@ impl FastFieldDecoderValues {
         size: DecimalSize,
         reader: &mut Cursor<R>,
     ) -> Result<()> {
-        let buf = reader.remaining_slice();
+        let buf = Cursor::split(reader).1;
         let (n, n_read) = read_decimal_with_size(buf, size, false, true)?;
         column.push(n);
         reader.consume(n_read);
@@ -270,7 +271,7 @@ impl FastFieldDecoderValues {
         reader: &mut Cursor<R>,
         positions: &mut VecDeque<usize>,
     ) -> Result<()> {
-        self.read_string_inner(reader, &mut column.data, positions)?;
+        self.read_string_inner(reader, &mut column.row_buffer, positions)?;
         column.commit_row();
         Ok(())
     }
@@ -284,13 +285,9 @@ impl FastFieldDecoderValues {
         let mut buf = Vec::new();
         self.read_string_inner(reader, &mut buf, positions)?;
         let mut buffer_readr = Cursor::new(&buf);
-        let date = buffer_readr.read_date_text(
-            &self.common_settings().timezone,
-            self.common_settings().enable_dst_hour_fix,
-        )?;
+        let date = buffer_readr.read_date_text(&self.common_settings().jiff_timezone)?;
         let days = uniform_date(date);
-        check_date(days as i64)?;
-        column.push(days);
+        column.push(clamp_date(days as i64));
         Ok(())
     }
 
@@ -303,11 +300,7 @@ impl FastFieldDecoderValues {
         let mut buf = Vec::new();
         self.read_string_inner(reader, &mut buf, positions)?;
         let mut buffer_readr = Cursor::new(&buf);
-        let ts = buffer_readr.read_timestamp_text(
-            &self.common_settings().timezone,
-            false,
-            self.common_settings.enable_dst_hour_fix,
-        )?;
+        let ts = buffer_readr.read_timestamp_text(&self.common_settings().jiff_timezone)?;
         match ts {
             DateTimeResType::Datetime(ts) => {
                 if !buffer_readr.eof() {
@@ -319,8 +312,8 @@ impl FastFieldDecoderValues {
                     );
                     return Err(ErrorCode::BadBytes(msg));
                 }
-                let micros = ts.timestamp_micros();
-                check_timestamp(micros)?;
+                let mut micros = ts.timestamp().as_microsecond();
+                clamp_timestamp(&mut micros);
                 column.push(micros.as_());
             }
             _ => unreachable!(),
@@ -638,7 +631,8 @@ impl<'a> FastValuesDecoder<'a> {
                 // Parse from expression and append all columns.
                 self.reader.set_position(start_pos_of_row);
                 let row_len = end_pos_of_row - start_pos_of_row;
-                let buf = &self.reader.remaining_slice()[..row_len as usize];
+                let buf = Cursor::split(&self.reader).1;
+                let buf = &buf[..row_len as usize];
 
                 let sql = std::str::from_utf8(buf).unwrap();
                 let values = fallback.parse_fallback(sql).await?;
@@ -663,7 +657,7 @@ pub fn skip_to_next_row<R: AsRef<[u8]>>(reader: &mut Cursor<R>, mut balance: i32
     let mut escaped = false;
 
     while balance > 0 {
-        let buffer = reader.remaining_slice();
+        let buffer = Cursor::split(reader).1;
         if buffer.is_empty() {
             break;
         }

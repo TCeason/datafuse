@@ -13,7 +13,6 @@
 // limitations under the License.
 
 pub mod aggregator;
-pub mod group_by;
 mod hash_join;
 pub(crate) mod range_join;
 mod transform_add_computed_columns;
@@ -24,10 +23,10 @@ mod transform_async_function;
 mod transform_cache_scan;
 mod transform_cast_schema;
 mod transform_create_sets;
+mod transform_dictionary;
 mod transform_expression_scan;
 mod transform_filter;
 mod transform_limit;
-mod transform_materialized_cte;
 mod transform_merge_block;
 mod transform_null_if;
 mod transform_recursive_cte_scan;
@@ -54,9 +53,6 @@ pub use transform_create_sets::TransformCreateSets;
 pub use transform_expression_scan::TransformExpressionScan;
 pub use transform_filter::TransformFilter;
 pub use transform_limit::TransformLimit;
-pub use transform_materialized_cte::MaterializedCteSink;
-pub use transform_materialized_cte::MaterializedCteSource;
-pub use transform_materialized_cte::MaterializedCteState;
 pub use transform_merge_block::TransformMergeBlock;
 pub use transform_null_if::TransformNullIf;
 pub use transform_recursive_cte_scan::TransformRecursiveCteScan;

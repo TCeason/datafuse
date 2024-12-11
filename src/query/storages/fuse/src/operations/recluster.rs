@@ -41,6 +41,7 @@ use crate::operations::ReclusterMutator;
 use crate::pruning::create_segment_location_vector;
 use crate::pruning::PruningContext;
 use crate::pruning::SegmentPruner;
+use crate::FuseStorageFormat;
 use crate::FuseTable;
 use crate::SegmentLocation;
 
@@ -82,12 +83,12 @@ impl FuseTable {
         let segment_locations = create_segment_location_vector(segment_locations, None);
 
         let max_threads = ctx.get_settings().get_max_threads()? as usize;
-        let limit = limit.unwrap_or(1000);
+        let segment_limit = limit.unwrap_or(1000);
         // The default limit might be too small, which makes
         // the scanning of recluster candidates slow.
-        let chunk_size = limit.max(max_threads * 4);
+        let chunk_size = segment_limit.max(max_threads * 4);
         // The max number of segments to be reclustered.
-        let max_seg_num = limit.min(max_threads * 2);
+        let max_seg_num = segment_limit.min(max_threads * 2);
 
         let mut recluster_seg_num = 0;
         let mut recluster_blocks_count = 0;
@@ -103,6 +104,7 @@ impl FuseTable {
                 self.schema_with_stream(),
                 self.get_operator(),
                 &push_downs,
+                self.get_storage_format(),
                 chunk.to_vec(),
             )
             .await?;
@@ -146,7 +148,7 @@ impl FuseTable {
                     .await?;
             }
 
-            if !parts.is_empty() {
+            if !parts.is_empty() || limit.is_some() {
                 recluster_seg_num = selected_seg_num;
                 break;
             }
@@ -225,6 +227,7 @@ impl FuseTable {
         schema: TableSchemaRef,
         dal: Operator,
         push_down: &Option<PushDownInfo>,
+        storage_format: FuseStorageFormat,
         mut segment_locs: Vec<SegmentLocation>,
     ) -> Result<Vec<(SegmentLocation, Arc<CompactSegmentInfo>)>> {
         let max_concurrency = {
@@ -252,6 +255,7 @@ impl FuseTable {
             BloomIndexColumns::None,
             max_concurrency,
             bloom_index_builder,
+            storage_format,
         )?;
 
         let segment_pruner = SegmentPruner::create(pruning_ctx.clone(), schema)?;

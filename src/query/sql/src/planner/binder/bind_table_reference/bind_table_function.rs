@@ -19,7 +19,7 @@ use databend_common_ast::ast::Expr;
 use databend_common_ast::ast::FunctionCall as ASTFunctionCall;
 use databend_common_ast::ast::Identifier;
 use databend_common_ast::ast::Literal;
-use databend_common_ast::ast::Sample;
+use databend_common_ast::ast::SampleConfig;
 use databend_common_ast::ast::SelectStmt;
 use databend_common_ast::ast::SelectTarget;
 use databend_common_ast::ast::TableAlias;
@@ -62,7 +62,7 @@ impl Binder {
         params: &[Expr],
         named_params: &[(Identifier, Expr)],
         alias: &Option<TableAlias>,
-        sample: &Option<Sample>,
+        sample: &Option<SampleConfig>,
     ) -> Result<(SExpr, BindContext)> {
         let func_name = normalize_identifier(name, &self.name_resolution_ctx);
 
@@ -121,8 +121,6 @@ impl Binder {
             &self.name_resolution_ctx,
             self.metadata.clone(),
             &[],
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
         );
         let table_args = bind_table_args(&mut scalar_binder, params, named_params)?;
 
@@ -354,10 +352,12 @@ impl Binder {
                     }];
                     let mut select_list =
                         self.normalize_select_list(&mut bind_context, &select_list)?;
-                    // analyze set returning functions
+                    // analyze Set-returning functions.
                     self.analyze_project_set_select(&mut bind_context, &mut select_list)?;
-                    // bind set returning functions
-                    let srf_expr = self.bind_project_set(&mut bind_context, child)?;
+                    // bind Set-returning functions.
+                    let srf_expr = self.bind_project_set(&mut bind_context, child, false)?;
+                    // clear Set-returning functions, avoid duplicate bind.
+                    bind_context.srf_info = Default::default();
 
                     if let Some(item) = select_list.items.pop() {
                         let srf_result = item.scalar;

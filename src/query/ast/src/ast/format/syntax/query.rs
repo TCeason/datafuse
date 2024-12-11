@@ -272,6 +272,15 @@ fn pretty_group_by(group_by: Option<GroupBy>) -> RcDoc<'static> {
                 )
                 .append(RcDoc::line())
                 .append(RcDoc::text(")")),
+
+            GroupBy::Combined(sets) => RcDoc::line()
+                .append(RcDoc::text("GROUP BY ").append(RcDoc::line().nest(NEST_FACTOR)))
+                .append(
+                    interweave_comma(sets.into_iter().map(|s| RcDoc::text(s.to_string())))
+                        .nest(NEST_FACTOR)
+                        .group(),
+                )
+                .append(RcDoc::line()),
         }
     } else {
         RcDoc::nil()
@@ -319,7 +328,7 @@ pub(crate) fn pretty_table(table: TableReference) -> RcDoc<'static> {
             table,
             alias,
             temporal,
-            consume,
+            with_options,
             pivot,
             unpivot,
             sample,
@@ -339,8 +348,8 @@ pub(crate) fn pretty_table(table: TableReference) -> RcDoc<'static> {
         } else {
             RcDoc::nil()
         })
-        .append(if consume {
-            RcDoc::text(" WITH CONSUME")
+        .append(if let Some(with_options) = with_options {
+            RcDoc::text(format!(" {with_options}"))
         } else {
             RcDoc::nil()
         })
@@ -369,6 +378,8 @@ pub(crate) fn pretty_table(table: TableReference) -> RcDoc<'static> {
             lateral,
             subquery,
             alias,
+            pivot,
+            unpivot,
         } => (if lateral {
             RcDoc::text("LATERAL")
         } else {
@@ -377,6 +388,16 @@ pub(crate) fn pretty_table(table: TableReference) -> RcDoc<'static> {
         .append(parenthesized(pretty_query(*subquery)))
         .append(if let Some(alias) = alias {
             RcDoc::text(format!(" AS {alias}"))
+        } else {
+            RcDoc::nil()
+        })
+        .append(if let Some(pivot) = pivot {
+            RcDoc::text(format!(" {pivot}"))
+        } else {
+            RcDoc::nil()
+        })
+        .append(if let Some(unpivot) = unpivot {
+            RcDoc::text(format!(" {unpivot}"))
         } else {
             RcDoc::nil()
         }),
