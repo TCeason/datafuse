@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Duration;
@@ -24,14 +26,15 @@ use databend_common_expression::types::UInt64Type;
 use databend_common_expression::DataBlock;
 use databend_common_expression::FromData;
 use databend_common_license::license::Feature::Vacuum;
-use databend_common_license::license_manager::get_license_manager;
-use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::DroppedId;
 use databend_common_meta_app::schema::GcDroppedTableReq;
 use databend_common_meta_app::schema::ListDroppedTableReq;
-use databend_common_meta_app::schema::TableInfoFilter;
 use databend_common_sql::plans::VacuumDropTablePlan;
+use databend_common_storage::DataOperator;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
 use databend_enterprise_vacuum_handler::get_vacuum_handler;
+use futures_util::TryStreamExt;
 use log::info;
 
 use crate::interpreters::Interpreter;
@@ -65,11 +68,11 @@ impl VacuumDropTablesInterpreter {
         let mut drop_db_table_ids = vec![];
         for drop_id in drop_ids {
             match drop_id {
-                DroppedId::Db(db_id, db_name) => {
-                    drop_db_ids.push(DroppedId::Db(db_id, db_name));
+                DroppedId::Db { .. } => {
+                    drop_db_ids.push(drop_id);
                 }
-                DroppedId::Table(db_id, table_id, table_name) => {
-                    drop_db_table_ids.push(DroppedId::Table(db_id, table_id, table_name));
+                DroppedId::Table { .. } => {
+                    drop_db_table_ids.push(drop_id);
                 }
             }
         }
@@ -112,10 +115,13 @@ impl Interpreter for VacuumDropTablesInterpreter {
 
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager
-            .manager
+        LicenseManagerSwitch::instance()
             .check_enterprise_enabled(self.ctx.get_license_key(), Vacuum)?;
+
+        if self.plan.option.force {
+            self.vacuum_drop_tables_force().await?;
+            return Ok(PipelineBuildResult::create());
+        }
 
         let ctx = self.ctx.clone();
         let duration = Duration::days(ctx.get_settings().get_data_retention_time_in_days()? as i64);
@@ -127,39 +133,53 @@ impl Interpreter for VacuumDropTablesInterpreter {
             self.plan.database, retention_time
         );
         // if database if empty, vacuum all tables
-        let filter = if self.plan.database.is_empty() {
-            TableInfoFilter::AllDroppedTables(Some(retention_time))
+        let database_name = if self.plan.database.is_empty() {
+            None
         } else {
-            TableInfoFilter::Dropped(Some(retention_time))
+            Some(self.plan.database.clone())
         };
 
         let tenant = self.ctx.get_tenant();
+
         let (tables, drop_ids) = catalog
-            .get_drop_table_infos(ListDroppedTableReq {
-                inner: DatabaseNameIdent::new(&tenant, &self.plan.database),
-                filter,
-                limit: self.plan.option.limit,
-            })
+            .get_drop_table_infos(ListDroppedTableReq::new4(
+                &tenant,
+                database_name,
+                Some(retention_time),
+                self.plan.option.limit,
+            ))
             .await?;
+
+        // map: table id to its belonging db id
+        let mut containing_db = BTreeMap::new();
+        for drop_id in drop_ids.iter() {
+            if let DroppedId::Table { name, id } = drop_id {
+                containing_db.insert(id.table_id, name.db_id);
+            }
+        }
 
         info!(
             "vacuum drop table from db {:?}, get_drop_table_infos return tables: {:?}, drop_ids: {:?}",
             self.plan.database,
             tables.len(),
-            drop_ids.len()
+            drop_ids
         );
 
-        // TODO buggy, table as catalog obj should be allowed to drop
-        // also drop ids
-        // filter out read-only tables
-        let tables = tables
+        // Filter out read-only tables and views.
+        // Note: The drop_ids list still includes view IDs
+        let (views, tables): (Vec<_>, Vec<_>) = tables
             .into_iter()
             .filter(|tbl| !tbl.as_ref().is_read_only())
-            .collect::<Vec<_>>();
+            .partition(|tbl| tbl.get_table_info().meta.engine == VIEW_ENGINE);
+
+        {
+            let view_ids = views.into_iter().map(|v| v.get_id()).collect::<Vec<_>>();
+            info!("view ids excluded from purging data: {:?}", view_ids);
+        }
 
         let handler = get_vacuum_handler();
         let threads_nums = self.ctx.get_settings().get_max_threads()? as usize;
-        let files_opt = handler
+        let (files_opt, failed_tables) = handler
             .do_vacuum_drop_tables(
                 threads_nums,
                 tables,
@@ -170,9 +190,38 @@ impl Interpreter for VacuumDropTablesInterpreter {
                 },
             )
             .await?;
-        // gc meta data only when not dry run
+
+        let failed_db_ids = failed_tables
+            .iter()
+            // Safe unwrap: the map is built from drop_ids
+            .map(|id| *containing_db.get(id).unwrap())
+            .collect::<HashSet<_>>();
+
+        // gc metadata only when not dry run
         if self.plan.option.dry_run.is_none() {
-            self.gc_drop_tables(catalog, drop_ids).await?;
+            let mut success_dropped_ids = vec![];
+            // Since drop_ids contains view IDs, any views (if present) will be added to
+            // the success_dropped_id list, with removal from the meta-server attempted later.
+            for drop_id in drop_ids {
+                match &drop_id {
+                    DroppedId::Db { db_id, db_name: _ } => {
+                        if !failed_db_ids.contains(db_id) {
+                            success_dropped_ids.push(drop_id);
+                        }
+                    }
+                    DroppedId::Table { name: _, id } => {
+                        if !failed_tables.contains(&id.table_id) {
+                            success_dropped_ids.push(drop_id);
+                        }
+                    }
+                }
+            }
+            info!(
+                "failed dbs:{:?}, failed_tables:{:?}, success_drop_ids:{:?}",
+                failed_db_ids, failed_tables, success_dropped_ids
+            );
+
+            self.gc_drop_tables(catalog, success_dropped_ids).await?;
         }
 
         match files_opt {
@@ -232,5 +281,64 @@ impl Interpreter for VacuumDropTablesInterpreter {
                 }
             }
         }
+    }
+}
+
+impl VacuumDropTablesInterpreter {
+    async fn vacuum_drop_tables_force(&self) -> Result<()> {
+        let catalog = self.ctx.get_catalog(self.plan.catalog.as_str()).await?;
+        let op = DataOperator::instance().operator();
+        let databases = match self.plan.database.is_empty() {
+            true => catalog.list_databases(&self.ctx.get_tenant()).await?,
+            false => {
+                let database = catalog
+                    .get_database(&self.ctx.get_tenant(), &self.plan.database)
+                    .await?;
+                vec![database]
+            }
+        };
+
+        for database in databases {
+            if database.name() == "system" || database.name() == "information_schema" {
+                continue;
+            }
+            let db_id = database.get_db_info().database_id.db_id;
+            info!(
+                "vacuum drop table force from db name: {}, id: {}",
+                database.name(),
+                db_id
+            );
+            let mut lister = op.lister_with(&db_id.to_string()).recursive(true).await?;
+            let mut paths = vec![];
+            let mut orphan_paths = vec![];
+            while let Some(entry) = lister.try_next().await? {
+                paths.push(entry.path().to_string());
+            }
+            let tables_in_meta = database.list_tables_history().await?;
+            let table_ids_in_meta = tables_in_meta
+                .iter()
+                .map(|t| t.get_id())
+                .collect::<HashSet<_>>();
+            for path in paths {
+                let Some(table_id) = path.split('/').nth(1) else {
+                    info!("can not parse table id from path: {}", path);
+                    continue;
+                };
+                let Some(table_id) = table_id.parse::<u64>().ok() else {
+                    info!("can not parse table id from path: {}", path);
+                    continue;
+                };
+                if !table_ids_in_meta.contains(&table_id) {
+                    orphan_paths.push(path);
+                }
+            }
+            info!(
+                "orphan_paths summary: {:?}",
+                orphan_paths.iter().take(100).collect::<Vec<_>>()
+            );
+            op.remove(orphan_paths).await?;
+        }
+
+        Ok(())
     }
 }

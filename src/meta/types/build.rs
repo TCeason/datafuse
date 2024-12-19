@@ -45,6 +45,7 @@ fn build_proto() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     tonic_build::configure()
+        .btree_map(["RaftLogStatus.wal_closed_chunk_sizes"])
         .file_descriptor_set_path(out_dir.join("meta_descriptor.bin"))
         .type_attribute(
             "SeqV",
@@ -138,6 +139,6 @@ fn build_proto() {
             "TxnPutRequest.ttl_ms",
             r#"#[serde(skip_serializing_if = "Option::is_none")]"#,
         )
-        .compile_with_config(config, &protos, &[&proto_dir])
+        .compile_protos_with_config(config, &protos, &[&proto_dir])
         .unwrap();
 }

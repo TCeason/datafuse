@@ -28,7 +28,6 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use chrono::Utc;
 use chrono_tz::Tz;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::DashMap;
@@ -49,18 +48,17 @@ use databend_common_catalog::plan::Partitions;
 use databend_common_catalog::plan::StageTableInfo;
 use databend_common_catalog::query_kind::QueryKind;
 use databend_common_catalog::runtime_filter_info::RuntimeFilterInfo;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterReady;
 use databend_common_catalog::statistics::data_cache_statistics::DataCacheMetrics;
 use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_context::ContextError;
 use databend_common_catalog::table_context::FilteredCopyFiles;
-use databend_common_catalog::table_context::MaterializedCtesBlocks;
 use databend_common_catalog::table_context::StageAttachment;
 use databend_common_config::GlobalConfig;
 use databend_common_config::DATABEND_COMMIT_VERSION;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::date_helper::TzFactory;
 use databend_common_expression::BlockThresholds;
-use databend_common_expression::DataBlock;
 use databend_common_expression::Expr;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::Scalar;
@@ -79,6 +77,8 @@ use databend_common_meta_app::principal::UserInfo;
 use databend_common_meta_app::principal::UserPrivilegeType;
 use databend_common_meta_app::principal::COPY_MAX_FILES_COMMIT_MSG;
 use databend_common_meta_app::principal::COPY_MAX_FILES_PER_COMMIT;
+use databend_common_meta_app::schema::CatalogType;
+use databend_common_meta_app::schema::DropTableByIdReq;
 use databend_common_meta_app::schema::GetTableCopiedFileReq;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::storage::StorageParams;
@@ -104,12 +104,16 @@ use databend_common_storages_orc::OrcTable;
 use databend_common_storages_parquet::ParquetRSTable;
 use databend_common_storages_result_cache::ResultScan;
 use databend_common_storages_stage::StageTable;
+use databend_common_storages_stream::stream_table::StreamTable;
 use databend_common_users::GrantObjectVisibilityChecker;
 use databend_common_users::UserApiProvider;
+use databend_storages_common_session::drop_table_by_id;
 use databend_storages_common_session::SessionState;
 use databend_storages_common_session::TxnManagerRef;
 use databend_storages_common_table_meta::meta::Location;
-use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::table::OPT_KEY_TEMP_PREFIX;
+use jiff::tz::TimeZone;
+use jiff::Zoned;
 use log::debug;
 use log::info;
 use parking_lot::Mutex;
@@ -147,8 +151,9 @@ pub struct QueryContext {
     fragment_id: Arc<AtomicUsize>,
     // Used by synchronized generate aggregating indexes when new data written.
     inserted_segment_locs: Arc<RwLock<HashSet<Location>>>,
-    snapshot: Arc<RwLock<Option<Arc<TableSnapshot>>>>,
-    lazy_mutaion_delete: Arc<RwLock<bool>>,
+    // Temp table for materialized CTE, first string is the database_name, second string is the table_name
+    // All temp tables' catalog is `CATALOG_DEFAULT`, so we don't need to store it.
+    m_cte_temp_table: Arc<RwLock<Vec<(String, String)>>>,
 }
 
 impl QueryContext {
@@ -174,8 +179,7 @@ impl QueryContext {
             fragment_id: Arc::new(AtomicUsize::new(0)),
             inserted_segment_locs: Arc::new(RwLock::new(HashSet::new())),
             block_threshold: Arc::new(RwLock::new(BlockThresholds::default())),
-            snapshot: Arc::new(RwLock::new(None)),
-            lazy_mutaion_delete: Arc::new(RwLock::new(false)),
+            m_cte_temp_table: Arc::new(Default::default()),
         })
     }
 
@@ -189,26 +193,38 @@ impl QueryContext {
             .shared
             .catalog_manager
             .build_catalog(table_info.catalog_info.clone(), self.session_state())?;
-        match table_args {
-            None => {
+
+        let is_default = catalog.info().catalog_type() == CatalogType::Default;
+        match (table_args, is_default) {
+            (Some(table_args), true) => {
+                let default_catalog = self
+                    .shared
+                    .catalog_manager
+                    .get_default_catalog(self.session_state())?;
+                let table_function =
+                    default_catalog.get_table_function(&table_info.name, table_args)?;
+                Ok(table_function.as_table())
+            }
+            (Some(_), false) => Err(ErrorCode::InvalidArgument(
+                "request table args inside non-default catalog is invalid",
+            )),
+            // Load table first, if not found, try to load table function.
+            (None, true) => {
                 let table = catalog.get_table_by_info(table_info);
                 if table.is_err() {
-                    let table_function = catalog
-                        .get_table_function(&table_info.name, TableArgs::new_positioned(vec![]));
+                    let Ok(table_function) = catalog
+                        .get_table_function(&table_info.name, TableArgs::new_positioned(vec![]))
+                    else {
+                        // Returns the table error if the table function failed to load.
+                        return table;
+                    };
 
-                    if table_function.is_err() {
-                        table
-                    } else {
-                        Ok(table_function?.as_table())
-                    }
+                    Ok(table_function.as_table())
                 } else {
                     table
                 }
             }
-
-            Some(table_args) => Ok(catalog
-                .get_table_function(&table_info.name, table_args)?
-                .as_table()),
+            (None, false) => catalog.get_table_by_info(table_info),
         }
     }
 
@@ -221,6 +237,14 @@ impl QueryContext {
         _table_args: Option<TableArgs>,
     ) -> Result<Arc<dyn Table>> {
         StageTable::try_create(table_info.clone())
+    }
+
+    #[async_backtrace::framed]
+    pub async fn set_current_catalog(&self, new_catalog_name: String) -> Result<()> {
+        let _catalog = self.get_catalog(&new_catalog_name).await?;
+        self.shared.set_current_catalog(new_catalog_name);
+
+        Ok(())
     }
 
     #[async_backtrace::framed]
@@ -328,12 +352,40 @@ impl QueryContext {
         *self.shared.finish_time.write() = Some(time)
     }
 
-    pub fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
-        self.shared.evict_table_from_cache(catalog, database, table)
-    }
-
     pub fn clear_tables_cache(&self) {
         self.shared.clear_tables_cache()
+    }
+
+    #[async_backtrace::framed]
+    async fn get_table_from_shared(
+        &self,
+        catalog: &str,
+        database: &str,
+        table: &str,
+        max_batch_size: Option<u64>,
+    ) -> Result<Arc<dyn Table>> {
+        let table = self
+            .shared
+            .get_table(catalog, database, table, max_batch_size)
+            .await?;
+        // the better place to do this is in the QueryContextShared::get_table() method,
+        // but there is no way to access dyn TableContext.
+        let table: Arc<dyn Table> = match table.engine() {
+            "ICEBERG" => {
+                let sp = get_storage_params_from_options(self, table.options()).await?;
+                let mut info = table.get_table_info().to_owned();
+                info.meta.storage_params = Some(sp);
+                IcebergTable::try_create(info.to_owned())?.into()
+            }
+            "DELTA" => {
+                let sp = get_storage_params_from_options(self, table.options()).await?;
+                let mut info = table.get_table_info().to_owned();
+                info.meta.storage_params = Some(sp);
+                DeltaTable::try_create(info.to_owned())?.into()
+            }
+            _ => table,
+        };
+        Ok(table)
     }
 }
 
@@ -484,22 +536,6 @@ impl TableContext for QueryContext {
         Ok(())
     }
 
-    fn set_table_snapshot(&self, snapshot: Arc<TableSnapshot>) {
-        *self.snapshot.write() = Some(snapshot);
-    }
-
-    fn get_table_snapshot(&self) -> Option<Arc<TableSnapshot>> {
-        self.snapshot.read().clone()
-    }
-
-    fn set_lazy_mutation_delete(&self, lazy: bool) {
-        *self.lazy_mutaion_delete.write() = lazy;
-    }
-
-    fn get_lazy_mutation_delete(&self) -> bool {
-        *self.lazy_mutaion_delete.read()
-    }
-
     fn partition_num(&self) -> usize {
         self.partition_queue.read().len()
     }
@@ -545,17 +581,26 @@ impl TableContext for QueryContext {
     }
 
     // get a hint at the number of blocks that need to be compacted.
-    fn get_compaction_num_block_hint(&self) -> u64 {
+    fn get_compaction_num_block_hint(&self, table_name: &str) -> u64 {
         self.shared
             .num_fragmented_block_hint
-            .load(Ordering::Acquire)
+            .lock()
+            .get(table_name)
+            .copied()
+            .unwrap_or_default()
     }
 
     // set a hint at the number of blocks that need to be compacted.
-    fn set_compaction_num_block_hint(&self, hint: u64) {
-        self.shared
+    fn set_compaction_num_block_hint(&self, table_name: &str, hint: u64) {
+        let old = self
+            .shared
             .num_fragmented_block_hint
-            .store(hint, Ordering::Release);
+            .lock()
+            .insert(table_name.to_string(), hint);
+        info!(
+            "set_compaction_num_block_hint: table_name {} old hint {:?}, new hint {}",
+            table_name, old, hint
+        );
     }
 
     fn attach_query_str(&self, kind: QueryKind, query: String) {
@@ -609,11 +654,11 @@ impl TableContext for QueryContext {
         self.shared.get_current_catalog()
     }
 
-    fn check_aborting(&self) -> Result<()> {
+    fn check_aborting(&self) -> Result<(), ContextError> {
         self.shared.check_aborting()
     }
 
-    fn get_error(&self) -> Option<ErrorCode> {
+    fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         self.shared.get_error()
     }
 
@@ -655,8 +700,14 @@ impl TableContext for QueryContext {
         self.get_current_session().get_id()
     }
 
-    async fn get_visibility_checker(&self) -> Result<GrantObjectVisibilityChecker> {
-        self.shared.session.get_visibility_checker().await
+    async fn get_visibility_checker(
+        &self,
+        ignore_ownership: bool,
+    ) -> Result<GrantObjectVisibilityChecker> {
+        self.shared
+            .session
+            .get_visibility_checker(ignore_ownership)
+            .await
     }
 
     fn get_fuse_version(&self) -> String {
@@ -673,11 +724,15 @@ impl TableContext for QueryContext {
         let timezone = tz.parse::<Tz>().map_err(|_| {
             ErrorCode::InvalidTimezone("Timezone has been checked and should be valid")
         })?;
+        let jiff_timezone = TimeZone::get(&tz).map_err(|_| {
+            ErrorCode::InvalidTimezone("Timezone has been checked and should be valid")
+        })?;
         let geometry_format = self.get_settings().get_geometry_output_format()?;
         let format_null_as_str = self.get_settings().get_format_null_as_str()?;
         let enable_dst_hour_fix = self.get_settings().get_enable_dst_hour_fix()?;
         let format = FormatSettings {
             timezone,
+            jiff_timezone,
             geometry_format,
             enable_dst_hour_fix,
             format_null_as_str,
@@ -696,15 +751,22 @@ impl TableContext for QueryContext {
     fn get_function_context(&self) -> Result<FunctionContext> {
         let settings = self.get_settings();
 
-        let tz = settings.get_timezone()?;
-        let tz = TzFactory::instance().get_by_name(&tz)?;
-        let now = Utc::now();
+        let tz_string = settings.get_timezone()?;
+        let tz = tz_string.parse::<Tz>().map_err(|_| {
+            ErrorCode::InvalidTimezone("Timezone has been checked and should be valid")
+        })?;
+        let jiff_tz = TimeZone::get(&tz_string).map_err(|e| {
+            ErrorCode::InvalidTimezone(format!(
+                "Timezone has been checked and should be valid but got error: {}",
+                e
+            ))
+        })?;
+        let now = Zoned::now().with_time_zone(TimeZone::UTC);
         let numeric_cast_option = settings.get_numeric_cast_option()?;
         let rounding_mode = numeric_cast_option.as_str() == "rounding";
         let disable_variant_check = settings.get_disable_variant_check()?;
         let geometry_output_format = settings.get_geometry_output_format()?;
         let parse_datetime_ignore_remainder = settings.get_parse_datetime_ignore_remainder()?;
-        let enable_dst_hour_fix = settings.get_enable_dst_hour_fix()?;
         let enable_strict_datetime_parser = settings.get_enable_strict_datetime_parser()?;
         let query_config = &GlobalConfig::instance().query;
         let random_function_seed = settings.get_random_function_seed()?;
@@ -712,6 +774,7 @@ impl TableContext for QueryContext {
         Ok(FunctionContext {
             tz,
             now,
+            jiff_tz,
             rounding_mode,
             disable_variant_check,
 
@@ -724,7 +787,6 @@ impl TableContext for QueryContext {
 
             geometry_output_format,
             parse_datetime_ignore_remainder,
-            enable_dst_hour_fix,
             enable_strict_datetime_parser,
             random_function_seed,
         })
@@ -734,11 +796,33 @@ impl TableContext for QueryContext {
         self.shared.get_connection_id()
     }
 
+    // subquery level
     fn get_settings(&self) -> Arc<Settings> {
-        if !self.query_settings.is_changed() {
+        // query level change
+        if self.shared.query_settings.is_changed()
+            && self.shared.query_settings.query_level_change()
+        {
+            let shared_settings = self.shared.query_settings.changes();
+            // if has session level change, should not cover query level change
+            if self.get_session_settings().is_changed() {
+                for r in self.get_session_settings().changes().iter() {
+                    if !self.shared.query_settings.changes().contains_key(r.key()) {
+                        shared_settings.insert(r.key().clone(), r.value().clone());
+                    }
+                }
+                unsafe {
+                    self.query_settings.unchecked_apply_changes(shared_settings);
+                }
+            } else {
+                unsafe {
+                    self.query_settings.unchecked_apply_changes(shared_settings);
+                }
+            }
+        } else {
             unsafe {
+                // apply session level changes
                 self.query_settings
-                    .unchecked_apply_changes(self.shared.get_settings().changes());
+                    .unchecked_apply_changes(self.get_session_settings().changes())
             }
         }
 
@@ -746,6 +830,11 @@ impl TableContext for QueryContext {
     }
 
     fn get_shared_settings(&self) -> Arc<Settings> {
+        self.shared.query_settings.clone()
+    }
+
+    fn get_session_settings(&self) -> Arc<Settings> {
+        // get session settings from query shared
         self.shared.get_settings()
     }
 
@@ -874,24 +963,38 @@ impl TableContext for QueryContext {
         database: &str,
         table: &str,
     ) -> Result<Arc<dyn Table>> {
-        let table = self.shared.get_table(catalog, database, table).await?;
-        // the better place to do this is in the QueryContextShared::get_table_to_cache() method,
-        // but there is no way to access dyn TableContext.
-        let table: Arc<dyn Table> = match table.engine() {
-            "ICEBERG" => {
-                let sp = get_storage_params_from_options(self, table.options()).await?;
-                let mut info = table.get_table_info().to_owned();
-                info.meta.storage_params = Some(sp);
-                IcebergTable::try_create(info.to_owned())?.into()
+        self.get_table_from_shared(catalog, database, table, None)
+            .await
+    }
+
+    fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
+        self.shared.evict_table_from_cache(catalog, database, table)
+    }
+
+    #[async_backtrace::framed]
+    async fn get_table_with_batch(
+        &self,
+        catalog: &str,
+        database: &str,
+        table: &str,
+        max_batch_size: Option<u64>,
+    ) -> Result<Arc<dyn Table>> {
+        let table = self
+            .get_table_from_shared(catalog, database, table, max_batch_size)
+            .await?;
+        if table.is_stream() {
+            let stream = StreamTable::try_from_table(table.as_ref())?;
+            let actual_batch_limit = stream.max_batch_size();
+            if actual_batch_limit != max_batch_size {
+                return Err(ErrorCode::StorageUnsupported(
+                    "Within the same transaction, the batch size for a stream must remain consistent",
+                ));
             }
-            "DELTA" => {
-                let sp = get_storage_params_from_options(self, table.options()).await?;
-                let mut info = table.get_table_info().to_owned();
-                info.meta.storage_params = Some(sp);
-                DeltaTable::try_create(info.to_owned())?.into()
-            }
-            _ => table,
-        };
+        } else if max_batch_size.is_some() {
+            return Err(ErrorCode::StorageUnsupported(
+                "MAX_BATCH_SIZE only support in STREAM",
+            ));
+        }
         Ok(table)
     }
 
@@ -964,28 +1067,6 @@ impl TableContext for QueryContext {
         })
     }
 
-    fn set_materialized_cte(
-        &self,
-        idx: (IndexType, IndexType),
-        blocks: Arc<RwLock<Vec<DataBlock>>>,
-    ) -> Result<()> {
-        let mut ctes = self.shared.materialized_cte_tables.write();
-        ctes.insert(idx, blocks);
-        Ok(())
-    }
-
-    fn get_materialized_cte(
-        &self,
-        idx: (IndexType, IndexType),
-    ) -> Result<Option<Arc<RwLock<Vec<DataBlock>>>>> {
-        let ctes = self.shared.materialized_cte_tables.read();
-        Ok(ctes.get(&idx).cloned())
-    }
-
-    fn get_materialized_ctes(&self) -> MaterializedCtesBlocks {
-        self.shared.materialized_cte_tables.clone()
-    }
-
     fn add_segment_location(&self, segment_loc: Location) -> Result<()> {
         let mut segment_locations = self.inserted_segment_locs.write();
         segment_locations.insert(segment_loc);
@@ -1048,11 +1129,18 @@ impl TableContext for QueryContext {
     }
 
     fn get_license_key(&self) -> String {
-        unsafe {
+        let mut license = unsafe {
             self.get_settings()
                 .get_enterprise_license()
                 .unwrap_or_default()
+        };
+
+        // Try load license from embedded env if failed to load from settings.
+        if license.is_empty() {
+            license = env!("DATABEND_ENTERPRISE_LICENSE_EMBEDDED").to_string();
         }
+
+        license
     }
 
     fn get_query_profiles(&self) -> Vec<PlanProfile> {
@@ -1094,6 +1182,39 @@ impl TableContext for QueryContext {
                     v.get_mut().add_bloom(filter);
                 }
             }
+        }
+    }
+
+    fn set_runtime_filter_ready(&self, table_index: usize, ready: Arc<RuntimeFilterReady>) {
+        let mut runtime_filter_ready = self.shared.runtime_filter_ready.write();
+        match runtime_filter_ready.entry(table_index) {
+            Entry::Vacant(v) => {
+                v.insert(vec![ready]);
+            }
+            Entry::Occupied(mut v) => {
+                v.get_mut().push(ready);
+            }
+        }
+    }
+
+    fn get_runtime_filter_ready(&self, table_index: usize) -> Vec<Arc<RuntimeFilterReady>> {
+        let runtime_filter_ready = self.shared.runtime_filter_ready.read();
+        match runtime_filter_ready.get(&table_index) {
+            Some(v) => v.to_vec(),
+            None => vec![],
+        }
+    }
+
+    fn set_wait_runtime_filter(&self, table_index: usize, need_to_wait: bool) {
+        let mut wait_runtime_filter = self.shared.wait_runtime_filter.write();
+        wait_runtime_filter.insert(table_index, need_to_wait);
+    }
+
+    fn get_wait_runtime_filter(&self, table_index: usize) -> bool {
+        let wait_runtime_filter = self.shared.wait_runtime_filter.read();
+        match wait_runtime_filter.get(&table_index) {
+            Some(v) => *v,
+            None => false,
         }
     }
 
@@ -1199,6 +1320,7 @@ impl TableContext for QueryContext {
         files_info: StageFilesInfo,
         files_to_copy: Option<Vec<StageFileInfo>>,
         max_column_position: usize,
+        case_sensitive: bool,
     ) -> Result<Arc<dyn Table>> {
         match stage_info.file_format_params {
             FileFormatParams::Parquet(..) => {
@@ -1223,6 +1345,7 @@ impl TableContext for QueryContext {
                     files_to_copy,
                     self.get_settings(),
                     self.get_query_kind(),
+                    case_sensitive,
                 )
                 .await
             }
@@ -1236,6 +1359,8 @@ impl TableContext for QueryContext {
                     duplicated_files_detected: vec![],
                     is_select: true,
                     default_values: None,
+                    copy_into_location_options: Default::default(),
+                    copy_into_table_options: Default::default(),
                 };
                 OrcTable::try_create(info).await
             }
@@ -1252,6 +1377,8 @@ impl TableContext for QueryContext {
                     duplicated_files_detected: vec![],
                     is_select: true,
                     default_values: None,
+                    copy_into_location_options: Default::default(),
+                    copy_into_table_options: Default::default(),
                 };
                 StageTable::try_create(info)
             }
@@ -1286,6 +1413,8 @@ impl TableContext for QueryContext {
                     duplicated_files_detected: vec![],
                     is_select: true,
                     default_values: None,
+                    copy_into_location_options: Default::default(),
+                    copy_into_table_options: Default::default(),
                 };
                 StageTable::try_create(info)
             }
@@ -1314,11 +1443,7 @@ impl TableContext for QueryContext {
         let tbl = catalog
             .get_table(&self.get_tenant(), db_name, tbl_name)
             .await?;
-        if tbl.engine() != "FUSE" || tbl.is_read_only() {
-            return Ok(None);
-        }
-
-        if tbl.is_temp() {
+        if tbl.engine() != "FUSE" || tbl.is_read_only() || tbl.is_temp() {
             return Ok(None);
         }
 
@@ -1349,17 +1474,87 @@ impl TableContext for QueryContext {
                 .lock()
                 .is_temp_table(database_name, table_name)
     }
+
+    fn add_m_cte_temp_table(&self, database_name: &str, table_name: &str) {
+        self.m_cte_temp_table
+            .write()
+            .push((database_name.to_string(), table_name.to_string()));
+    }
+
+    async fn drop_m_cte_temp_table(&self) -> Result<()> {
+        let temp_tbl_mgr = self.shared.session.session_ctx.temp_tbl_mgr();
+        let m_cte_temp_table = self.m_cte_temp_table.read().clone();
+        let tenant = self.get_tenant();
+        for (db_name, table_name) in m_cte_temp_table.iter() {
+            let table = self.get_table(CATALOG_DEFAULT, db_name, table_name).await?;
+            let db = self
+                .get_catalog(CATALOG_DEFAULT)
+                .await?
+                .get_database(&tenant, db_name)
+                .await?;
+            let drop_table_req = DropTableByIdReq {
+                if_exists: true,
+                tenant: tenant.clone(),
+                tb_id: table.get_table_info().ident.table_id,
+                table_name: table_name.to_string(),
+                db_id: db.get_db_info().database_id.db_id,
+                engine: table.engine().to_string(),
+                session_id: table
+                    .options()
+                    .get(OPT_KEY_TEMP_PREFIX)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            drop_table_by_id(temp_tbl_mgr.clone(), drop_table_req).await?;
+        }
+        let mut m_cte_temp_table = self.m_cte_temp_table.write();
+        m_cte_temp_table.clear();
+        Ok(())
+    }
+
+    fn add_streams_ref(&self, catalog: &str, database: &str, stream: &str, consume: bool) {
+        let mut streams = self.shared.streams_refs.write();
+        let stream_key = (
+            catalog.to_string(),
+            database.to_string(),
+            stream.to_string(),
+        );
+        streams
+            .entry(stream_key)
+            .and_modify(|v| {
+                if consume {
+                    *v = true;
+                }
+            })
+            .or_insert(consume);
+    }
+
+    fn get_consume_streams(&self, query: bool) -> Result<Vec<Arc<dyn Table>>> {
+        let streams_refs = self.shared.streams_refs.read();
+        let tables = self.shared.tables_refs.lock();
+        let mut streams_meta = Vec::with_capacity(streams_refs.len());
+        for (stream_key, consume) in streams_refs.iter() {
+            if query && !consume {
+                continue;
+            }
+            let stream = tables
+                .get(stream_key)
+                .ok_or_else(|| ErrorCode::Internal("It's a bug"))?;
+            streams_meta.push(stream.clone());
+        }
+        Ok(streams_meta)
+    }
 }
 
 impl TrySpawn for QueryContext {
     /// Spawns a new asynchronous task, returning a tokio::JoinHandle for it.
     /// The task will run in the current context thread_pool not the global.
-    fn try_spawn<T>(&self, task: T) -> Result<JoinHandle<T::Output>>
+    fn try_spawn<T>(&self, task: T, name: Option<String>) -> Result<JoinHandle<T::Output>>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
-        Ok(self.shared.try_get_runtime()?.spawn(task))
+        self.shared.try_get_runtime()?.try_spawn(task, name)
     }
 }
 

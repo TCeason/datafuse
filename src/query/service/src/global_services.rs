@@ -24,9 +24,8 @@ use databend_common_cloud_control::cloud_api::CloudControlApiProvider;
 use databend_common_config::GlobalConfig;
 use databend_common_config::InnerConfig;
 use databend_common_exception::Result;
+use databend_common_exception::StackTrace;
 use databend_common_meta_app::schema::CatalogType;
-use databend_common_sharing::ShareEndpointManager;
-use databend_common_sharing::SharePresignedCacheManager;
 use databend_common_storage::DataOperator;
 use databend_common_storage::ShareTableConfig;
 use databend_common_storages_hive::HiveCreator;
@@ -37,12 +36,12 @@ use databend_common_users::builtin::BuiltIn;
 use databend_common_users::RoleCacheManager;
 use databend_common_users::UserApiProvider;
 use databend_storages_common_cache::CacheManager;
+use databend_storages_common_cache::TempDirManager;
 
 use crate::auth::AuthMgr;
 use crate::builtin::BuiltinUDFs;
 use crate::builtin::BuiltinUsers;
 use crate::catalogs::DatabaseCatalog;
-use crate::catalogs::ShareCatalogCreator;
 use crate::clusters::ClusterDiscovery;
 use crate::locks::LockManager;
 #[cfg(feature = "enable_queries_executor")]
@@ -64,6 +63,8 @@ impl GlobalServices {
 
     #[async_backtrace::framed]
     pub async fn init_with(config: &InnerConfig) -> Result<()> {
+        StackTrace::pre_load_symbol();
+
         // app name format: node_id[0..7]@cluster_id
         let app_name_shuffle = format!("databend-query-{}", config.query.cluster_id);
 
@@ -103,7 +104,6 @@ impl GlobalServices {
             let catalog_creator: Vec<(CatalogType, Arc<dyn CatalogCreator>)> = vec![
                 (CatalogType::Iceberg, Arc::new(IcebergCreator)),
                 (CatalogType::Hive, Arc::new(HiveCreator)),
-                (CatalogType::Share, Arc::new(ShareCatalogCreator)),
             ];
 
             CatalogManager::init(config, Arc::new(default_catalog), catalog_creator).await?;
@@ -116,7 +116,6 @@ impl GlobalServices {
         SessionManager::init(config)?;
         LockManager::init()?;
         AuthMgr::init(config)?;
-        SharePresignedCacheManager::init()?;
 
         // Init user manager.
         // Builtin users and udfs are created here.
@@ -139,7 +138,6 @@ impl GlobalServices {
         }
 
         RoleCacheManager::init()?;
-        ShareEndpointManager::init()?;
 
         DataOperator::init(&config.storage).await?;
         ShareTableConfig::init(
@@ -152,6 +150,7 @@ impl GlobalServices {
             &config.query.max_server_memory_usage,
             config.query.tenant_id.tenant_name().to_string(),
         )?;
+        TempDirManager::init(&config.spill, config.query.tenant_id.tenant_name())?;
 
         if let Some(addr) = config.query.cloud_control_grpc_server_address.clone() {
             CloudControlApiProvider::init(addr, config.query.cloud_control_grpc_timeout).await?;

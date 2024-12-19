@@ -15,6 +15,7 @@
 // DO NOT EDIT.
 // This crate keeps some Index codes for compatibility, it's locked by bincode of meta's v3 version
 
+use databend_common_column::types::months_days_micros;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use enum_as_inner::EnumAsInner;
@@ -32,12 +33,14 @@ pub enum IndexScalar {
     Decimal(DecimalScalar),
     Timestamp(i64),
     Date(i32),
+    Interval(months_days_micros),
     Boolean(bool),
     // For compat reason, we keep this attribute which treat string/binary into string
     #[serde(alias = "String", alias = "Binary")]
     String(Vec<u8>),
     Tuple(Vec<IndexScalar>),
     BinaryV2(Vec<u8>),
+    Variant(Vec<u8>),
 }
 
 impl TryFrom<IndexScalar> for Scalar {
@@ -50,11 +53,13 @@ impl TryFrom<IndexScalar> for Scalar {
             IndexScalar::Decimal(dec_scalar) => Scalar::Decimal(dec_scalar),
             IndexScalar::Timestamp(ts) => Scalar::Timestamp(ts),
             IndexScalar::Date(date) => Scalar::Date(date),
+            IndexScalar::Interval(interval) => Scalar::Interval(interval),
             IndexScalar::Boolean(b) => Scalar::Boolean(b),
             IndexScalar::String(s) => Scalar::String(String::from_utf8(s).map_err(|e| {
                 ErrorCode::InvalidUtf8String(format!("invalid utf8 data for string type: {}", e))
             })?),
             IndexScalar::BinaryV2(s) => Scalar::Binary(s),
+            IndexScalar::Variant(s) => Scalar::Variant(s),
             IndexScalar::Tuple(tuple) => Scalar::Tuple(
                 tuple
                     .into_iter()
@@ -75,6 +80,7 @@ impl TryFrom<Scalar> for IndexScalar {
             Scalar::Decimal(dec_scalar) => IndexScalar::Decimal(dec_scalar),
             Scalar::Timestamp(ts) => IndexScalar::Timestamp(ts),
             Scalar::Date(date) => IndexScalar::Date(date),
+            Scalar::Interval(interval) => IndexScalar::Interval(interval),
             Scalar::Boolean(b) => IndexScalar::Boolean(b),
             Scalar::String(string) => IndexScalar::String(string.as_bytes().to_vec()),
             Scalar::Binary(s) => IndexScalar::BinaryV2(s),
@@ -86,8 +92,9 @@ impl TryFrom<Scalar> for IndexScalar {
             ),
             Scalar::Array(_)
             | Scalar::Map(_)
-            | Scalar::Bitmap(_)
+            // we only support variant read only
             | Scalar::Variant(_)
+            | Scalar::Bitmap(_)
             | Scalar::Geometry(_)
             | Scalar::Geography(_)
             | Scalar::EmptyArray

@@ -109,7 +109,7 @@ pub struct TransformHashJoinProbe {
     // The spiller is used to spill/restore data blocks.
     spiller: HashJoinSpiller,
     // The next partition id to restore.
-    partition_id_to_restore: u8,
+    partition_id_to_restore: usize,
 
     step: Step,
     step_logs: Vec<Step>,
@@ -126,7 +126,6 @@ impl TransformHashJoinProbe {
         func_ctx: FunctionContext,
         join_type: &JoinType,
         with_conjunct: bool,
-        has_string_column: bool,
     ) -> Result<Box<dyn Processor>> {
         join_probe_state.probe_attach();
         // Create a hash join spiller.
@@ -153,7 +152,6 @@ impl TransformHashJoinProbe {
             max_block_size,
             join_type,
             with_conjunct,
-            has_string_column,
             func_ctx,
             other_predicate,
         );
@@ -352,7 +350,7 @@ impl Processor for TransformHashJoinProbe {
                         {
                             self.probe_hash_table(data_block)?;
                         } else if let Some(data_block) = self.input_data_blocks.pop_front() {
-                            let data_block = data_block.convert_to_full();
+                            let data_block = data_block.consume_convert_to_full();
                             self.probe_hash_table(data_block)?;
                         }
                     }

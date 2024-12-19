@@ -78,9 +78,15 @@ pub struct NodeInfo {
     pub secret: String,
     pub cpu_nums: u64,
     pub version: u32,
+    pub http_address: String,
     pub flight_address: String,
     pub discovery_address: String,
     pub binary_version: String,
+
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cluster_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub warehouse_id: String,
 }
 
 impl NodeInfo {
@@ -88,6 +94,7 @@ impl NodeInfo {
         id: String,
         secret: String,
         cpu_nums: u64,
+        http_address: String,
         flight_address: String,
         discovery_address: String,
         binary_version: String,
@@ -97,9 +104,12 @@ impl NodeInfo {
             secret,
             cpu_nums,
             version: 0,
+            http_address,
             flight_address,
             discovery_address,
             binary_version,
+            cluster_id: "".to_string(),
+            warehouse_id: "".to_string(),
         }
     }
 

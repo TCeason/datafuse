@@ -34,19 +34,24 @@ use databend_common_storages_system::ColumnsTable;
 use databend_common_storages_system::ConfigsTable;
 use databend_common_storages_system::ContributorsTable;
 use databend_common_storages_system::CreditsTable;
-use databend_common_storages_system::DatabasesTable;
+use databend_common_storages_system::DatabasesTableWithHistory;
+use databend_common_storages_system::DatabasesTableWithoutHistory;
+use databend_common_storages_system::DictionariesTable;
 use databend_common_storages_system::EnginesTable;
 use databend_common_storages_system::FullStreamsTable;
 use databend_common_storages_system::FunctionsTable;
 use databend_common_storages_system::IndexesTable;
 use databend_common_storages_system::LocksTable;
+#[cfg(feature = "jemalloc")]
 use databend_common_storages_system::MallocStatsTable;
+#[cfg(feature = "jemalloc")]
 use databend_common_storages_system::MallocStatsTotalsTable;
 use databend_common_storages_system::MetricsTable;
 use databend_common_storages_system::NotificationHistoryTable;
 use databend_common_storages_system::NotificationsTable;
 use databend_common_storages_system::OneTable;
 use databend_common_storages_system::PasswordPoliciesTable;
+use databend_common_storages_system::ProceduresTable;
 use databend_common_storages_system::ProcessesTable;
 use databend_common_storages_system::QueriesProfilingTable;
 use databend_common_storages_system::QueryCacheTable;
@@ -99,13 +104,16 @@ impl SystemDatabase {
             TablesTableWithoutHistory::create(sys_db_meta.next_table_id()),
             TablesTableWithHistory::create(sys_db_meta.next_table_id()),
             ClustersTable::create(sys_db_meta.next_table_id()),
-            DatabasesTable::create(sys_db_meta.next_table_id()),
+            DatabasesTableWithHistory::create(sys_db_meta.next_table_id()),
+            DatabasesTableWithoutHistory::create(sys_db_meta.next_table_id()),
             FullStreamsTable::create(sys_db_meta.next_table_id()),
             TerseStreamsTable::create(sys_db_meta.next_table_id()),
             ProcessesTable::create(sys_db_meta.next_table_id()),
             ConfigsTable::create(sys_db_meta.next_table_id()),
             MetricsTable::create(sys_db_meta.next_table_id()),
+            #[cfg(feature = "jemalloc")]
             MallocStatsTable::create(sys_db_meta.next_table_id()),
+            #[cfg(feature = "jemalloc")]
             MallocStatsTotalsTable::create(sys_db_meta.next_table_id()),
             ColumnsTable::create(sys_db_meta.next_table_id()),
             UsersTable::create(sys_db_meta.next_table_id()),
@@ -142,6 +150,8 @@ impl SystemDatabase {
             ViewsTableWithHistory::create(sys_db_meta.next_table_id()),
             ViewsTableWithoutHistory::create(sys_db_meta.next_table_id()),
             TemporaryTablesTable::create(sys_db_meta.next_table_id()),
+            ProceduresTable::create(sys_db_meta.next_table_id()),
+            DictionariesTable::create(sys_db_meta.next_table_id()),
         ];
 
         let disable_tables = Self::disable_system_tables();
