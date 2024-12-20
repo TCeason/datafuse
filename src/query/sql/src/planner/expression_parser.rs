@@ -60,7 +60,7 @@ use crate::MetadataRef;
 use crate::ScalarExpr;
 use crate::Visibility;
 
-pub fn bind_one_table(table_meta: Arc<dyn Table>) -> Result<(BindContext, MetadataRef)> {
+pub fn bind_table(table_meta: Arc<dyn Table>) -> Result<(BindContext, MetadataRef)> {
     let mut bind_context = BindContext::new();
     let metadata = Arc::new(RwLock::new(Metadata::default()));
     let table_index = metadata.write().add_table(
@@ -71,7 +71,7 @@ pub fn bind_one_table(table_meta: Arc<dyn Table>) -> Result<(BindContext, Metada
         false,
         false,
         false,
-        false,
+        None,
     );
 
     let columns = metadata.read().columns_by_table_index(table_index);
@@ -117,7 +117,7 @@ pub fn parse_exprs(
     table_meta: Arc<dyn Table>,
     sql: &str,
 ) -> Result<Vec<Expr>> {
-    let (mut bind_context, metadata) = bind_one_table(table_meta)?;
+    let (mut bind_context, metadata) = bind_table(table_meta)?;
     let settings = Settings::create(Tenant::new_literal("dummy"));
     let name_resolution_ctx = NameResolutionContext::try_from(settings.as_ref())?;
     let sql_dialect = ctx.get_settings().get_sql_dialect().unwrap_or_default();
@@ -257,6 +257,12 @@ pub fn parse_default_expr_to_string(
     )?;
 
     let (mut scalar, data_type) = *type_checker.resolve(ast)?;
+    if !scalar.evaluable() {
+        return Err(ErrorCode::SemanticError(format!(
+            "default value expression `{:#}` is invalid",
+            ast
+        )));
+    }
     let schema_data_type = DataType::from(field.data_type());
     if data_type != schema_data_type {
         scalar = wrap_cast(&scalar, &schema_data_type);
@@ -297,7 +303,7 @@ pub fn parse_computed_expr_to_string(
             field.data_type().clone(),
             0,
             None,
-            None,
+            Some(field.column_id),
             None,
             None,
         );
@@ -314,6 +320,12 @@ pub fn parse_computed_expr_to_string(
     )?;
 
     let (scalar, data_type) = *type_checker.resolve(ast)?;
+    if !scalar.evaluable() {
+        return Err(ErrorCode::SemanticError(format!(
+            "computed column expression `{:#}` is invalid",
+            ast
+        )));
+    }
     if data_type != DataType::from(field.data_type()) {
         return Err(ErrorCode::SemanticError(format!(
             "expected computed column expression have type {}, but `{}` has type {}.",
@@ -378,7 +390,7 @@ pub fn parse_cluster_keys(
     table_meta: Arc<dyn Table>,
     cluster_key_str: &str,
 ) -> Result<Vec<Expr>> {
-    let (mut bind_context, metadata) = bind_one_table(table_meta)?;
+    let (mut bind_context, metadata) = bind_table(table_meta)?;
     let settings = Settings::create(Tenant::new_literal("dummy"));
     let name_resolution_ctx = NameResolutionContext::try_from(settings.as_ref())?;
     let sql_dialect = ctx.get_settings().get_sql_dialect().unwrap_or_default();
@@ -455,7 +467,7 @@ pub fn parse_hilbert_cluster_key(
     table_meta: Arc<dyn Table>,
     cluster_key_str: &str,
 ) -> Result<Vec<Expr>> {
-    let (mut bind_context, metadata) = bind_one_table(table_meta)?;
+    let (mut bind_context, metadata) = bind_table(table_meta)?;
     let settings = Settings::create(Tenant::new_literal("dummy"));
     let name_resolution_ctx = NameResolutionContext::try_from(settings.as_ref())?;
     let sql_dialect = ctx.get_settings().get_sql_dialect().unwrap_or_default();
@@ -609,7 +621,7 @@ pub fn analyze_cluster_keys(
         }
     }
 
-    let (mut bind_context, metadata) = bind_one_table(table_meta)?;
+    let (mut bind_context, metadata) = bind_table(table_meta)?;
     let settings = Settings::create(Tenant::new_literal("dummy"));
     let name_resolution_ctx = NameResolutionContext::try_from(settings.as_ref())?;
     let mut type_checker = TypeChecker::try_create(

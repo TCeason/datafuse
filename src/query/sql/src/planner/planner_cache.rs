@@ -24,6 +24,7 @@ use databend_common_ast::ast::TableReference;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_expression::Scalar;
 use databend_common_expression::TableSchemaRef;
+use databend_common_functions::is_cacheable_function;
 use databend_common_settings::ChangeValue;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheValue;
@@ -38,13 +39,11 @@ use sha2::Sha256;
 use crate::normalize_identifier;
 use crate::plans::Plan;
 use crate::NameResolutionContext;
-use crate::PlanExtras;
 use crate::Planner;
 
 #[derive(Clone)]
 pub struct PlanCacheItem {
     pub(crate) plan: Plan,
-    pub(crate) extras: PlanExtras,
     pub(crate) setting_changes: Vec<(String, ChangeValue)>,
     pub(crate) variables: HashMap<String, Scalar>,
 }
@@ -124,7 +123,7 @@ impl Planner {
         }
     }
 
-    pub fn set_cache(&self, key: String, plan: Plan, extras: PlanExtras) {
+    pub fn set_cache(&self, key: String, plan: Plan) {
         let setting_changes = self
             .ctx
             .get_settings()
@@ -138,7 +137,6 @@ impl Planner {
 
         let plan_item = PlanCacheItem {
             plan,
-            extras,
             setting_changes,
             variables,
         };
@@ -162,8 +160,9 @@ impl TableRefVisitor {
             return;
         }
 
-        // If the function is score, we should not cache the plan
-        if func.name.name.to_lowercase() == "score" {
+        let func_name = func.name.name.to_lowercase();
+        // If the function is not suitable for caching, we should not cache the plan
+        if !is_cacheable_function(&func_name) {
             self.cache_miss = true;
         }
     }
@@ -177,11 +176,11 @@ impl TableRefVisitor {
             database,
             table,
             temporal,
-            consume,
+            with_options,
             ..
         } = table_ref
         {
-            if temporal.is_some() || *consume {
+            if temporal.is_some() || with_options.is_some() {
                 self.cache_miss = true;
                 return;
             }

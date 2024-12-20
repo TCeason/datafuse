@@ -106,7 +106,6 @@ pub struct TransformHashJoinBuild {
     processor_memory_threshold: usize,
 
     step: Step,
-    step_logs: Vec<Step>,
 }
 
 impl TransformHashJoinBuild {
@@ -152,7 +151,6 @@ impl TransformHashJoinBuild {
             global_memory_threshold,
             processor_memory_threshold,
             step: Step::Sync(SyncStep::Collect),
-            step_logs: vec![Step::Sync(SyncStep::Collect)],
         }))
     }
 
@@ -166,7 +164,6 @@ impl TransformHashJoinBuild {
             }
         };
         self.step = step;
-        self.step_logs.push(step);
         Ok(event)
     }
 
@@ -331,18 +328,6 @@ impl Processor for TransformHashJoinBuild {
         }
         Ok(())
     }
-
-    fn details_status(&self) -> Option<String> {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct Display {
-            step_logs: Vec<Step>,
-        }
-
-        Some(format!("{:?}", Display {
-            step_logs: self.step_logs.clone(),
-        }))
-    }
 }
 
 impl TransformHashJoinBuild {
@@ -374,7 +359,7 @@ impl TransformHashJoinBuild {
         self.is_spill_happened
     }
 
-    fn partition_to_restore(&self) -> u8 {
+    fn partition_to_restore(&self) -> usize {
         self.build_state
             .hash_join_state
             .partition_id

@@ -296,7 +296,14 @@ impl<'a> ClusteringInformation<'a> {
         let (keys, values): (Vec<_>, Vec<_>) = points_map.into_iter().unzip();
         let cluster_key_types = exprs
             .into_iter()
-            .map(|v| v.data_type().clone())
+            .map(|v| {
+                let data_type = v.data_type();
+                if matches!(*data_type, DataType::String) {
+                    data_type.wrap_nullable()
+                } else {
+                    data_type.clone()
+                }
+            })
             .collect::<Vec<_>>();
         let indices = compare_scalars(keys, &cluster_key_types)?;
         for idx in indices.into_iter() {
@@ -550,6 +557,9 @@ fn domain_to_minmax(domain: &Domain) -> (Scalar, Scalar) {
             (Scalar::Timestamp(*min), Scalar::Timestamp(*max))
         }
         Domain::Date(SimpleDomain { min, max }) => (Scalar::Date(*min), Scalar::Date(*max)),
+        Domain::Interval(SimpleDomain { min, max }) => {
+            (Scalar::Interval(*min), Scalar::Interval(*max))
+        }
         Domain::Nullable(NullableDomain { has_null, value }) => {
             if let Some(v) = value {
                 let (min, mut max) = domain_to_minmax(v);

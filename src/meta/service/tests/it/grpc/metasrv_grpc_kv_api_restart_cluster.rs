@@ -21,7 +21,7 @@ use databend_common_base::base::Stoppable;
 use databend_common_meta_client::ClientHandle;
 use databend_common_meta_client::MetaGrpcClient;
 use databend_common_meta_kvapi::kvapi::KVApi;
-use databend_common_meta_kvapi::kvapi::UpsertKVReq;
+use databend_common_meta_types::UpsertKV;
 use log::info;
 use test_harness::test;
 
@@ -52,7 +52,7 @@ async fn test_kv_api_restart_cluster_write_read() -> anyhow::Result<()> {
             let client = tc.grpc_client().await?;
 
             let k = make_key(tc, key_suffix);
-            let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+            let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
 
             info!("--- upsert res: {:?}", res);
 
@@ -138,11 +138,11 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
         for (i, tc) in tcs.iter().enumerate() {
             let k = make_key(tc, key_suffix);
             if i == 0 {
-                let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+                let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
                 info!("--- upsert res: {:?}", res);
             } else {
                 let client = tc.grpc_client().await.unwrap();
-                let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+                let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
                 info!("--- upsert res: {:?}", res);
             }
 
@@ -160,7 +160,9 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
         vec![tcs[0].config.grpc_api_address.clone()],
         "root",
         "xxx",
-        None,
+        // Without timeout, the client will not be able to reconnect.
+        // This is an issue of the http client.
+        Some(Duration::from_secs(1)),
         Some(Duration::from_secs(10)),
         None,
     )?;
@@ -187,7 +189,18 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
     let tcs = {
         let mut tcs = vec![];
         for mut tc in stopped_tcs {
+            info!(
+                "--- starting metasrv: {:?}",
+                tc.config.raft_config.raft_api_addr().await?
+            );
             start_metasrv_with_context(&mut tc).await?;
+
+            info!(
+                "--- started metasrv: {:?}",
+                tc.config.raft_config.raft_api_addr().await?
+            );
+
+            // sleep(Duration::from_secs(3)).await;
             tcs.push(tc);
         }
 

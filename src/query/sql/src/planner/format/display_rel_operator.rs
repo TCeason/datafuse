@@ -23,6 +23,7 @@ use crate::planner::format::display::TreeHumanizer;
 use crate::plans::Aggregate;
 use crate::plans::AggregateMode;
 use crate::plans::AsyncFunction;
+use crate::plans::ConstantTableScan;
 use crate::plans::EvalScalar;
 use crate::plans::Exchange;
 use crate::plans::Filter;
@@ -151,6 +152,7 @@ pub(super) fn to_format_tree<I: IdHumanizer<ColumnId = IndexType, TableId = Inde
         RelOperator::Sort(op) => sort_to_format_tree(id_humanizer, op),
         RelOperator::Limit(op) => limit_to_format_tree(id_humanizer, op),
         RelOperator::Exchange(op) => exchange_to_format_tree(id_humanizer, op),
+        RelOperator::ConstantTableScan(op) => constant_scan_to_format_tree(id_humanizer, op),
         _ => FormatTreeNode::with_children(format!("{:?}", op), vec![]),
     }
 }
@@ -383,9 +385,42 @@ fn sort_to_format_tree<I: IdHumanizer<ColumnId = IndexType, TableId = IndexType>
         .join(", ");
     let limit = op.limit.map_or("NONE".to_string(), |l| l.to_string());
 
-    FormatTreeNode::with_children("Sort".to_string(), vec![
-        FormatTreeNode::new(format!("sort keys: [{}]", scalars)),
-        FormatTreeNode::new(format!("limit: [{}]", limit)),
+    let children = match &op.window_partition {
+        Some(window) => vec![
+            FormatTreeNode::new(format!("sort keys: [{}]", scalars)),
+            FormatTreeNode::new(format!("limit: [{}]", limit)),
+            FormatTreeNode::new(format!(
+                "window top: {}",
+                window.top.map_or("NONE".to_string(), |n| n.to_string())
+            )),
+            FormatTreeNode::new(format!("window function: {:?}", window.func)),
+        ],
+        None => vec![
+            FormatTreeNode::new(format!("sort keys: [{}]", scalars)),
+            FormatTreeNode::new(format!("limit: [{}]", limit)),
+        ],
+    };
+
+    FormatTreeNode::with_children("Sort".to_string(), children)
+}
+
+fn constant_scan_to_format_tree<I: IdHumanizer<ColumnId = IndexType, TableId = IndexType>>(
+    id_humanizer: &I,
+    plan: &ConstantTableScan,
+) -> FormatTreeNode {
+    if plan.num_rows == 0 {
+        return FormatTreeNode::new(plan.name().to_string());
+    }
+
+    FormatTreeNode::with_children(plan.name().to_string(), vec![
+        FormatTreeNode::new(format!(
+            "columns: [{}]",
+            plan.columns
+                .iter()
+                .map(|col| id_humanizer.humanize_column_id(*col))
+                .join(", ")
+        )),
+        FormatTreeNode::new(format!("num_rows: [{}]", plan.num_rows)),
     ])
 }
 

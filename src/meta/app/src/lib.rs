@@ -19,6 +19,7 @@
 //! But instead, they are used by the caller of meta-client, e.g, databend-query.
 
 #![allow(clippy::uninlined_format_args)]
+#![allow(non_local_definitions)]
 #![feature(no_sanitize)]
 
 pub mod app_error;
@@ -28,7 +29,6 @@ pub mod data_mask;
 pub mod primitive;
 pub mod principal;
 pub mod schema;
-pub mod share;
 pub mod storage;
 pub mod tenant;
 pub mod tenant_key;

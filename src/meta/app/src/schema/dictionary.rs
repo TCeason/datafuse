@@ -20,11 +20,15 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use databend_common_expression::TableSchema;
 
 use super::dictionary_name_ident::DictionaryNameIdent;
+use crate::schema::DictionaryIdentity;
 use crate::tenant::Tenant;
 use crate::tenant::ToTenant;
+use crate::KeyWithTenant;
 
 /// Represents the metadata of a dictionary within the system.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -74,6 +78,35 @@ impl Default for DictionaryMeta {
             comment: "".to_string(),
             field_comments: BTreeMap::new(),
         }
+    }
+}
+
+impl DictionaryMeta {
+    pub fn build_sql_connection_url(&self) -> Result<String> {
+        let username = self
+            .options
+            .get("username")
+            .ok_or_else(|| ErrorCode::BadArguments("Miss option `username`"))?;
+        let password = self
+            .options
+            .get("password")
+            .ok_or_else(|| ErrorCode::BadArguments("Miss option `password`"))?;
+        let host = self
+            .options
+            .get("host")
+            .ok_or_else(|| ErrorCode::BadArguments("Miss option `host`"))?;
+        let port = self
+            .options
+            .get("port")
+            .ok_or_else(|| ErrorCode::BadArguments("Miss option `port`"))?;
+        let db = self
+            .options
+            .get("db")
+            .ok_or_else(|| ErrorCode::BadArguments("Miss option `db`"))?;
+        Ok(format!(
+            "mysql://{}:{}@{}:{}/{}",
+            username, password, host, port, db
+        ))
     }
 }
 
@@ -128,4 +161,46 @@ pub struct UpdateDictionaryReq {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateDictionaryReply {
     pub dictionary_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameDictionaryReq {
+    pub name_ident: DictionaryNameIdent,
+    pub new_dict_ident: DictionaryIdentity,
+}
+
+impl RenameDictionaryReq {
+    pub fn tenant(&self) -> &Tenant {
+        self.name_ident.tenant()
+    }
+
+    pub fn db_id(&self) -> u64 {
+        self.name_ident.db_id()
+    }
+
+    pub fn dictionary_name(&self) -> String {
+        self.name_ident.dict_name().clone()
+    }
+
+    pub fn new_db_id(&self) -> u64 {
+        self.new_dict_ident.db_id
+    }
+
+    pub fn new_dictionary_name(&self) -> String {
+        self.new_dict_ident.dict_name.clone()
+    }
+}
+
+impl Display for RenameDictionaryReq {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "rename_dictionary:{}/{}-{}=>{}-{}",
+            self.tenant().tenant_name(),
+            self.db_id(),
+            self.dictionary_name(),
+            self.new_db_id(),
+            self.new_dictionary_name(),
+        )
+    }
 }

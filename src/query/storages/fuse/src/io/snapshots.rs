@@ -30,7 +30,7 @@ use databend_storages_common_table_meta::meta::Location;
 use databend_storages_common_table_meta::meta::SnapshotId;
 use databend_storages_common_table_meta::meta::TableSnapshot;
 use databend_storages_common_table_meta::meta::TableSnapshotLite;
-use fastrace::full_name;
+use fastrace::func_path;
 use fastrace::prelude::*;
 use futures::stream::StreamExt;
 use futures_util::TryStreamExt;
@@ -85,6 +85,7 @@ impl SnapshotsIO {
             ver,
             put_cache: true,
         };
+        info!("read_snapshot will read: {:?}", load_params);
         let snapshot = reader.read(&load_params).await?;
         Ok((snapshot, ver))
     }
@@ -137,7 +138,7 @@ impl SnapshotsIO {
                     self.operator.clone(),
                     min_snapshot_timestamp,
                 )
-                .in_span(Span::enter_with_local_parent(full_name!()))
+                .in_span(Span::enter_with_local_parent(func_path!()))
             })
         });
 
@@ -307,7 +308,7 @@ impl SnapshotsIO {
                     root_snapshot.clone(),
                     ignore_timestamp,
                 )
-                .in_span(Span::enter_with_local_parent(full_name!()))
+                .in_span(Span::enter_with_local_parent(func_path!()))
             })
         });
 

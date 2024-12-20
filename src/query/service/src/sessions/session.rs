@@ -136,7 +136,7 @@ impl Session {
         self.kill(/* shutdown io stream */);
     }
 
-    pub fn force_kill_query(&self, cause: ErrorCode) {
+    pub fn force_kill_query<C>(&self, cause: ErrorCode<C>) {
         if let Some(context_shared) = self.session_ctx.get_query_context_shared() {
             context_shared.kill(cause);
         }
@@ -198,6 +198,10 @@ impl Session {
 
     pub fn get_current_catalog(&self) -> String {
         self.session_ctx.get_current_catalog()
+    }
+
+    pub fn set_current_catalog(&self, catalog_name: String) {
+        self.session_ctx.set_current_catalog(catalog_name)
     }
 
     pub fn get_current_tenant(&self) -> Tenant {
@@ -281,6 +285,16 @@ impl Session {
     }
 
     #[async_backtrace::framed]
+    pub async fn set_current_warehouse(&self, w: Option<String>) -> Result<()> {
+        self.privilege_mgr().set_current_warehouse(w).await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn get_current_warehouse(&self) -> Option<String> {
+        self.session_ctx.get_current_warehouse()
+    }
+
+    #[async_backtrace::framed]
     pub async fn validate_privilege(
         &self,
         object: &GrantObject,
@@ -310,8 +324,13 @@ impl Session {
     }
 
     #[async_backtrace::framed]
-    pub async fn get_visibility_checker(&self) -> Result<GrantObjectVisibilityChecker> {
-        self.privilege_mgr().get_visibility_checker().await
+    pub async fn get_visibility_checker(
+        &self,
+        ignore_ownership: bool,
+    ) -> Result<GrantObjectVisibilityChecker> {
+        self.privilege_mgr()
+            .get_visibility_checker(ignore_ownership)
+            .await
     }
 
     pub fn get_settings(&self) -> Arc<Settings> {
@@ -380,21 +399,24 @@ impl Session {
     }
     pub fn get_temp_table_prefix(&self) -> Result<String> {
         let typ = self.typ.read().clone();
-        match typ {
-            SessionType::MySQL => Ok(self.id.clone()),
+        let session_id = match typ {
+            SessionType::MySQL => self.id.clone(),
             SessionType::HTTPQuery => {
                 if let Some(id) = self.get_client_session_id() {
-                    Ok(id)
+                    id
                 } else {
-                    Err(ErrorCode::BadArguments(
-                        "can not use temp table in http handler if token is not used",
-                    ))
+                    return Err(ErrorCode::BadArguments(
+                        "can not use temp table in http handler if cookie is not enabled",
+                    ));
                 }
             }
-            t => Err(ErrorCode::BadArguments(format!(
-                "can not use temp table in session type {t}"
-            ))),
-        }
+            t => {
+                return Err(ErrorCode::BadArguments(format!(
+                    "can not use temp table in session type {t}"
+                )));
+            }
+        };
+        Ok(format!("{}/{session_id}", self.get_current_user()?.name))
     }
 }
 
