@@ -131,7 +131,7 @@ impl Binder {
         )?;
         let mut arg_types = vec![];
         for argument in arguments {
-            let box (arg, mut arg_type) = type_checker.resolve(argument)?;
+            let box (arg, mut arg_type) = type_checker.resovle_procedure_arg(argument)?;
             if let ScalarExpr::SubqueryExpr(subquery) = &arg {
                 if subquery.typ == SubqueryType::Scalar && !arg.data_type()?.is_nullable() {
                     arg_type = arg_type.wrap_nullable();

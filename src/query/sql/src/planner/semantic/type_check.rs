@@ -231,6 +231,86 @@ impl<'a> TypeChecker<'a> {
     }
 
     #[recursive::recursive]
+    pub fn resovle_procedure_arg(&mut self, expr: &Expr) -> Result<Box<(ScalarExpr, DataType)>> {
+        let box (scalar, data_type): Box<(ScalarExpr, DataType)> = match expr {
+            Expr::Cast {
+                expr, target_type, ..
+            } => {
+                let box (scalar, data_type) = self.resolve(expr)?;
+                if target_type == &TypeName::Variant {
+                    if let Some(result) =
+                        self.resolve_cast_to_variant(expr.span(), &data_type, &scalar, false)
+                    {
+                        return result;
+                    }
+                }
+
+                let raw_expr = RawExpr::Cast {
+                    span: expr.span(),
+                    is_try: false,
+                    expr: Box::new(scalar.as_raw_expr()),
+                    dest_type: DataType::from(&resolve_type_name(target_type, true)?),
+                };
+                let registry = &BUILTIN_FUNCTIONS;
+                let checked_expr = type_check::check(&raw_expr, registry)?;
+
+                // if the source type is nullable, cast target type should also be nullable.
+                let target_type = if data_type.is_nullable_or_null() {
+                    checked_expr.data_type().wrap_nullable()
+                } else {
+                    checked_expr.data_type().clone()
+                };
+
+                Box::new((
+                    CastExpr {
+                        span: expr.span(),
+                        is_try: false,
+                        argument: Box::new(scalar),
+                        target_type: Box::new(target_type.clone()),
+                    }
+                    .into(),
+                    target_type,
+                ))
+            }
+
+            Expr::TryCast {
+                expr, target_type, ..
+            } => {
+                let box (scalar, data_type) = self.resolve(expr)?;
+                if target_type == &TypeName::Variant {
+                    if let Some(result) =
+                        self.resolve_cast_to_variant(expr.span(), &data_type, &scalar, true)
+                    {
+                        return result;
+                    }
+                }
+
+                let raw_expr = RawExpr::Cast {
+                    span: expr.span(),
+                    is_try: true,
+                    expr: Box::new(scalar.as_raw_expr()),
+                    dest_type: DataType::from(&resolve_type_name(target_type, true)?),
+                };
+                let registry = &BUILTIN_FUNCTIONS;
+                let checked_expr = type_check::check(&raw_expr, registry)?;
+
+                Box::new((
+                    CastExpr {
+                        span: expr.span(),
+                        is_try: true,
+                        argument: Box::new(scalar),
+                        target_type: Box::new(checked_expr.data_type().clone()),
+                    }
+                    .into(),
+                    checked_expr.data_type().clone(),
+                ))
+            }
+            _ => self.resolve(expr)?,
+        };
+        Ok(Box::new((scalar, data_type)))
+    }
+
+    #[recursive::recursive]
     pub fn resolve(&mut self, expr: &Expr) -> Result<Box<(ScalarExpr, DataType)>> {
         let box (scalar, data_type): Box<(ScalarExpr, DataType)> = match expr {
             Expr::ColumnRef {
@@ -1086,7 +1166,6 @@ impl<'a> TypeChecker<'a> {
 
             Expr::Hole { .. } => unreachable!("hole is impossible in trivial query"),
         };
-
         Ok(Box::new((scalar, data_type)))
     }
 
