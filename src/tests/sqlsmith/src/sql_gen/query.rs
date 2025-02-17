@@ -46,13 +46,13 @@ use crate::sql_gen::SqlGenerator;
 use crate::sql_gen::Table;
 
 impl<R: Rng> SqlGenerator<'_, R> {
-    pub(crate) fn gen_query(&mut self) -> Query {
+    pub(crate) fn gen_query(&mut self, need_with: bool) -> Query {
         self.cte_tables.clear();
         self.bound_tables.clear();
         self.bound_columns.clear();
         self.is_join = false;
 
-        let with = self.gen_with();
+        let with = if need_with { self.gen_with() } else { None };
         let body = self.gen_set_expr();
         let limit = self.gen_limit();
         let offset = self.gen_offset(limit.len());

@@ -19,19 +19,28 @@ use databend_common_ast::ast::ColumnExpr;
 use databend_common_ast::ast::CreateOption;
 use databend_common_ast::ast::CreateTableSource;
 use databend_common_ast::ast::CreateTableStmt;
+use databend_common_ast::ast::CreateViewStmt;
 use databend_common_ast::ast::DropTableStmt;
+use databend_common_ast::ast::DropViewStmt;
 use databend_common_ast::ast::Engine;
 use databend_common_ast::ast::Expr;
 use databend_common_ast::ast::Identifier;
 use databend_common_ast::ast::Literal;
+use databend_common_ast::ast::Statement;
 use databend_common_ast::ast::TableType;
 use databend_common_ast::ast::TypeName;
+use databend_common_ast::parser::parse_sql;
+use databend_common_ast::parser::tokenize_sql;
+use databend_common_ast::parser::Dialect;
+use databend_common_exception::ErrorCode;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
 use crate::sql_gen::SqlGenerator;
+use crate::sql_gen::Table;
 
 const BASE_TABLE_NAMES: [&str; 4] = ["t1", "t2", "t3", "t4"];
+const BASE_VIEW_NAMES: [&str; 4] = ["v1", "v2", "v3", "v4"];
 
 const SIMPLE_COLUMN_TYPES: [TypeName; 22] = [
     TypeName::Boolean,
@@ -102,6 +111,49 @@ impl<R: Rng> SqlGenerator<'_, R> {
             tables.push((drop_table, create_table));
         }
         tables
+    }
+
+    pub(crate) async fn gen_view(
+        &mut self,
+        db_name: &str,
+        base_tables: &[Table],
+    ) -> Result<Vec<(DropViewStmt, CreateViewStmt)>, ErrorCode> {
+        let mut views = Vec::with_capacity(BASE_VIEW_NAMES.len());
+
+        for (i, view_name) in BASE_VIEW_NAMES.iter().enumerate() {
+            let drop_view = DropViewStmt {
+                if_exists: true,
+                catalog: None,
+                database: Some(Identifier::from_name(None, db_name)),
+                view: Identifier::from_name(None, view_name.to_string()),
+            };
+
+            let t = base_tables[i].clone();
+            let case = format!("select * from {}", base_tables[i].name);
+            let tokens = tokenize_sql(&case)?;
+            let (stmt, _) = parse_sql(&tokens, Dialect::PostgreSQL)?;
+
+            if let Statement::Query(query) = stmt {
+                let columns: Vec<Identifier> = t
+                    .schema
+                    .fields
+                    .iter()
+                    .map(|f| Identifier::from_name(None, f.name.clone()))
+                    .collect();
+                let create_view = CreateViewStmt {
+                    create_option: CreateOption::CreateOrReplace,
+                    catalog: None,
+                    database: Some(Identifier::from_name(None, db_name)),
+                    columns,
+                    view: Identifier::from_name(None, view_name.to_string()),
+                    query,
+                };
+                views.push((drop_view, create_view));
+            } else {
+                unreachable!()
+            }
+        }
+        Ok(views)
     }
 
     fn gen_nested_type(&mut self, depth: u8) -> TypeName {
