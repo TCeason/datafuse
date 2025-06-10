@@ -324,6 +324,10 @@ pub enum ExprElement {
         unit: IntervalKind,
         date: Expr,
     },
+    NumericTrunc {
+        unit: IntervalKind,
+        date: Expr,
+    },
     LastDay {
         unit: IntervalKind,
         date: Expr,
@@ -1268,9 +1272,21 @@ pub fn expr_element(i: Input) -> IResult<WithSpan<ExprElement>> {
 
     let trunc = map(
         rule! {
-            TRUNC ~ "(" ~  #subexpr(0) ~ "," ~  #interval_kind ~ ")"
+            TRUNC ~ "(" ~  (#subexpr(0) ~ "," ~  #interval_kind)? ~ (#subexpr(0) ~ "," ~  #subexpr(0))? ~ ")"
         },
-        |(_, _, date, _, unit, _)| ExprElement::DateTrunc { unit, date },
+        |(_, _, opt_date, opt_numeric, _)| {
+            return match (opt_date, opt_numeric) {
+                (Some((date, _, unit)), None) => {
+                    ExprElement::DateTrunc { unit, date }
+                }
+                (None, Some((expr, _, expr2))) => {
+                    ExprElement::DateBetween { unit: IntervalKind::Year, date_start: expr, date_end: expr2 }
+                }
+                _ => {
+                    ExprElement::DateTrunc { unit: IntervalKind::Day, date: Expr::Literal { span: None, value: Literal::Null } }
+                }
+            }
+         },
     );
 
     let last_day = map(
