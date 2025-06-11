@@ -324,10 +324,6 @@ pub enum ExprElement {
         unit: IntervalKind,
         date: Expr,
     },
-    NumericTrunc {
-        unit: IntervalKind,
-        date: Expr,
-    },
     LastDay {
         unit: IntervalKind,
         date: Expr,
@@ -1272,18 +1268,36 @@ pub fn expr_element(i: Input) -> IResult<WithSpan<ExprElement>> {
 
     let trunc = map(
         rule! {
-            TRUNC ~ "(" ~  (#subexpr(0) ~ "," ~  #interval_kind)? ~ (#subexpr(0) ~ "," ~  #subexpr(0))? ~ ")"
+            TRUNC ~ "(" ~  (#subexpr(0) ~ "," ~  #interval_kind)? ~ (#subexpr(0) ~ ("," ~  #subexpr(0))?)? ~ ")"
         },
-        |(_, _, opt_date, opt_numeric, _)| {
+        |(s, _, opt_date, opt_numeric, _)| {
             return match (opt_date, opt_numeric) {
                 (Some((date, _, unit)), None) => {
                     ExprElement::DateTrunc { unit, date }
                 }
-                (None, Some((expr, _, expr2))) => {
-                    ExprElement::DateBetween { unit: IntervalKind::Year, date_start: expr, date_end: expr2 }
+                (None, Some((expr, opt_expr2))) => {
+                    if let Some((_, expr2)) = opt_expr2 {
+                        ExprElement::FunctionCall {
+                            func: FunctionCall {
+                                distinct: false,
+                                name: Identifier::from_name(Some(s.span), "TRUNCATE"),
+                                args: vec![expr, expr2],
+                                ..Default::default()
+                            }
+                        }
+                    } else {
+                        ExprElement::FunctionCall {
+                            func: FunctionCall {
+                                distinct: false,
+                                name: Identifier::from_name(Some(s.span), "TRUNCATE"),
+                                args: vec![expr],
+                                ..Default::default()
+                            }
+                        }
+                    }
                 }
                 _ => {
-                    ExprElement::DateTrunc { unit: IntervalKind::Day, date: Expr::Literal { span: None, value: Literal::Null } }
+                    ExprElement::DateTrunc { unit: IntervalKind::UnknownIntervalKind, date: Expr::Literal { span: None, value: Literal::Null } }
                 }
             }
          },
