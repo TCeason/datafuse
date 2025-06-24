@@ -279,6 +279,7 @@ pub(crate) async fn dump_tables(
 
             invalid_optimize = find_eq_or_filter(
                 &expr,
+                true,
                 &mut |col_name, scalar| {
                     if col_name == "database" {
                         if let Scalar::String(database) = scalar {

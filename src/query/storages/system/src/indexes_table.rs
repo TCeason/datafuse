@@ -70,6 +70,7 @@ impl AsyncSystemTable for IndexesTable {
 
             invalid_optimize = find_eq_or_filter(
                 &expr,
+                false,
                 &mut |col_name, scalar| {
                     if col_name == "database" {
                         if let Scalar::String(database) = scalar {

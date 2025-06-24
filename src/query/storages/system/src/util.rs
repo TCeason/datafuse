@@ -139,6 +139,7 @@ pub fn find_lt_filter(expr: &Expr<String>, visitor: &mut impl FnMut(&str, &Scala
 
 pub fn find_eq_or_filter(
     expr: &Expr<String>,
+    ignore_like: bool,
     visitor: &mut impl FnMut(&str, &Scalar) -> Result<()>,
     mut invalid_optimize: bool,
 ) -> bool {
@@ -148,12 +149,13 @@ pub fn find_eq_or_filter(
 
     fn inner(
         expr: &Expr<String>,
+        ignore_like: bool,
         visitor: &mut impl FnMut(&str, &Scalar) -> Result<()>,
         invalid_optimize: &mut bool,
     ) {
         match expr {
             Expr::Constant(_) | Expr::ColumnRef(_) => {}
-            Expr::Cast(Cast { expr, .. }) => inner(expr, visitor, invalid_optimize),
+            Expr::Cast(Cast { expr, .. }) => inner(expr, ignore_like, visitor, invalid_optimize),
             Expr::FunctionCall(FunctionCall { function, args, .. }) => {
                 // Like: select * from (select * from system.tables where database='default') where name='t'
                 // push downs: [filters: [and_filters(and_filters(tables.database (#1) = 'default', tables.name (#2) = 't'), tables.database (#1) = 'default')], limit: NONE]
@@ -169,7 +171,7 @@ pub fn find_eq_or_filter(
                     }
                     "and_filters" => {
                         for arg in args {
-                            inner(arg, visitor, invalid_optimize);
+                            inner(arg, ignore_like, visitor, invalid_optimize);
                             if *invalid_optimize {
                                 return;
                             }
@@ -215,7 +217,7 @@ pub fn find_eq_or_filter(
                         }
 
                         for arg in args {
-                            inner(arg, visitor, invalid_optimize);
+                            inner(arg, ignore_like, visitor, invalid_optimize);
                             if *invalid_optimize {
                                 return;
                             }
@@ -229,6 +231,18 @@ pub fn find_eq_or_filter(
                             }
                         }
                     }
+                    "like" => {
+                        // Some gui will send query like :
+                        // SELECT * FROM information_schema.columns
+                        // WHERE table_catalog = 'xx' AND table_name = 'xx' AND column_name LIKE '%'
+                        // In this case we can trust this optimize
+                        // Note: null like '%' -> null so we only limit system.columns's name
+                        if let Expr::ColumnRef(ColumnRef { id, .. }) = args[0].clone() {
+                            if !(ignore_like && id == "name") {
+                                *invalid_optimize = true;
+                            }
+                        }
+                    }
                     _ => {
                         // Any other function makes it invalid.
                         *invalid_optimize = true;
@@ -237,7 +251,7 @@ pub fn find_eq_or_filter(
             }
             Expr::LambdaFunctionCall(LambdaFunctionCall { args, .. }) => {
                 for arg in args {
-                    inner(arg, visitor, invalid_optimize);
+                    inner(arg, ignore_like, visitor, invalid_optimize);
                     if *invalid_optimize {
                         return;
                     }
@@ -246,6 +260,6 @@ pub fn find_eq_or_filter(
         }
     }
 
-    inner(expr, visitor, &mut invalid_optimize);
+    inner(expr, ignore_like, visitor, &mut invalid_optimize);
     invalid_optimize
 }

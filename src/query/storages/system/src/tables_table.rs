@@ -363,6 +363,7 @@ where TablesTable<WITH_HISTORY, WITHOUT_VIEW>: HistoryAware
                 let expr = filter.as_expr(&BUILTIN_FUNCTIONS);
                 invalid_optimize = find_eq_or_filter(
                     &expr,
+                    false,
                     &mut |col_name, scalar| {
                         if col_name == "catalog" {
                             if let Scalar::String(catalog) = scalar {
