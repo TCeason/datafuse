@@ -106,7 +106,9 @@ impl RecursiveRuleOptimizer {
 
     fn apply_transform_rules(&self, s_expr: &SExpr, rules: &[RuleID]) -> Result<SExpr> {
         let mut s_expr = s_expr.clone();
+        println!("in apply s_expr is {:?}", s_expr.clone());
         for rule_id in rules {
+            println!("rule_id is {:?}", rule_id.clone());
             let rule = RuleFactory::create_rule(*rule_id, self.ctx.clone())?;
 
             // Skip disabled rules
@@ -127,6 +129,7 @@ impl RecursiveRuleOptimizer {
                 .any(|matcher| matcher.matches(&s_expr))
                 && !s_expr.applied_rule(&rule.id())
             {
+                println!("rule id is {}", rule.id().clone());
                 s_expr.set_applied_rule(&rule.id());
                 rule.apply(&s_expr, &mut state)?;
                 if !state.results().is_empty() {

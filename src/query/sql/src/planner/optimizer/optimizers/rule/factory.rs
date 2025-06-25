@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use databend_common_exception::Result;
 
-use crate::optimizer::optimizers::rule::RuleCommuteJoin;
+use crate::optimizer::optimizers::rule::{RuleCommuteJoin, RuleRewriteLike};
 use crate::optimizer::optimizers::rule::RuleCommuteJoinBaseTable;
 use crate::optimizer::optimizers::rule::RuleEagerAggregation;
 use crate::optimizer::optimizers::rule::RuleEliminateEvalScalar;
@@ -111,6 +111,7 @@ impl RuleFactory {
             RuleID::TryApplyAggIndex => Ok(Box::new(RuleTryApplyAggIndex::new(metadata))),
             RuleID::EliminateSort => Ok(Box::new(RuleEliminateSort::new())),
             RuleID::SemiToInnerJoin => Ok(Box::new(RuleSemiToInnerJoin::new())),
+            RuleID::RewriteLike => Ok(Box::new(RuleRewriteLike::new())),
             RuleID::MergeFilterIntoMutation => {
                 Ok(Box::new(RuleMergeFilterIntoMutation::new(metadata)))
             }

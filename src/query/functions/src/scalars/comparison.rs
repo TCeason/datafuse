@@ -1121,7 +1121,16 @@ fn vectorize_like(
             (Value::Scalar(arg1), Value::Scalar(arg2)) => {
                 let pattern = convert_escape_pattern(&escape, arg2);
                 let pattern_type = generate_like_pattern(pattern.as_bytes(), 1);
-                Value::Scalar(func(arg1.as_bytes(), &pattern_type))
+                match pattern_type {
+                    LikePattern::StartOfPercent(v) if v.len() == 1 => {
+                        println!("will print true");
+                        Value::Scalar(true)
+                    }
+                    _ => {
+                        Value::Scalar(func(arg1.as_bytes(), &pattern_type))
+                    }
+                }
+
             }
             (Value::Column(arg1), Value::Scalar(arg2)) => {
                 let arg1_iter = StringType::iter_column(&arg1);
@@ -1129,13 +1138,22 @@ fn vectorize_like(
                 let pattern = convert_escape_pattern(&escape, arg2);
                 let pattern_type =
                     generate_like_pattern(pattern.as_bytes(), arg1.total_bytes_len());
-                if let LikePattern::SurroundByPercent(searcher) = pattern_type {
-                    for arg1 in arg1_iter {
-                        builder.push(searcher.search(arg1.as_bytes()).is_some());
+                match pattern_type {
+                    LikePattern::StartOfPercent(v) if v.len() == 1 => {
+                        println!("will print true col");
+                        for _arg1 in arg1_iter {
+                            builder.push(true);
+                        }
                     }
-                } else {
-                    for arg1 in arg1_iter {
-                        builder.push(func(arg1.as_bytes(), &pattern_type));
+                    LikePattern::SurroundByPercent(searcher) => {
+                        for arg1 in arg1_iter {
+                            builder.push(searcher.search(arg1.as_bytes()).is_some());
+                        }
+                    }
+                    _ => {
+                        for arg1 in arg1_iter {
+                            builder.push(func(arg1.as_bytes(), &pattern_type));
+                        }
                     }
                 }
 

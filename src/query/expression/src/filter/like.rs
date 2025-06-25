@@ -58,6 +58,8 @@ impl LikePattern<'_> {
     pub fn compare(&self, haystack: &[u8]) -> bool {
         match self {
             LikePattern::OrdinalStr(s) => haystack == s.as_ref(),
+            // '%'
+            LikePattern::StartOfPercent(s) if s.len() == 1 => true,
             // '%abc'
             LikePattern::StartOfPercent(s) => haystack.ends_with(s),
             // 'abc%'
@@ -248,12 +250,21 @@ pub fn generate_like_pattern<'a, B: Into<Cow<'a, [u8]>>>(
     match percent_num {
         0 => LikePattern::OrdinalStr(pattern),
         1 if has_start_percent => match pattern {
-            Cow::Borrowed(v) => LikePattern::StartOfPercent(Cow::Borrowed(&v[1..])),
-            Cow::Owned(v) => LikePattern::StartOfPercent(Cow::Owned(v[1..].to_vec())),
+            Cow::Borrowed(v) => {
+                println!("v is {:?}, v.len() {}",v, v.len());
+                println!("in 252");
+                LikePattern::StartOfPercent(Cow::Borrowed(&v[1..])) },
+            Cow::Owned(v) => {
+                println!("in 255");
+                LikePattern::StartOfPercent(Cow::Owned(v[1..].to_vec())) },
         },
         1 if has_end_percent => match pattern {
-            Cow::Borrowed(v) => LikePattern::EndOfPercent(Cow::Borrowed(&v[..v.len() - 1])),
-            Cow::Owned(v) => LikePattern::EndOfPercent(Cow::Owned(v[..v.len() - 1].to_vec())),
+            Cow::Borrowed(v) => {
+                println!("in 260");
+                LikePattern::EndOfPercent(Cow::Borrowed(&v[..v.len() - 1])) },
+            Cow::Owned(v) => {
+                println!("in 263");
+                LikePattern::EndOfPercent(Cow::Owned(v[..v.len() - 1].to_vec())) },
         },
         2 if has_start_percent && has_end_percent => {
             let needle = &pattern[1..len - 1];
