@@ -38,6 +38,7 @@ impl From<CreateDatabasePlan> for CreateDatabaseReq {
     fn from(p: CreateDatabasePlan) -> Self {
         CreateDatabaseReq {
             create_option: p.create_option,
+            catalog_name: "default".to_string(),
             name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
             meta: p.meta,
         }
@@ -48,6 +49,7 @@ impl From<&CreateDatabasePlan> for CreateDatabaseReq {
     fn from(p: &CreateDatabasePlan) -> Self {
         CreateDatabaseReq {
             create_option: p.create_option,
+            catalog_name: p.catalog.to_string(),
             name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
             meta: p.meta.clone(),
         }

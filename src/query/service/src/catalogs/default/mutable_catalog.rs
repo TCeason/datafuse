@@ -191,6 +191,7 @@ impl MutableCatalog {
         // Create default database.
         let req = CreateDatabaseReq {
             create_option: CreateOption::CreateIfNotExists,
+            catalog_name: "default".to_string(),
             name_ident: DatabaseNameIdent::new(&tenant, "default"),
             meta: DatabaseMeta {
                 engine: "".to_string(),

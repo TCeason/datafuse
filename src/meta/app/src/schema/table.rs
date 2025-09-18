@@ -617,6 +617,7 @@ impl Display for TableIdList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTableReq {
     pub create_option: CreateOption,
+    pub catalog_name: String,
     pub name_ident: TableNameIdent,
     pub table_meta: TableMeta,
 

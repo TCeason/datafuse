@@ -48,6 +48,7 @@ async fn test_immutable_catalogs_database() -> Result<()> {
     // create database should failed
     let create_db_req = CreateDatabaseReq {
         create_option: CreateOption::Create,
+        catalog_name: "default".to_string(),
         name_ident: DatabaseNameIdent::new(&tenant, "system"),
         meta: Default::default(),
     };

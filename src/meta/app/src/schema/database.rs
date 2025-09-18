@@ -181,6 +181,7 @@ impl Display for DbIdList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateDatabaseReq {
     pub create_option: CreateOption,
+    pub catalog_name: String,
     pub name_ident: DatabaseNameIdent,
     pub meta: DatabaseMeta,
 }

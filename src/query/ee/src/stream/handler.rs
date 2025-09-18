@@ -135,6 +135,7 @@ impl StreamHandler for RealStreamHandler {
 
         let req = CreateTableReq {
             create_option: plan.create_option,
+            catalog_name: plan.catalog.to_string(),
             name_ident: TableNameIdent {
                 tenant: plan.tenant.clone(),
                 db_name: plan.database.clone(),

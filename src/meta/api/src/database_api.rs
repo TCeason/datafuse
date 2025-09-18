@@ -138,7 +138,15 @@ where
                         });
                     }
                     CreateOption::CreateOrReplace => {
-                        let _ = drop_database_meta(self, name_key, false, false, &mut txn).await?;
+                        let _ = drop_database_meta(
+                            self,
+                            name_key,
+                            Some(req.catalog_name.to_string()),
+                            false,
+                            false,
+                            &mut txn,
+                        )
+                        .await?;
                     }
                 }
             };
@@ -215,7 +223,8 @@ where
             let mut txn = TxnRequest::default();
 
             let db_id =
-                drop_database_meta(self, tenant_dbname, req.if_exists, true, &mut txn).await?;
+                drop_database_meta(self, tenant_dbname, None, req.if_exists, true, &mut txn)
+                    .await?;
 
             let (succ, _responses) = send_txn(self, txn).await?;
 

@@ -108,6 +108,7 @@ impl Interpreter for CreateViewInterpreter {
 
         let plan = CreateTableReq {
             create_option: self.plan.create_option,
+            catalog_name: self.plan.catalog.to_string(),
             name_ident: TableNameIdent {
                 tenant: self.plan.tenant.clone(),
                 db_name: self.plan.database.clone(),
