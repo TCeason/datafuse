@@ -43,9 +43,6 @@ pub struct DataSourcePlan {
     // used for recluster to update stream columns
     pub update_stream_columns: bool,
 
-    // data mask policy for `output_schema` columns
-    pub data_mask_policy: Option<BTreeMap<FieldIndex, RemoteExpr>>,
-
     pub table_index: usize,
     pub scan_id: usize,
 }

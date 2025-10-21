@@ -78,6 +78,18 @@ impl Binder {
         let last_expr_context = bind_context.expr_context.clone();
         bind_context.set_expr_context(ExprContext::WhereClause);
 
+        // Optimization: Check if any table in the context has masking policies
+        let has_masking_policies = self.check_if_has_masking_policies(bind_context);
+
+        // Rewrite the expression to replace masked columns with their policy expressions (only if needed)
+        let rewritten_expr = if has_masking_policies {
+            databend_common_base::runtime::block_on(async {
+                self.rewrite_expr_with_masking(bind_context, expr).await
+            })?
+        } else {
+            expr.clone()
+        };
+
         let mut scalar_binder = ScalarBinder::new(
             bind_context,
             self.ctx.clone(),
@@ -85,7 +97,7 @@ impl Binder {
             self.metadata.clone(),
             aliases,
         );
-        let (scalar, _) = scalar_binder.bind(expr)?;
+        let (scalar, _) = scalar_binder.bind(&rewritten_expr)?;
         let f = |scalar: &ScalarExpr| {
             matches!(
                 scalar,

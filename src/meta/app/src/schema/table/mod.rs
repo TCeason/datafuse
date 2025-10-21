@@ -794,7 +794,6 @@ pub struct SetTableColumnMaskPolicyReq {
     pub tenant: Tenant,
     pub table_id: u64,
     pub seq: MatchSeq,
-    pub column: String,
     pub action: SetSecurityPolicyAction,
 }
 
