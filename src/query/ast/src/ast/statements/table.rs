@@ -1099,9 +1099,9 @@ impl Display for ColumnComment {
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum ModifyColumnAction {
-    // (column name id, masking policy name)
-    SetMaskingPolicy(Identifier, String),
-    // column name id
+    // (column name, masking policy name, using column name)
+    SetMaskingPolicy(Identifier, String, Option<Vec<Identifier>>),
+    // column name
     UnsetMaskingPolicy(Identifier),
     // vec<ColumnDefinition>
     SetDataType(Vec<ColumnDefinition>),
@@ -1114,8 +1114,14 @@ pub enum ModifyColumnAction {
 impl Display for ModifyColumnAction {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match &self {
-            ModifyColumnAction::SetMaskingPolicy(column, name) => {
-                write!(f, "{} SET MASKING POLICY {}", column, name)?
+            ModifyColumnAction::SetMaskingPolicy(column, name, using_columns) => {
+                if let Some(using_columns) = using_columns {
+                    write!(f, "{} SET MASKING POLICY {} USING (", column, name)?;
+                    write_comma_separated_list(f, using_columns)?;
+                    write!(f, ")")?
+                } else {
+                    write!(f, "{} SET MASKING POLICY {}", column, name)?
+                }
             }
             ModifyColumnAction::UnsetMaskingPolicy(column) => {
                 write!(f, "{} UNSET MASKING POLICY", column)?

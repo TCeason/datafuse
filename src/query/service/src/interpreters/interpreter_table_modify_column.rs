@@ -43,6 +43,7 @@ use databend_common_meta_types::MatchSeq;
 use databend_common_sql::plans::ModifyColumnAction;
 use databend_common_sql::plans::ModifyTableColumnPlan;
 use databend_common_sql::plans::Plan;
+use databend_common_sql::resolve_type_name_by_str;
 use databend_common_sql::BloomIndexColumns;
 use databend_common_sql::DefaultExprBinder;
 use databend_common_sql::Planner;
@@ -79,12 +80,13 @@ impl ModifyTableColumnInterpreter {
         Ok(ModifyTableColumnInterpreter { ctx, plan })
     }
 
+
     // Set data mask policy to a column is a ee feature.
     async fn do_set_data_mask_policy(
         &self,
         catalog: Arc<dyn Catalog>,
         table: Arc<dyn Table>,
-        column: String,
+        using_columns: &[String],
         mask_name: String,
     ) -> Result<PipelineBuildResult> {
         LicenseManagerSwitch::instance()
@@ -117,26 +119,42 @@ impl ModifyTableColumnInterpreter {
             .get_data_mask(meta_api, &self.ctx.get_tenant(), mask_name.clone())
             .await?;
 
-        // check if column type match to the input type
-        let policy_data_type = policy.args[0].1.to_string().to_lowercase();
+        // check if column type match to the input type - similar to row access policy validation
+        let mut policy_data_types = Vec::new();
+        for (_, type_str) in &policy.args {
+            let table_data_type = resolve_type_name_by_str(type_str, false)?;
+            policy_data_types.push(table_data_type.remove_nullable());
+        }
+
         let schema = table.schema();
         let table_info = table.get_table_info();
 
-        let column_id = if let Some((_, data_field)) = schema.column_with_name(&column) {
-            let data_type = data_field.data_type().to_string().to_lowercase();
-            if data_type != policy_data_type {
-                return Err(ErrorCode::UnmatchColumnDataType(format!(
-                    "Column '{}' data type {} does not match to the mask policy type {}",
-                    column, data_type, policy_data_type,
-                )));
-            }
-            data_field.column_id
-        } else {
-            return Err(ErrorCode::UnknownColumn(format!(
-                "Cannot find column {}",
-                column
+        if using_columns.len() != policy_data_types.len() {
+            return Err(ErrorCode::UnmatchColumnDataType(format!(
+                "Number of columns ({}) does not match the number of mask policy arguments ({})",
+                using_columns.len(), policy_data_types.len()
             )));
-        };
+        }
+
+        let mut columns_ids = vec![];
+        for (column, policy_data_type) in using_columns.iter().zip(policy_data_types.into_iter()) {
+            let column_id = if let Some((_, data_field)) = schema.column_with_name(column) {
+                let column_type = data_field.data_type();
+                if policy_data_type != column_type.remove_nullable() {
+                    return Err(ErrorCode::UnmatchColumnDataType(format!(
+                        "Column '{}' data type {} does not match to the mask policy type {}",
+                        column, column_type, policy_data_type,
+                    )));
+                }
+                data_field.column_id
+            } else {
+                return Err(ErrorCode::UnknownColumn(format!(
+                    "Cannot find column {}",
+                    column
+                )));
+            };
+            columns_ids.push(column_id);
+        }
 
         let table_id = table_info.ident.table_id;
 
@@ -144,8 +162,7 @@ impl ModifyTableColumnInterpreter {
             tenant: self.ctx.get_tenant(),
             seq: MatchSeq::Exact(table_info.ident.seq),
             table_id,
-            column,
-            action: SetSecurityPolicyAction::Set(*policy_id, vec![column_id]),
+            action: SetSecurityPolicyAction::Set(*policy_id, columns_ids),
         };
 
         let _resp = catalog.set_table_column_mask_policy(req).await?;
@@ -566,7 +583,6 @@ impl ModifyTableColumnInterpreter {
                 tenant: self.ctx.get_tenant(),
                 seq: MatchSeq::Exact(table_version),
                 table_id,
-                column: column.clone(),
                 action: SetSecurityPolicyAction::Unset(policy.policy_id),
             };
 
@@ -671,8 +687,8 @@ impl Interpreter for ModifyTableColumnInterpreter {
         // NOTICE: if we support modify column data type,
         // need to check whether this column is referenced by other computed columns.
         let mut build_res = match &self.plan.action {
-            ModifyColumnAction::SetMaskingPolicy(column, mask_name) => {
-                self.do_set_data_mask_policy(catalog, table, column.to_string(), mask_name.clone())
+            ModifyColumnAction::SetMaskingPolicy(mask_name, using_columns) => {
+                self.do_set_data_mask_policy(catalog, table, using_columns, mask_name.clone())
                     .await?
             }
             ModifyColumnAction::UnsetMaskingPolicy(column) => {

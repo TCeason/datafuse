@@ -17,14 +17,13 @@ use std::sync::Arc;
 use databend_common_catalog::table::TableExt;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::TableDataType;
 use databend_common_license::license::Feature::RowAccessPolicy;
 use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::DatabaseType;
 use databend_common_meta_app::schema::SetSecurityPolicyAction;
 use databend_common_meta_app::schema::SetTableRowAccessPolicyReq;
 use databend_common_sql::plans::AddTableRowAccessPolicyPlan;
-use databend_common_sql::resolve_type_name_by_str;
+use databend_common_sql::{parse_type_name_non_nullable, resolve_type_name_by_str};
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 use databend_common_storages_stream::stream_table::STREAM_ENGINE;
 use databend_common_users::UserApiProvider;
@@ -45,10 +44,6 @@ impl AddTableRowAccessPolicyInterpreter {
         Ok(AddTableRowAccessPolicyInterpreter { ctx, plan })
     }
 
-    fn parse_type_name(type_str: &str) -> Result<TableDataType> {
-        let table_data_type = resolve_type_name_by_str(type_str, false)?;
-        Ok(table_data_type.remove_nullable())
-    }
 }
 
 #[async_trait::async_trait]
@@ -108,8 +103,8 @@ impl Interpreter for AddTableRowAccessPolicyInterpreter {
         // check if column type match to the input type
         let mut policy_data_types = Vec::new();
         for (_, type_str) in &policy.args {
-            let policy_type = Self::parse_type_name(type_str)?;
-            policy_data_types.push(policy_type);
+            let table_data_type = resolve_type_name_by_str(type_str, false)?;
+            policy_data_types.push(table_data_type.remove_nullable());
         }
 
         let mut columns_ids = vec![];
