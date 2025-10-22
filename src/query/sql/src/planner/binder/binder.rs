@@ -1164,48 +1164,48 @@ impl Binder {
                             let using_columns = &policy_info.columns_ids;
 
                             // Create arguments based on USING clause
-                            let arguments: Vec<Expr> = args
+                            let arguments: Result<Vec<Expr>> = args
                                 .iter()
                                 .enumerate()
                                 .map(|(param_idx, _)| {
-                                    if let Some(&column_id) = using_columns.get(param_idx) {
-                                        let field_name = table_meta
-                                            .schema
-                                            .fields()
-                                            .iter()
-                                            .find(|f| f.column_id == column_id)
-                                            .map(|f| f.name.clone())
-                                            .unwrap_or_else(|| format!("column_{}", column_id));
+                                    let column_id = using_columns.get(param_idx).ok_or_else(|| {
+                                        ErrorCode::Internal(format!(
+                                            "Masking policy metadata is corrupted: policy requires {} parameters, \
+                                             but only {} columns are configured in USING clause. \
+                                             Please drop and recreate the masking policy attachment.",
+                                            args.len(),
+                                            using_columns.len()
+                                        ))
+                                    })?;
 
-                                        Expr::ColumnRef {
-                                            span: None,
-                                            column: ColumnRef {
-                                                database: None,
-                                                table: None,
-                                                column: ast::ColumnID::Name(Identifier::from_name(
-                                                    None, field_name,
-                                                )),
-                                            },
-                                        }
-                                    } else {
-                                        panic!(
-                                            "doesn't have enough columns for parameter {}",
-                                            param_idx
-                                        );
-                                    }
+                                    let field_name = table_meta
+                                        .schema
+                                        .fields()
+                                        .iter()
+                                        .find(|f| f.column_id == *column_id)
+                                        .map(|f| f.name.clone())
+                                        .unwrap_or_else(|| format!("column_{}", column_id));
+
+                                    Ok(Expr::ColumnRef {
+                                        span: None,
+                                        column: ColumnRef {
+                                            database: None,
+                                            table: None,
+                                            column: ast::ColumnID::Name(Identifier::from_name(
+                                                None, field_name,
+                                            )),
+                                        },
+                                    })
                                 })
                                 .collect();
+                            let arguments = arguments?;
 
                             // Create parameter mapping
-                            let parameters =
-                                args.iter().map(|arg| arg.0.to_string()).collect::<Vec<_>>();
-                            let mut args_map = HashMap::with_capacity(parameters.len());
-
-                            arguments.iter().enumerate().for_each(|(idx, argument)| {
-                                if let Some(parameter) = parameters.get(idx) {
-                                    args_map.insert(parameter.as_str(), (*argument).clone());
-                                }
-                            });
+                            let args_map: HashMap<_, _> = args
+                                .iter()
+                                .map(|(param_name, _)| param_name.as_str())
+                                .zip(arguments.iter().cloned())
+                                .collect();
 
                             // Replace parameters in the expression
                             let expr =
@@ -1297,7 +1297,7 @@ impl Binder {
                 bind_context.search_bound_columns_recursively(
                     column.database.as_ref().map(|ident| ident.name.as_str()),
                     column.table.as_ref().map(|ident| ident.name.as_str()),
-                    &column.column.name(),
+                    column.column.name(),
                     &mut results,
                 );
 

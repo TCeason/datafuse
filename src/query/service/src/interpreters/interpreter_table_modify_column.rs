@@ -118,12 +118,17 @@ impl ModifyTableColumnInterpreter {
             .get_data_mask(meta_api, &self.ctx.get_tenant(), mask_name.clone())
             .await?;
 
+        println!("policy is {:?}", policy.clone());
         // check if column type match to the input type - similar to row access policy validation
-        let mut policy_data_types = Vec::new();
-        for (_, type_str) in &policy.args {
-            let table_data_type = resolve_type_name_by_str(type_str, false)?;
-            policy_data_types.push(table_data_type.remove_nullable());
-        }
+        let policy_data_types: Result<Vec<_>> = policy
+            .args
+            .iter()
+            .map(|(_, type_str)| {
+                let table_data_type = resolve_type_name_by_str(type_str, false)?;
+                Ok(table_data_type.remove_nullable())
+            })
+            .collect();
+        let policy_data_types = policy_data_types?;
 
         let schema = table.schema();
         let table_info = table.get_table_info();
@@ -136,9 +141,15 @@ impl ModifyTableColumnInterpreter {
             )));
         }
 
-        let mut columns_ids = vec![];
-        for (column, policy_data_type) in using_columns.iter().zip(policy_data_types.into_iter()) {
-            let column_id = if let Some((_, data_field)) = schema.column_with_name(column) {
+        println!("using_columns is {:?}, policy_data_types is {:?}", using_columns, policy_data_types);
+        let columns_ids: Result<Vec<_>> = using_columns
+            .iter()
+            .zip(policy_data_types.into_iter())
+            .map(|(column, policy_data_type)| {
+                let (_, data_field) = schema.column_with_name(column).ok_or_else(|| {
+                    ErrorCode::UnknownColumn(format!("Cannot find column {}", column))
+                })?;
+
                 let column_type = data_field.data_type();
                 if policy_data_type != column_type.remove_nullable() {
                     return Err(ErrorCode::UnmatchColumnDataType(format!(
@@ -146,15 +157,11 @@ impl ModifyTableColumnInterpreter {
                         column, column_type, policy_data_type,
                     )));
                 }
-                data_field.column_id
-            } else {
-                return Err(ErrorCode::UnknownColumn(format!(
-                    "Cannot find column {}",
-                    column
-                )));
-            };
-            columns_ids.push(column_id);
-        }
+
+                Ok(data_field.column_id)
+            })
+            .collect();
+        let columns_ids = columns_ids?;
 
         let table_id = table_info.ident.table_id;
 

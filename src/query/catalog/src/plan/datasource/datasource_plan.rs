@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 
 use databend_common_expression::FieldIndex;
-use databend_common_expression::RemoteExpr;
 use databend_common_expression::Scalar;
 use databend_common_expression::TableSchemaRef;
 

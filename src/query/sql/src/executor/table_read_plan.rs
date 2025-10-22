@@ -13,17 +13,9 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use databend_common_ast::ast;
-use databend_common_ast::ast::ColumnRef;
-use databend_common_ast::ast::Expr;
-use databend_common_ast::ast::Identifier;
-use databend_common_ast::parser::parse_expr;
-use databend_common_ast::parser::tokenize_sql;
 use databend_common_base::base::ProgressValues;
-use databend_common_catalog::plan::DataSourceInfo;
 use databend_common_catalog::plan::DataSourcePlan;
 use databend_common_catalog::plan::Filters;
 use databend_common_catalog::plan::InternalColumn;
@@ -37,17 +29,6 @@ use databend_common_exception::Result;
 use databend_common_expression::FieldIndex;
 use databend_common_expression::RemoteExpr;
 use databend_common_expression::Scalar;
-use databend_common_license::license::Feature::DataMask;
-use databend_common_license::license_manager::LicenseManagerSwitch;
-use databend_common_users::UserApiProvider;
-use databend_enterprise_data_mask_feature::get_datamask_handler;
-use log::info;
-use parking_lot::RwLock;
-
-use crate::BindContext;
-use crate::Metadata;
-use crate::NameResolutionContext;
-use crate::TypeChecker;
 
 #[async_trait::async_trait]
 pub trait ToReadDataSourcePlan {

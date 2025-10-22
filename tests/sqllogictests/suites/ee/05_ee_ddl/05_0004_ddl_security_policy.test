@@ -313,4 +313,7 @@ statement ok
 drop table if exists data_mask_test;
 
 statement ok
+unset global enable_planner_cache;
+
+statement ok
 unset global enable_experimental_row_access_policy;

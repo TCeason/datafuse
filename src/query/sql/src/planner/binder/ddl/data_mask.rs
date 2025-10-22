@@ -50,6 +50,7 @@ impl Binder {
             )));
         }
 
+        println!("in bind create policy is {:?}", policy.clone());
         let tenant = self.ctx.get_tenant();
         let plan = CreateDatamaskPolicyPlan {
             create_option: create_option.clone().into(),
