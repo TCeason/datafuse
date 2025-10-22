@@ -1092,4 +1092,163 @@ impl Binder {
         }
         Ok(s_expr)
     }
+
+    pub async fn get_masking_policy_expr_for_column_ref(
+        &self,
+        column_ref: &databend_common_ast::ast::ColumnRef,
+        table_index: Option<crate::IndexType>,
+    ) -> Result<Option<databend_common_ast::ast::Expr>> {
+        use std::collections::HashMap;
+
+        use databend_common_ast::ast;
+        use databend_common_ast::ast::ColumnRef;
+        use databend_common_ast::ast::Expr;
+        use databend_common_ast::ast::Identifier;
+        use databend_common_ast::parser::parse_expr;
+        use databend_common_ast::parser::tokenize_sql;
+        use databend_common_license::license::Feature::DataMask;
+        use databend_common_license::license_manager::LicenseManagerSwitch;
+        use databend_common_users::UserApiProvider;
+        use databend_enterprise_data_mask_feature::get_datamask_handler;
+
+        // Check if this column has a masking policy
+        if let Some(table_index) = table_index {
+            let metadata = self.metadata.read();
+            let table = metadata.table(table_index);
+            let table_ref = table.table();
+            let table_info_ref = table_ref.get_table_info();
+
+            // Use column ID from ColumnRef
+            if let ast::ColumnID::Name(ident) = &column_ref.column {
+                // Find the field by name to get column_id
+                if let Some(field) = table_info_ref
+                    .meta
+                    .schema
+                    .fields()
+                    .iter()
+                    .find(|f| f.name == ident.name)
+                {
+                    if let Some(policy_info) = table_info_ref
+                        .meta
+                        .column_mask_policy_columns_ids
+                        .get(&field.column_id)
+                    {
+                        // Check license
+                        if LicenseManagerSwitch::instance()
+                            .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)
+                            .is_err()
+                        {
+                            return Ok(None);
+                        }
+
+                        let tenant = self.ctx.get_tenant();
+                        let meta_api = UserApiProvider::instance().get_meta_store_client();
+                        let handler = get_datamask_handler();
+
+                        // Get the policy
+                        if let Ok(policy) = handler
+                            .get_data_mask_by_id(meta_api.clone(), &tenant, policy_info.policy_id)
+                            .await
+                        {
+                            let policy = policy.data;
+                            let body = &policy.body;
+                            let args = &policy.args;
+
+                            // Parse the policy body
+                            let tokens = tokenize_sql(body)?;
+                            let settings = self.ctx.get_settings();
+                            let ast_expr = parse_expr(&tokens, settings.get_sql_dialect()?)?;
+
+                            // Get table schema for column mapping
+                            let table_meta = &table_info_ref.meta;
+                            let using_columns = &policy_info.columns_ids;
+
+                            // Create arguments based on USING clause
+                            let arguments: Vec<Expr> = args
+                                .iter()
+                                .enumerate()
+                                .map(|(param_idx, _)| {
+                                    if let Some(&column_id) = using_columns.get(param_idx) {
+                                        let field_name = table_meta
+                                            .schema
+                                            .fields()
+                                            .iter()
+                                            .find(|f| f.column_id == column_id)
+                                            .map(|f| f.name.clone())
+                                            .unwrap_or_else(|| format!("column_{}", column_id));
+
+                                        Expr::ColumnRef {
+                                            span: None,
+                                            column: ColumnRef {
+                                                database: None,
+                                                table: None,
+                                                column: ast::ColumnID::Name(Identifier::from_name(
+                                                    None, field_name,
+                                                )),
+                                            },
+                                        }
+                                    } else {
+                                        panic!(
+                                            "doesn't have enough columns for parameter {}",
+                                            param_idx
+                                        );
+                                    }
+                                })
+                                .collect();
+
+                            // Create parameter mapping
+                            let parameters =
+                                args.iter().map(|arg| arg.0.to_string()).collect::<Vec<_>>();
+                            let mut args_map = HashMap::with_capacity(parameters.len());
+
+                            arguments.iter().enumerate().for_each(|(idx, argument)| {
+                                if let Some(parameter) = parameters.get(idx) {
+                                    args_map.insert(parameter.as_str(), (*argument).clone());
+                                }
+                            });
+
+                            // Replace parameters in the expression
+                            let expr =
+                                TypeChecker::clone_expr_with_replacement(&ast_expr, |nest_expr| {
+                                    if let Expr::ColumnRef { column, .. } = nest_expr {
+                                        if let Some(arg) = args_map.get(column.column.name()) {
+                                            return Ok(Some(arg.clone()));
+                                        }
+                                    }
+                                    Ok(None)
+                                })?;
+
+                            return Ok(Some(expr));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn get_masking_policy_expr(
+        &self,
+        column_binding: &ColumnBinding,
+    ) -> Result<Option<databend_common_ast::ast::Expr>> {
+        // For build_select_item case, we need to construct a ColumnRef from ColumnBinding
+        let column_ref =
+            databend_common_ast::ast::ColumnRef {
+                database: column_binding.database_name.as_ref().map(|name| {
+                    databend_common_ast::ast::Identifier::from_name(None, name.clone())
+                }),
+                table: column_binding.table_name.as_ref().map(|name| {
+                    databend_common_ast::ast::Identifier::from_name(None, name.clone())
+                }),
+                column: databend_common_ast::ast::ColumnID::Name(
+                    databend_common_ast::ast::Identifier::from_name(
+                        None,
+                        column_binding.column_name.clone(),
+                    ),
+                ),
+            };
+
+        self.get_masking_policy_expr_for_column_ref(&column_ref, column_binding.table_index)
+            .await
+    }
 }

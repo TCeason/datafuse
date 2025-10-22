@@ -80,7 +80,6 @@ impl ModifyTableColumnInterpreter {
         Ok(ModifyTableColumnInterpreter { ctx, plan })
     }
 
-
     // Set data mask policy to a column is a ee feature.
     async fn do_set_data_mask_policy(
         &self,
@@ -132,7 +131,8 @@ impl ModifyTableColumnInterpreter {
         if using_columns.len() != policy_data_types.len() {
             return Err(ErrorCode::UnmatchColumnDataType(format!(
                 "Number of columns ({}) does not match the number of mask policy arguments ({})",
-                using_columns.len(), policy_data_types.len()
+                using_columns.len(),
+                policy_data_types.len()
             )));
         }
 

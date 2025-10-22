@@ -167,8 +167,6 @@ impl ToReadDataSourcePlan for dyn Table {
             output_schema = Arc::new(schema);
         }
 
-
-
         // check if need to apply data mask policy
         let data_mask_policy = if let DataSourceInfo::TableSource(table_info) = &source_info {
             let table_meta = &table_info.meta;
@@ -264,10 +262,8 @@ impl ToReadDataSourcePlan for dyn Table {
                             let tokens = tokenize_sql(body)?;
                             let ast_expr = parse_expr(&tokens, settings.get_sql_dialect()?)?;
 
-                            let parameters = args
-                                .iter()
-                                .map(|arg| arg.0.to_string())
-                                .collect::<Vec<_>>();
+                            let parameters =
+                                args.iter().map(|arg| arg.0.to_string()).collect::<Vec<_>>();
                             let mut args_map = HashMap::with_capacity(parameters.len());
 
                             arguments.iter().enumerate().for_each(|(idx, argument)| {
@@ -278,14 +274,15 @@ impl ToReadDataSourcePlan for dyn Table {
 
                             println!("ast_expr before replacement: {:?}", ast_expr);
                             println!("args_map: {:?}", args_map);
-                            let expr = TypeChecker::clone_expr_with_replacement(&ast_expr, |nest_expr| {
-                                if let Expr::ColumnRef { column, .. } = nest_expr {
-                                    if let Some(arg) = args_map.get(column.column.name()) {
-                                        return Ok(Some(arg.clone()));
+                            let expr =
+                                TypeChecker::clone_expr_with_replacement(&ast_expr, |nest_expr| {
+                                    if let Expr::ColumnRef { column, .. } = nest_expr {
+                                        if let Some(arg) = args_map.get(column.column.name()) {
+                                            return Ok(Some(arg.clone()));
+                                        }
                                     }
-                                }
-                                Ok(None)
-                            })?;
+                                    Ok(None)
+                                })?;
                             println!("expr after replacement: {:?}", expr);
 
                             let mut type_checker = TypeChecker::try_create(
@@ -318,7 +315,9 @@ impl ToReadDataSourcePlan for dyn Table {
                                         // Map table schema column indices to output schema column indices
                                         let specialized_expr = expr.project_column_ref(|col| {
                                             // Find which column this binding refers to in table schema
-                                            let binding_column_id = table_meta.schema.fields()
+                                            let binding_column_id = table_meta
+                                                .schema
+                                                .fields()
                                                 .get(col.index)
                                                 .map(|f| f.column_id)
                                                 .unwrap_or(0);
@@ -328,8 +327,11 @@ impl ToReadDataSourcePlan for dyn Table {
                                                 Ok(field_idx)
                                             } else {
                                                 // This is a condition column, find its index in output_schema
-                                                if let Some(output_index) = output_schema.fields().iter()
-                                                    .position(|f| f.column_id == binding_column_id) {
+                                                if let Some(output_index) = output_schema
+                                                    .fields()
+                                                    .iter()
+                                                    .position(|f| f.column_id == binding_column_id)
+                                                {
                                                     Ok(output_index)
                                                 } else {
                                                     // Condition column not in output_schema, but that's OK -
@@ -339,7 +341,8 @@ impl ToReadDataSourcePlan for dyn Table {
                                                 }
                                             }
                                         })?;
-                                        mask_policy_map.insert(field_idx, specialized_expr.as_remote_expr());
+                                        mask_policy_map
+                                            .insert(field_idx, specialized_expr.as_remote_expr());
                                     }
                                 }
                             }

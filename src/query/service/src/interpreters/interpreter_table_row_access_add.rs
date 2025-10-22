@@ -43,7 +43,6 @@ impl AddTableRowAccessPolicyInterpreter {
     pub fn try_create(ctx: Arc<QueryContext>, plan: AddTableRowAccessPolicyPlan) -> Result<Self> {
         Ok(AddTableRowAccessPolicyInterpreter { ctx, plan })
     }
-
 }
 
 #[async_trait::async_trait]
