@@ -46,7 +46,6 @@ use crate::binder::select::SelectList;
 use crate::binder::window::find_replaced_window_function;
 use crate::binder::window::WindowInfo;
 use crate::binder::ExprContext;
-use crate::binder::NameResolutionResult;
 use crate::binder::Visibility;
 use crate::optimizer::ir::SExpr;
 use crate::planner::binder::scalar::ScalarBinder;
@@ -264,39 +263,7 @@ impl Binder {
                     )?;
                 }
                 SelectTarget::AliasedExpr { expr, alias } => {
-                    // Check if this is a column reference that needs masking
-                    let expr_to_bind = match expr.as_ref() {
-                        Expr::ColumnRef { column, .. } => {
-                            // Try to find the column binding to check for masking policy
-                            let mut results = Vec::new();
-                            input_context.search_bound_columns_recursively(
-                                column.database.as_ref().map(|ident| ident.name.as_str()),
-                                column.table.as_ref().map(|ident| ident.name.as_str()),
-                                column.column.name(),
-                                &mut results,
-                            );
-
-                            results
-                                .first()
-                                .and_then(|result| match result {
-                                    NameResolutionResult::Column(binding) => {
-                                        databend_common_base::runtime::block_on(
-                                            self.get_masking_policy_expr_for_column_ref(
-                                                column,
-                                                binding.table_index,
-                                            ),
-                                        )
-                                        .transpose()
-                                    }
-                                    _ => None,
-                                })
-                                .transpose()?
-                                .map(Box::new)
-                                .unwrap_or_else(|| expr.clone())
-                        }
-                        _ => expr.clone(),
-                    };
-
+                    // Masking policy is now handled uniformly in TypeChecker::resolve()
                     let mut scalar_binder = ScalarBinder::new(
                         input_context,
                         self.ctx.clone(),
@@ -304,7 +271,7 @@ impl Binder {
                         self.metadata.clone(),
                         &prev_aliases,
                     );
-                    let (bound_expr, _) = scalar_binder.bind(&expr_to_bind)?;
+                    let (bound_expr, _) = scalar_binder.bind(expr)?;
 
                     fn get_expr_name(
                         expr: &Expr,
@@ -383,28 +350,11 @@ impl Binder {
                 scalar
             }
             None => {
-                // Check if this column has a masking policy
-                match databend_common_base::runtime::block_on(
-                    self.get_masking_policy_expr(&column_binding),
-                )? {
-                    Some(mask_expr) => {
-                        // Parse and bind the masking expression
-                        let mut input_context = input_context.clone();
-                        let mut scalar_binder = ScalarBinder::new(
-                            &mut input_context,
-                            self.ctx.clone(),
-                            &self.name_resolution_ctx,
-                            self.metadata.clone(),
-                            &[],
-                        );
-                        let (scalar, _) = scalar_binder.bind(&mask_expr)?;
-                        scalar
-                    }
-                    None => ScalarExpr::BoundColumnRef(BoundColumnRef {
-                        span,
-                        column: column_binding.clone(),
-                    }),
-                }
+                // Masking policy is now handled uniformly in TypeChecker::resolve()
+                ScalarExpr::BoundColumnRef(BoundColumnRef {
+                    span,
+                    column: column_binding.clone(),
+                })
             }
         };
 

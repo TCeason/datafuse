@@ -170,6 +170,9 @@ select id, name from employees where department = 'Engineering' order by id;
 1 Alice
 3 Charlie
 
+statement ok
+drop table if exists departments;
+
 ## Test 11: JOIN with masked columns
 statement ok
 create table departments(dept_name string, budget int);
