@@ -42,6 +42,19 @@ impl Binder {
         having: &Expr,
     ) -> Result<ScalarExpr> {
         bind_context.set_expr_context(ExprContext::HavingClause);
+
+        // Optimization: Check if any table in the context has masking policies
+        let has_masking_policies = self.check_if_has_masking_policies(bind_context);
+
+        // Rewrite the expression to apply masking policies (only if needed)
+        let rewritten_having = if has_masking_policies {
+            databend_common_base::runtime::block_on(async {
+                self.rewrite_expr_with_masking(bind_context, having).await
+            })?
+        } else {
+            having.clone()
+        };
+
         let mut scalar_binder = ScalarBinder::new(
             bind_context,
             self.ctx.clone(),
@@ -49,7 +62,7 @@ impl Binder {
             self.metadata.clone(),
             aliases,
         );
-        let (mut scalar, _) = scalar_binder.bind(having)?;
+        let (mut scalar, _) = scalar_binder.bind(&rewritten_having)?;
         let mut rewriter = AggregateRewriter::new(bind_context, self.metadata.clone());
         rewriter.visit(&mut scalar)?;
         Ok(scalar)

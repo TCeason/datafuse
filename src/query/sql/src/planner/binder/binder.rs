@@ -1251,4 +1251,179 @@ impl Binder {
         self.get_masking_policy_expr_for_column_ref(&column_ref, column_binding.table_index)
             .await
     }
+
+    /// Check if any table in the bind context has masking policies
+    /// This is an optimization to skip the rewrite logic when no masking policies exist
+    pub fn check_if_has_masking_policies(&self, bind_context: &BindContext) -> bool {
+        let metadata = self.metadata.read();
+
+        // Collect all unique table indices from the bind context
+        let mut table_indices = std::collections::HashSet::new();
+        for column in &bind_context.columns {
+            if let Some(table_index) = column.table_index {
+                table_indices.insert(table_index);
+            }
+        }
+
+        // Check if any of these tables has masking policies
+        for table_index in table_indices {
+            let table = metadata.table(table_index);
+            let table_ref = table.table();
+            let table_info = table_ref.get_table_info();
+
+            if !table_info.meta.column_mask_policy_columns_ids.is_empty() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Rewrite an expression to replace masked columns with their policy expressions
+    /// This function manually recurses through the expression tree to avoid infinite recursion
+    #[async_recursion::async_recursion(#[recursive::recursive])]
+    pub async fn rewrite_expr_with_masking(
+        &self,
+        bind_context: &BindContext,
+        expr: &databend_common_ast::ast::Expr,
+    ) -> Result<databend_common_ast::ast::Expr> {
+        use databend_common_ast::ast::Expr;
+
+        match expr {
+            // For ColumnRef, check if it needs masking and replace it
+            // IMPORTANT: Don't recurse into the replacement expression
+            Expr::ColumnRef { column, .. } => {
+                let mut results = Vec::new();
+                bind_context.search_bound_columns_recursively(
+                    column.database.as_ref().map(|ident| ident.name.as_str()),
+                    column.table.as_ref().map(|ident| ident.name.as_str()),
+                    &column.column.name(),
+                    &mut results,
+                );
+
+                if let Some(crate::binder::NameResolutionResult::Column(binding)) = results.first()
+                {
+                    if let Some(mask_expr) = databend_common_base::runtime::block_on(
+                        self.get_masking_policy_expr_for_column_ref(column, binding.table_index),
+                    )? {
+                        // Return the mask expression directly without further recursion
+                        // The mask expression will be processed by scalar_binder later
+                        return Ok(mask_expr);
+                    }
+                }
+                Ok(expr.clone())
+            }
+            // For all other expressions, manually recurse through their children
+            _ => {
+                // Use TypeChecker::clone_expr_with_replacement but only for non-ColumnRef nodes
+                // This ensures we recurse through the tree but don't re-process mask expressions
+                TypeChecker::clone_expr_with_replacement(expr, |_nest_expr| {
+                    // Only process the top-level structure, actual ColumnRef replacement
+                    // will be handled by recursive calls to rewrite_expr_with_masking
+                    Ok(None)
+                })?;
+
+                // Actually, let's manually handle the recursion for common expression types
+                self.rewrite_expr_with_masking_recursive(bind_context, expr)
+                    .await
+            }
+        }
+    }
+
+    /// Helper function to manually recurse through expression tree
+    #[async_recursion::async_recursion(#[recursive::recursive])]
+    async fn rewrite_expr_with_masking_recursive(
+        &self,
+        bind_context: &BindContext,
+        expr: &databend_common_ast::ast::Expr,
+    ) -> Result<databend_common_ast::ast::Expr> {
+        use databend_common_ast::ast::Expr;
+
+        match expr {
+            Expr::ColumnRef { .. } => {
+                // This should be handled by the parent function
+                self.rewrite_expr_with_masking(bind_context, expr).await
+            }
+            Expr::BinaryOp {
+                span,
+                op,
+                left,
+                right,
+            } => Ok(Expr::BinaryOp {
+                span: *span,
+                op: op.clone(),
+                left: Box::new(self.rewrite_expr_with_masking(bind_context, left).await?),
+                right: Box::new(self.rewrite_expr_with_masking(bind_context, right).await?),
+            }),
+            Expr::UnaryOp {
+                span,
+                op,
+                expr: inner,
+            } => Ok(Expr::UnaryOp {
+                span: *span,
+                op: op.clone(),
+                expr: Box::new(self.rewrite_expr_with_masking(bind_context, inner).await?),
+            }),
+            Expr::IsNull {
+                span,
+                expr: inner,
+                not,
+            } => Ok(Expr::IsNull {
+                span: *span,
+                expr: Box::new(self.rewrite_expr_with_masking(bind_context, inner).await?),
+                not: *not,
+            }),
+            Expr::InList {
+                span,
+                expr: inner,
+                list,
+                not,
+            } => {
+                let mut new_list = Vec::new();
+                for item in list {
+                    new_list.push(self.rewrite_expr_with_masking(bind_context, item).await?);
+                }
+                Ok(Expr::InList {
+                    span: *span,
+                    expr: Box::new(self.rewrite_expr_with_masking(bind_context, inner).await?),
+                    list: new_list,
+                    not: *not,
+                })
+            }
+            Expr::Between {
+                span,
+                expr: inner,
+                low,
+                high,
+                not,
+            } => Ok(Expr::Between {
+                span: *span,
+                expr: Box::new(self.rewrite_expr_with_masking(bind_context, inner).await?),
+                low: Box::new(self.rewrite_expr_with_masking(bind_context, low).await?),
+                high: Box::new(self.rewrite_expr_with_masking(bind_context, high).await?),
+                not: *not,
+            }),
+            Expr::FunctionCall { span, func } => {
+                let mut new_args = Vec::new();
+                for arg in &func.args {
+                    new_args.push(self.rewrite_expr_with_masking(bind_context, arg).await?);
+                }
+                Ok(Expr::FunctionCall {
+                    span: *span,
+                    func: databend_common_ast::ast::FunctionCall {
+                        distinct: func.distinct,
+                        name: func.name.clone(),
+                        args: new_args,
+                        params: func.params.clone(),
+                        order_by: func.order_by.clone(),
+                        window: func.window.clone(),
+                        lambda: func.lambda.clone(),
+                    },
+                })
+            }
+            // For other expression types, just return as-is
+            // Add more cases as needed
+            _ => Ok(expr.clone()),
+        }
+    }
 }
