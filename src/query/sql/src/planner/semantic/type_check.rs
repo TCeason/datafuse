@@ -661,12 +661,23 @@ impl<'a> TypeChecker<'a> {
                 results,
                 else_result,
             } => {
-                let mut arguments = Vec::with_capacity(conditions.len() * 2 + 1);
-                for (c, r) in conditions.iter().zip(results.iter()) {
-                    match operand {
+                // Build nested IF expressions correctly: IF(cond1, result1, IF(cond2, result2, else))
+                let else_expr = if let Some(expr) = else_result {
+                    *expr.clone()
+                } else {
+                    Expr::Literal {
+                        span: None,
+                        value: Literal::Null,
+                    }
+                };
+
+                // Build nested IFs from right to left (last condition to first)
+                let mut nested_expr = else_expr;
+                for (c, r) in conditions.iter().zip(results.iter()).rev() {
+                    let condition = match operand {
                         Some(operand) => {
                             // compare case operand with each conditions until one of them is equal
-                            let equal_expr = Expr::FunctionCall {
+                            Expr::FunctionCall {
                                 span: *span,
                                 func: ASTFunctionCall {
                                     distinct: false,
@@ -677,26 +688,26 @@ impl<'a> TypeChecker<'a> {
                                     window: None,
                                     lambda: None,
                                 },
-                            };
-                            arguments.push(equal_expr)
+                            }
                         }
-                        None => arguments.push(c.clone()),
-                    }
-                    arguments.push(r.clone());
-                }
-                let null_arg = Expr::Literal {
-                    span: None,
-                    value: Literal::Null,
-                };
+                        None => c.clone(),
+                    };
 
-                if let Some(expr) = else_result {
-                    arguments.push(*expr.clone());
-                } else {
-                    arguments.push(null_arg)
+                    nested_expr = Expr::FunctionCall {
+                        span: *span,
+                        func: ASTFunctionCall {
+                            distinct: false,
+                            name: Identifier::from_name(*span, "if"),
+                            args: vec![condition, r.clone(), nested_expr],
+                            params: vec![],
+                            order_by: vec![],
+                            window: None,
+                            lambda: None,
+                        },
+                    };
                 }
-                let args_ref: Vec<&Expr> = arguments.iter().collect();
 
-                self.resolve_function(*span, "if", vec![], &args_ref)?
+                self.resolve(&nested_expr)?
             }
 
             Expr::Substring {

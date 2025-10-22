@@ -23,7 +23,7 @@ use databend_common_meta_app::schema::DatabaseType;
 use databend_common_meta_app::schema::SetSecurityPolicyAction;
 use databend_common_meta_app::schema::SetTableRowAccessPolicyReq;
 use databend_common_sql::plans::AddTableRowAccessPolicyPlan;
-use databend_common_sql::{parse_type_name_non_nullable, resolve_type_name_by_str};
+use databend_common_sql::resolve_type_name_by_str;
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 use databend_common_storages_stream::stream_table::STREAM_ENGINE;
 use databend_common_users::UserApiProvider;

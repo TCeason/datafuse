@@ -108,7 +108,8 @@ impl FuseTable {
             for i in 0..num_input_columns {
                 if let Some(raw_expr) = data_mask_policy.get(&i) {
                     let expr = raw_expr.as_expr(&BUILTIN_FUNCTIONS);
-                    exprs.push(expr.project_column_ref(|_col_id| Ok(i))?);
+                    // Don't remap column references - they are already correctly mapped in table_read_plan.rs
+                    exprs.push(expr);
                     projection.push(mask_count + num_input_columns);
                     mask_count += 1;
                 } else {
