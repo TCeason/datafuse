@@ -118,7 +118,6 @@ impl ModifyTableColumnInterpreter {
             .get_data_mask(meta_api, &self.ctx.get_tenant(), mask_name.clone())
             .await?;
 
-        println!("policy is {:?}", policy.clone());
         // check if column type match to the input type - similar to row access policy validation
         let policy_data_types: Result<Vec<_>> = policy
             .args
@@ -141,7 +140,6 @@ impl ModifyTableColumnInterpreter {
             )));
         }
 
-        println!("using_columns is {:?}, policy_data_types is {:?}", using_columns, policy_data_types);
         let columns_ids: Result<Vec<_>> = using_columns
             .iter()
             .zip(policy_data_types.into_iter())

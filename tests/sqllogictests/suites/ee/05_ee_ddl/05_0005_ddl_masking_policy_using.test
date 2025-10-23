@@ -264,9 +264,9 @@ alter table employees modify column salary set masking policy mask_nested_case u
 query ITTTI
 select id, name, ssn, salary, department from employees order by id;
 ----
-1 Alice ***-**-**** 100000 Engineering
-2 Bob ***-**-**** 0 Sales
-3 Charlie ***-**-**** 60000 Engineering
+1 Alice ***-**-**** 100000.0 Engineering
+2 Bob ***-**-**** 0.0 Sales
+3 Charlie ***-**-**** 60000.0 Engineering
 
 ## Test 18: GROUP BY with nested CASE masked column
 query TI
@@ -275,8 +275,8 @@ from employees
 group by department
 order by department;
 ----
-Engineering 80000
-Sales 0
+Engineering 80000.0
+Sales 0.0
 
 ## Test 19: Complex aggregation with HAVING on masked column
 query TII
@@ -286,7 +286,7 @@ group by department
 having max(salary) > 0
 order by department;
 ----
-Engineering 2 100000
+Engineering 2 100000.0
 
 ## Test 20: Subquery with masked columns in HAVING
 query TI
@@ -296,7 +296,7 @@ group by department
 having sum(salary) > (select avg(salary) from employees)
 order by department;
 ----
-Engineering 160000
+Engineering 160000.0
 
 ## Test 21: Multiple aggregations with masked columns
 query TIIII
@@ -310,8 +310,8 @@ from employees
 group by department
 order by department;
 ----
-Engineering 2 160000 80000 100000
-Sales 1 0 0 0
+Engineering 2 160000.0 80000.0 100000.0
+Sales 1 0.0 0.0 0.0
 
 ## Test 22: HAVING with complex condition on masked column
 query TI
@@ -357,9 +357,9 @@ alter table employees modify column ssn set masking policy mask_triple_nested us
 query ITTTI
 select id, name, ssn, salary, department from employees order by id;
 ----
-1 Alice 123-45-6789 100000 Engineering
-2 Bob ***-**-**** 0 Sales
-3 Charlie 456-XX-XXXX 60000 Engineering
+1 Alice 123-45-6789 100000.0 Engineering
+2 Bob ***-**-**** 0.0 Sales
+3 Charlie 456-XX-XXXX 60000.0 Engineering
 
 ## Test 24: GROUP BY with triple nested masked column
 query T
@@ -384,9 +384,9 @@ select
 from employees
 order by id;
 ----
-1 Alice Engineering 100000 160000
-2 Bob Sales 0 0
-3 Charlie Engineering 60000 160000
+1 Alice Engineering 100000.0 160000.0
+2 Bob Sales 0.0 0.0
+3 Charlie Engineering 60000.0 160000.0
 
 ## Test 26: CTE with masked columns and GROUP BY
 query TI
@@ -400,7 +400,7 @@ from dept_stats
 where total_salary > 0
 order by department;
 ----
-Engineering 160000
+Engineering 160000.0
 
 ## Cleanup
 statement ok

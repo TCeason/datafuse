@@ -228,6 +228,10 @@ pub struct TypeChecker<'a> {
     // This is used to allow aggregation function in window's aggregate function.
     in_window_function: bool,
     forbid_udf: bool,
+
+    // true if currently resolving a masking policy expression.
+    // This prevents infinite recursion when a masking policy references the masked column itself.
+    in_masking_policy: bool,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -252,6 +256,7 @@ impl<'a> TypeChecker<'a> {
             in_aggregate_function: false,
             in_window_function: false,
             forbid_udf,
+            in_masking_policy: false,
         })
     }
 
@@ -300,30 +305,39 @@ impl<'a> TypeChecker<'a> {
                             return self.resolve(&expr);
                         } else {
                             // Fast path: Check if table has any masking policies at all before doing expensive async work
-                            let has_masking_policy = column.table_index
-                                .and_then(|table_index| {
-                                    let metadata = self.metadata.read();
-                                    let table_entry = metadata.table(table_index);
-                                    let table_ref = table_entry.table();
-                                    let table_info = table_ref.get_table_info();
+                            // BUT: skip masking policy application if we're already resolving a masking policy expression
+                            // to prevent infinite recursion (e.g., policy references the masked column itself)
+                            let has_masking_policy = !self.in_masking_policy
+                                && column
+                                    .table_index
+                                    .and_then(|table_index| {
+                                        let metadata = self.metadata.read();
+                                        let table_entry = metadata.table(table_index);
+                                        let table_ref = table_entry.table();
+                                        let table_info = table_ref.get_table_info();
 
-                                    // Quick check: if no columns have masking policies, skip async call
-                                    if table_info.meta.column_mask_policy_columns_ids.is_empty() {
-                                        return None;
-                                    }
+                                        // Quick check: if no columns have masking policies, skip async call
+                                        if table_info.meta.column_mask_policy_columns_ids.is_empty()
+                                        {
+                                            return None;
+                                        }
 
-                                    // Further check: does THIS specific column have a policy?
-                                    table_info.meta.schema
-                                        .fields()
-                                        .iter()
-                                        .find(|f| f.name == column.column_name)
-                                        .and_then(|field| {
-                                            table_info.meta.column_mask_policy_columns_ids
-                                                .contains_key(&field.column_id)
-                                                .then_some(())
-                                        })
-                                })
-                                .is_some();
+                                        // Further check: does THIS specific column have a policy?
+                                        table_info
+                                            .meta
+                                            .schema
+                                            .fields()
+                                            .iter()
+                                            .find(|f| f.name == column.column_name)
+                                            .and_then(|field| {
+                                                table_info
+                                                    .meta
+                                                    .column_mask_policy_columns_ids
+                                                    .contains_key(&field.column_id)
+                                                    .then_some(())
+                                            })
+                                    })
+                                    .is_some();
 
                             if has_masking_policy {
                                 // Only do expensive async work if we know there's a policy
@@ -337,8 +351,17 @@ impl<'a> TypeChecker<'a> {
                                 })?;
 
                                 if let Some(mask_expr) = mask_expr {
+                                    // Set flag to prevent recursive masking policy application
+                                    let old_in_masking_policy = self.in_masking_policy;
+                                    self.in_masking_policy = true;
+
                                     // Recursively resolve the masking policy expression
-                                    return self.resolve(&mask_expr);
+                                    let result = self.resolve(&mask_expr);
+
+                                    // Restore flag
+                                    self.in_masking_policy = old_in_masking_policy;
+
+                                    return result;
                                 }
                             }
 
@@ -6489,110 +6512,121 @@ impl<'a> TypeChecker<'a> {
 
         // Check if this column has a masking policy
         if let Some(table_index) = column_binding.table_index {
-            let metadata = self.metadata.read();
-            let table_entry = metadata.table(table_index);
-            let table_ref = table_entry.table();
-            let table_info_ref = table_ref.get_table_info();
+            // Extract all needed data before the await point to avoid holding the mutex lock
+            let policy_data = {
+                let metadata = self.metadata.read();
+                let table_entry = metadata.table(table_index);
+                let table_ref = table_entry.table();
+                let table_info_ref = table_ref.get_table_info();
 
-            // Find the field by name to get column_id
-            if let Some(field) = table_info_ref
-                .meta
-                .schema
-                .fields()
-                .iter()
-                .find(|f| f.name == column_binding.column_name)
-            {
-                if let Some(policy_info) = table_info_ref
+                // Find the field by name to get column_id
+                if let Some(field) = table_info_ref
                     .meta
-                    .column_mask_policy_columns_ids
-                    .get(&field.column_id)
+                    .schema
+                    .fields()
+                    .iter()
+                    .find(|f| f.name == column_binding.column_name)
                 {
-                    // Check license
-                    if LicenseManagerSwitch::instance()
-                        .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)
-                        .is_err()
+                    if let Some(policy_info) = table_info_ref
+                        .meta
+                        .column_mask_policy_columns_ids
+                        .get(&field.column_id)
                     {
-                        return Ok(None);
+                        // Check license
+                        if LicenseManagerSwitch::instance()
+                            .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)
+                            .is_err()
+                        {
+                            return Ok(None);
+                        }
+
+                        // Extract data needed after await
+                        Some((
+                            policy_info.policy_id,
+                            policy_info.columns_ids.clone(),
+                            table_info_ref.meta.schema.clone(),
+                        ))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                }
+            }; // metadata lock is released here
 
-                    let tenant = self.ctx.get_tenant();
-                    let meta_api = UserApiProvider::instance().get_meta_store_client();
-                    let handler = get_datamask_handler();
+            if let Some((policy_id, using_columns, table_schema)) = policy_data {
+                let tenant = self.ctx.get_tenant();
+                let meta_api = UserApiProvider::instance().get_meta_store_client();
+                let handler = get_datamask_handler();
 
-                    // Get the policy
-                    if let Ok(policy) = handler
-                        .get_data_mask_by_id(meta_api.clone(), &tenant, policy_info.policy_id)
-                        .await
-                    {
-                        let policy = policy.data;
-                        let body = &policy.body;
-                        let args = &policy.args;
+                // Get the policy (now safe to await without holding the lock)
+                if let Ok(policy) = handler
+                    .get_data_mask_by_id(meta_api.clone(), &tenant, policy_id)
+                    .await
+                {
+                    let policy = policy.data;
+                    let body = &policy.body;
+                    let args = &policy.args;
 
-                        // Parse the policy body
-                        let tokens = tokenize_sql(body)?;
-                        let settings = self.ctx.get_settings();
-                        let ast_expr = parse_expr(&tokens, settings.get_sql_dialect()?)?;
+                    // Parse the policy body
+                    let tokens = tokenize_sql(body)?;
+                    let settings = self.ctx.get_settings();
+                    let ast_expr = parse_expr(&tokens, settings.get_sql_dialect()?)?;
 
-                        // Get table schema for column mapping
-                        let table_meta = &table_info_ref.meta;
-                        let using_columns = &policy_info.columns_ids;
+                    // Create arguments based on USING clause
+                    let arguments: Result<Vec<Expr>> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(param_idx, _)| {
+                            let column_id = using_columns.get(param_idx).ok_or_else(|| {
+                                ErrorCode::Internal(format!(
+                                    "Masking policy metadata is corrupted: policy requires {} parameters, \
+                                     but only {} columns are configured in USING clause. \
+                                     Please drop and recreate the masking policy attachment.",
+                                    args.len(),
+                                    using_columns.len()
+                                ))
+                            })?;
 
-                        // Create arguments based on USING clause
-                        let arguments: Result<Vec<Expr>> = args
-                            .iter()
-                            .enumerate()
-                            .map(|(param_idx, _)| {
-                                let column_id = using_columns.get(param_idx).ok_or_else(|| {
-                                    ErrorCode::Internal(format!(
-                                        "Masking policy metadata is corrupted: policy requires {} parameters, \
-                                         but only {} columns are configured in USING clause. \
-                                         Please drop and recreate the masking policy attachment.",
-                                        args.len(),
-                                        using_columns.len()
-                                    ))
-                                })?;
+                            let field_name = table_schema
+                                .fields()
+                                .iter()
+                                .find(|f| f.column_id == *column_id)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_else(|| format!("column_{}", column_id));
 
-                                let field_name = table_meta
-                                    .schema
-                                    .fields()
-                                    .iter()
-                                    .find(|f| f.column_id == *column_id)
-                                    .map(|f| f.name.clone())
-                                    .unwrap_or_else(|| format!("column_{}", column_id));
-
-                                Ok(Expr::ColumnRef {
-                                    span: None,
-                                    column: ast::ColumnRef {
-                                        database: database.map(|d| Identifier::from_name(None, d.to_string())),
-                                        table: table.map(|t| Identifier::from_name(None, t.to_string())),
-                                        column: ast::ColumnID::Name(Identifier::from_name(
-                                            None, field_name,
-                                        )),
-                                    },
-                                })
+                            Ok(Expr::ColumnRef {
+                                span: None,
+                                column: ast::ColumnRef {
+                                    database: database.map(|d| Identifier::from_name(None, d.to_string())),
+                                    table: table.map(|t| Identifier::from_name(None, t.to_string())),
+                                    column: ast::ColumnID::Name(Identifier::from_name(
+                                        None, field_name,
+                                    )),
+                                },
                             })
-                            .collect();
-                        let arguments = arguments?;
+                        })
+                        .collect();
+                    let arguments = arguments?;
 
-                        // Create parameter mapping
-                        let args_map: HashMap<_, _> = args
-                            .iter()
-                            .map(|(param_name, _)| param_name.as_str())
-                            .zip(arguments.iter().cloned())
-                            .collect();
+                    // Create parameter mapping
+                    let args_map: HashMap<_, _> = args
+                        .iter()
+                        .map(|(param_name, _)| param_name.as_str())
+                        .zip(arguments.iter().cloned())
+                        .collect();
 
-                        // Replace parameters in the expression
-                        let expr = Self::clone_expr_with_replacement(&ast_expr, |nest_expr| {
-                            if let Expr::ColumnRef { column, .. } = nest_expr {
-                                if let Some(arg) = args_map.get(column.column.name()) {
-                                    return Ok(Some(arg.clone()));
-                                }
+                    // Replace parameters in the expression
+                    let expr = Self::clone_expr_with_replacement(&ast_expr, |nest_expr| {
+                        if let Expr::ColumnRef { column, .. } = nest_expr {
+                            if let Some(arg) = args_map.get(column.column.name()) {
+                                return Ok(Some(arg.clone()));
                             }
-                            Ok(None)
-                        })?;
+                        }
+                        Ok(None)
+                    })?;
 
-                        return Ok(Some(expr));
-                    }
+                    return Ok(Some(expr));
                 }
             }
         }

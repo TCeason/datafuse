@@ -45,10 +45,7 @@ impl FromToProto for mt::DatamaskMeta {
         } else {
             // Backward compatibility: read from old args map
             // Note: BTreeMap sorts keys alphabetically, so order may be lost for old data
-            p.args
-                .into_iter()
-                .map(|(name, type_str)| (name, type_str))
-                .collect()
+            p.args.into_iter().collect()
         };
 
         let v = Self {
