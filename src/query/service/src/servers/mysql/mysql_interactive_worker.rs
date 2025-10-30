@@ -694,10 +694,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
                 SessionStateVariable::new("sql_auto_is_null", if new_value { "1" } else { "0" }),
             ])];
-            info!(
-                "mysql session: sql_auto_is_null OK response => {:?}",
-                ok
-            );
+            info!("mysql session: sql_auto_is_null OK response => {:?}", ok);
             writer.completed(ok).await?;
             return Ok(());
         }
@@ -716,10 +713,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
                 SessionStateVariable::new("sql_select_limit", value.clone().into_bytes()),
             ])];
-            info!(
-                "mysql session: sql_select_limit OK response => {:?}",
-                ok
-            );
+            info!("mysql session: sql_select_limit OK response => {:?}", ok);
             writer.completed(ok).await?;
             return Ok(());
         }
@@ -993,7 +987,7 @@ impl InteractiveWorkerBase {
                 if data_block.num_rows() > 0 {
                     info!("Federated response: {:?}", data_block);
                 }
-                let has_result = data_block.num_rows() > 0;
+                let has_result = schema.fields().len() > 0 || data_block.num_columns() > 0;
                 Ok((
                     QueryResult::create(
                         DataBlockStream::create(None, vec![data_block]).boxed(),

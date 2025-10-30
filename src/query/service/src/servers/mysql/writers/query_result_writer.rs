@@ -28,7 +28,8 @@ use databend_common_expression::SendableDataBlockStream;
 use databend_common_formats::field_encoder::FieldEncoderValues;
 use databend_common_io::prelude::FormatSettings;
 use futures_util::StreamExt;
-use log::{error, info};
+use log::error;
+use log::info;
 use opensrv_mysql::*;
 
 use crate::sessions::Session;

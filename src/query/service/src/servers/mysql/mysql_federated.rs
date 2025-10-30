@@ -383,7 +383,10 @@ impl MySQLFederated {
             (Regex::new("(?i)^(/\\*!40101 SET(.*) \\*/)$").unwrap(), None),
             // PowerBI.
             (Regex::new("(?i)^(SET SQL_AUTO_IS_NULL(.*))").unwrap(), None),
-            (Regex::new("(?i)^(SHOW KEYS FROM(.*))").unwrap(), MySQLFederated::show_keys_block()),
+            (
+                Regex::new("(?i)^(SHOW KEYS FROM(.*))").unwrap(),
+                MySQLFederated::show_keys_block(),
+            ),
             // DBeaver.
             (Regex::new("(?i)^(SHOW WARNINGS)").unwrap(), None),
             (Regex::new("(?i)^(/\\* ApplicationName=(.*)SHOW WARNINGS)").unwrap(), None),
