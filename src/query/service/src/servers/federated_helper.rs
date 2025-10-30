@@ -19,8 +19,6 @@ use databend_common_expression::TableSchemaRef;
 use databend_common_expression::TableSchemaRefExt;
 use regex::Regex;
 
-pub type LazyBlockFunc = fn(&str) -> Option<(TableSchemaRef, DataBlock)>;
-
 pub struct FederatedHelper {}
 
 impl FederatedHelper {
@@ -37,21 +35,6 @@ impl FederatedHelper {
             }
         }
 
-        None
-    }
-
-    pub fn lazy_block_match_rule(
-        query: &str,
-        rules: &[(Regex, LazyBlockFunc)],
-    ) -> Option<(TableSchemaRef, DataBlock)> {
-        for (regex, func) in rules.iter() {
-            if regex.is_match(query) {
-                return match func(query) {
-                    None => Some((TableSchemaRefExt::create(vec![]), DataBlock::empty())),
-                    Some((schema, data_block)) => Some((schema, data_block)),
-                };
-            }
-        }
         None
     }
 }

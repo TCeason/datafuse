@@ -61,6 +61,53 @@ pub struct Session {
     status: Arc<RwLock<SessionStatus>>,
     pub(in crate::sessions) mysql_connection_id: Option<u32>,
     format_settings: FormatSettings,
+    mysql_vars: RwLock<MysqlSessionVars>,
+    mysql_autocommit: RwLock<bool>,
+    mysql_sql_auto_is_null: RwLock<bool>,
+    mysql_sql_select_limit: RwLock<String>,
+}
+
+pub const MYSQL_SQL_SELECT_LIMIT_UNLIMITED: &str = "18446744073709551615";
+const MYSQL_DEFAULT_CHARSET: &str = "utf8mb4";
+const MYSQL_DEFAULT_COLLATION: &str = "utf8mb4_0900_ai_ci";
+
+#[derive(Debug, Clone)]
+struct MysqlSessionVars {
+    default_charset: String,
+    default_collation_connection: Option<String>,
+    character_set_client: String,
+    character_set_connection: String,
+    character_set_results: String,
+    collation_connection: Option<String>,
+}
+
+impl MysqlSessionVars {
+    fn new(default_charset: &str, default_collation: Option<&str>) -> Self {
+        let collation = default_collation.map(|s| s.to_string());
+        Self {
+            default_charset: default_charset.to_string(),
+            default_collation_connection: collation.clone(),
+            character_set_client: default_charset.to_string(),
+            character_set_connection: default_charset.to_string(),
+            character_set_results: default_charset.to_string(),
+            collation_connection: collation,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.character_set_client = self.default_charset.clone();
+        self.character_set_connection = self.default_charset.clone();
+        self.character_set_results = self.default_charset.clone();
+        self.collation_connection = self.default_collation_connection.clone();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MysqlSetNamesSnapshot {
+    pub character_set_client: String,
+    pub character_set_connection: String,
+    pub character_set_results: String,
+    pub collation_connection: Option<String>,
 }
 
 impl Session {
@@ -78,6 +125,13 @@ impl Session {
             session_ctx,
             mysql_connection_id,
             format_settings: FormatSettings::default(),
+            mysql_vars: RwLock::new(MysqlSessionVars::new(
+                MYSQL_DEFAULT_CHARSET,
+                Some(MYSQL_DEFAULT_COLLATION),
+            )),
+            mysql_autocommit: RwLock::new(true),
+            mysql_sql_auto_is_null: RwLock::new(false),
+            mysql_sql_select_limit: RwLock::new(MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string()),
         })
     }
 
@@ -101,6 +155,84 @@ impl Session {
 
     pub fn get_mysql_conn_id(&self) -> Option<u32> {
         self.mysql_connection_id
+    }
+
+    pub fn mysql_set_names_snapshot(&self) -> MysqlSetNamesSnapshot {
+        let vars = self.mysql_vars.read();
+        MysqlSetNamesSnapshot {
+            character_set_client: vars.character_set_client.clone(),
+            character_set_connection: vars.character_set_connection.clone(),
+            character_set_results: vars.character_set_results.clone(),
+            collation_connection: vars.collation_connection.clone(),
+        }
+    }
+
+    pub fn mysql_default_set_names(&self) -> (String, Option<String>) {
+        let vars = self.mysql_vars.read();
+        (
+            vars.default_charset.clone(),
+            vars.default_collation_connection.clone(),
+        )
+    }
+
+    pub fn set_mysql_character_set_client(&self, charset: &str) {
+        let mut vars = self.mysql_vars.write();
+        vars.character_set_client = charset.to_string();
+    }
+
+    pub fn set_mysql_character_set_connection(&self, charset: &str) {
+        let mut vars = self.mysql_vars.write();
+        vars.character_set_connection = charset.to_string();
+    }
+
+    pub fn set_mysql_character_set_results(&self, charset: &str) {
+        let mut vars = self.mysql_vars.write();
+        vars.character_set_results = charset.to_string();
+    }
+
+    pub fn set_mysql_collation_connection(&self, collation: Option<&str>) {
+        let mut vars = self.mysql_vars.write();
+        vars.collation_connection = collation.map(|s| s.to_string());
+    }
+
+    pub fn mysql_autocommit(&self) -> bool {
+        *self.mysql_autocommit.read()
+    }
+
+    pub fn set_mysql_autocommit(&self, value: bool) {
+        let mut lock = self.mysql_autocommit.write();
+        *lock = value;
+    }
+
+    pub fn mysql_sql_auto_is_null(&self) -> bool {
+        *self.mysql_sql_auto_is_null.read()
+    }
+
+    pub fn set_mysql_sql_auto_is_null(&self, value: bool) {
+        let mut lock = self.mysql_sql_auto_is_null.write();
+        *lock = value;
+    }
+
+    pub fn mysql_sql_select_limit(&self) -> String {
+        self.mysql_sql_select_limit.read().clone()
+    }
+
+    pub fn set_mysql_sql_select_limit<S: Into<String>>(&self, value: S) {
+        let mut lock = self.mysql_sql_select_limit.write();
+        *lock = value.into();
+    }
+
+    pub fn set_mysql_set_names(&self, charset: &str, collation: Option<&str>) {
+        let mut vars = self.mysql_vars.write();
+        vars.character_set_client = charset.to_string();
+        vars.character_set_connection = charset.to_string();
+        vars.character_set_results = charset.to_string();
+        vars.collation_connection = collation.map(|s| s.to_string());
+    }
+
+    pub fn reset_mysql_set_names(&self) {
+        let mut vars = self.mysql_vars.write();
+        vars.reset();
     }
 
     pub fn get_id(&self) -> String {

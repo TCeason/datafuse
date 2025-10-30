@@ -28,13 +28,22 @@ use databend_common_expression::TableSchemaRefExt;
 use regex::Regex;
 
 use crate::servers::federated_helper::FederatedHelper;
-use crate::servers::federated_helper::LazyBlockFunc;
+use crate::sessions::Session;
+use crate::sessions::MYSQL_SQL_SELECT_LIMIT_UNLIMITED;
 
-pub struct MySQLFederated {}
+pub struct MySQLFederated {
+    session: Option<Arc<Session>>,
+}
 
 impl MySQLFederated {
     pub fn create() -> Self {
-        MySQLFederated {}
+        MySQLFederated { session: None }
+    }
+
+    pub fn with_session(session: Arc<Session>) -> Self {
+        MySQLFederated {
+            session: Some(session),
+        }
     }
 
     // Build block for select function.
@@ -72,39 +81,64 @@ impl MySQLFederated {
 
         let schema = TableSchemaRefExt::create(vec![
             TableField::new("Table", TableDataType::String),
-            TableField::new("Non_unique", TableDataType::Number(databend_common_expression::types::NumberDataType::Int32)),
+            TableField::new(
+                "Non_unique",
+                TableDataType::Number(databend_common_expression::types::NumberDataType::Int32),
+            ),
             TableField::new("Key_name", TableDataType::String),
-            TableField::new("Seq_in_index", TableDataType::Number(databend_common_expression::types::NumberDataType::Int32)),
+            TableField::new(
+                "Seq_in_index",
+                TableDataType::Number(databend_common_expression::types::NumberDataType::Int32),
+            ),
             TableField::new("Column_name", TableDataType::String),
-            TableField::new("Collation", TableDataType::Nullable(Box::new(TableDataType::String))),
-            TableField::new("Cardinality", TableDataType::Nullable(Box::new(TableDataType::Number(databend_common_expression::types::NumberDataType::Int64)))),
-            TableField::new("Sub_part", TableDataType::Nullable(Box::new(TableDataType::Number(databend_common_expression::types::NumberDataType::Int64)))),
-            TableField::new("Packed", TableDataType::Nullable(Box::new(TableDataType::String))),
+            TableField::new(
+                "Collation",
+                TableDataType::Nullable(Box::new(TableDataType::String)),
+            ),
+            TableField::new(
+                "Cardinality",
+                TableDataType::Nullable(Box::new(TableDataType::Number(
+                    databend_common_expression::types::NumberDataType::Int64,
+                ))),
+            ),
+            TableField::new(
+                "Sub_part",
+                TableDataType::Nullable(Box::new(TableDataType::Number(
+                    databend_common_expression::types::NumberDataType::Int64,
+                ))),
+            ),
+            TableField::new(
+                "Packed",
+                TableDataType::Nullable(Box::new(TableDataType::String)),
+            ),
             TableField::new("Null", TableDataType::String),
             TableField::new("Index_type", TableDataType::String),
             TableField::new("Comment", TableDataType::String),
             TableField::new("Index_comment", TableDataType::String),
             TableField::new("Visible", TableDataType::String),
-            TableField::new("Expression", TableDataType::Nullable(Box::new(TableDataType::String))),
+            TableField::new(
+                "Expression",
+                TableDataType::Nullable(Box::new(TableDataType::String)),
+            ),
         ]);
 
         // Create empty block with proper column types
         let block = DataBlock::new_from_columns(vec![
-            StringType::from_data(Vec::<String>::new()),  // Table
-            Int32Type::from_data(Vec::<i32>::new()),       // Non_unique
-            StringType::from_data(Vec::<String>::new()),  // Key_name
-            Int32Type::from_data(Vec::<i32>::new()),       // Seq_in_index
-            StringType::from_data(Vec::<String>::new()),  // Column_name
-            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()),  // Collation
-            Int64Type::from_data_with_validity(Vec::<i64>::new(), Vec::<bool>::new()),    // Cardinality
-            Int64Type::from_data_with_validity(Vec::<i64>::new(), Vec::<bool>::new()),    // Sub_part
-            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()),  // Packed
-            StringType::from_data(Vec::<String>::new()),  // Null
-            StringType::from_data(Vec::<String>::new()),  // Index_type
-            StringType::from_data(Vec::<String>::new()),  // Comment
-            StringType::from_data(Vec::<String>::new()),  // Index_comment
-            StringType::from_data(Vec::<String>::new()),  // Visible
-            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()),  // Expression
+            StringType::from_data(Vec::<String>::new()), // Table
+            Int32Type::from_data(Vec::<i32>::new()),     // Non_unique
+            StringType::from_data(Vec::<String>::new()), // Key_name
+            Int32Type::from_data(Vec::<i32>::new()),     // Seq_in_index
+            StringType::from_data(Vec::<String>::new()), // Column_name
+            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()), /* Collation */
+            Int64Type::from_data_with_validity(Vec::<i64>::new(), Vec::<bool>::new()), /* Cardinality */
+            Int64Type::from_data_with_validity(Vec::<i64>::new(), Vec::<bool>::new()), // Sub_part
+            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()), // Packed
+            StringType::from_data(Vec::<String>::new()),                               // Null
+            StringType::from_data(Vec::<String>::new()), // Index_type
+            StringType::from_data(Vec::<String>::new()), // Comment
+            StringType::from_data(Vec::<String>::new()), // Index_comment
+            StringType::from_data(Vec::<String>::new()), // Visible
+            StringType::from_data_with_validity(Vec::<&str>::new(), Vec::<bool>::new()), /* Expression */
         ]);
 
         Some((schema, block))
@@ -112,21 +146,100 @@ impl MySQLFederated {
 
     // SELECT @@aa, @@bb as cc, @dd...
     // Block is built by the variables.
-    fn select_variable_data_block(query: &str) -> Option<(TableSchemaRef, DataBlock)> {
-        let mut default_map = HashMap::new();
+    fn select_variable_data_block(&self, query: &str) -> Option<(TableSchemaRef, DataBlock)> {
+        let mut default_map: HashMap<String, String> = HashMap::new();
         // DBeaver.
-        default_map.insert("tx_isolation", "REPEATABLE-READ");
-        default_map.insert("session.tx_isolation", "REPEATABLE-READ");
-        default_map.insert("transaction_isolation", "REPEATABLE-READ");
-        default_map.insert("session.transaction_isolation", "REPEATABLE-READ");
-        default_map.insert("session.transaction_read_only", "0");
-        default_map.insert("time_zone", "UTC");
-        default_map.insert("system_time_zone", "UTC");
+        default_map.insert("tx_isolation".to_string(), "REPEATABLE-READ".to_string());
+        default_map.insert(
+            "session.tx_isolation".to_string(),
+            "REPEATABLE-READ".to_string(),
+        );
+        default_map.insert(
+            "transaction_isolation".to_string(),
+            "REPEATABLE-READ".to_string(),
+        );
+        default_map.insert(
+            "session.transaction_isolation".to_string(),
+            "REPEATABLE-READ".to_string(),
+        );
+        default_map.insert("session.transaction_read_only".to_string(), "0".to_string());
+        default_map.insert("time_zone".to_string(), "UTC".to_string());
+        default_map.insert("system_time_zone".to_string(), "UTC".to_string());
         // 128M
-        default_map.insert("max_allowed_packet", "134217728");
-        default_map.insert("interactive_timeout", "31536000");
-        default_map.insert("wait_timeout", "31536000");
-        default_map.insert("net_write_timeout", "31536000");
+        default_map.insert("max_allowed_packet".to_string(), "134217728".to_string());
+        default_map.insert("interactive_timeout".to_string(), "31536000".to_string());
+        default_map.insert("wait_timeout".to_string(), "31536000".to_string());
+        default_map.insert("net_write_timeout".to_string(), "31536000".to_string());
+        default_map.insert("autocommit".to_string(), "1".to_string());
+        default_map.insert("session.autocommit".to_string(), "1".to_string());
+        default_map.insert("sql_auto_is_null".to_string(), "0".to_string());
+        default_map.insert("session.sql_auto_is_null".to_string(), "0".to_string());
+        default_map.insert(
+            "sql_select_limit".to_string(),
+            MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string(),
+        );
+        default_map.insert(
+            "session.sql_select_limit".to_string(),
+            MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string(),
+        );
+
+        if let Some(session) = &self.session {
+            let snapshot = session.mysql_set_names_snapshot();
+            default_map.insert(
+                "character_set_client".to_string(),
+                snapshot.character_set_client.clone(),
+            );
+            default_map.insert(
+                "session.character_set_client".to_string(),
+                snapshot.character_set_client.clone(),
+            );
+            default_map.insert(
+                "character_set_connection".to_string(),
+                snapshot.character_set_connection.clone(),
+            );
+            default_map.insert(
+                "session.character_set_connection".to_string(),
+                snapshot.character_set_connection.clone(),
+            );
+            default_map.insert(
+                "character_set_results".to_string(),
+                snapshot.character_set_results.clone(),
+            );
+            default_map.insert(
+                "session.character_set_results".to_string(),
+                snapshot.character_set_results.clone(),
+            );
+            if let Some(collation) = snapshot.collation_connection {
+                default_map.insert("collation_connection".to_string(), collation.clone());
+                default_map.insert(
+                    "session.collation_connection".to_string(),
+                    collation.clone(),
+                );
+            }
+
+            let autocommit_value = if session.mysql_autocommit() {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            };
+            default_map.insert("autocommit".to_string(), autocommit_value.clone());
+            default_map.insert("session.autocommit".to_string(), autocommit_value.clone());
+
+            let sql_auto_is_null = if session.mysql_sql_auto_is_null() {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            };
+            default_map.insert("sql_auto_is_null".to_string(), sql_auto_is_null.clone());
+            default_map.insert(
+                "session.sql_auto_is_null".to_string(),
+                sql_auto_is_null.clone(),
+            );
+
+            let sql_select_limit = session.mysql_sql_select_limit();
+            default_map.insert("sql_select_limit".to_string(), sql_select_limit.clone());
+            default_map.insert("session.sql_select_limit".to_string(), sql_select_limit);
+        }
 
         let mut fields = vec![];
         let mut values = vec![];
@@ -147,7 +260,10 @@ impl MySQLFederated {
 
                     // var is 'cc'.
                     let var = vars_as[0];
-                    let value = default_map.get(var).unwrap_or(&"0").to_string();
+                    let value = default_map
+                        .get(var)
+                        .cloned()
+                        .unwrap_or_else(|| "0".to_string());
                     values.push(StringType::from_data(vec![value]));
                 } else {
                     // @@aa
@@ -157,7 +273,10 @@ impl MySQLFederated {
                         TableDataType::String,
                     ));
 
-                    let value = default_map.get(var).unwrap_or(&"0").to_string();
+                    let value = default_map
+                        .get(var)
+                        .cloned()
+                        .unwrap_or_else(|| "0".to_string());
                     values.push(StringType::from_data(vec![value]));
                 }
             }
@@ -170,21 +289,20 @@ impl MySQLFederated {
 
     // Check SELECT @@variable, @@variable
     fn federated_select_variable_check(&self, query: &str) -> Option<(TableSchemaRef, DataBlock)> {
-        static SELECT_VARIABLES_LAZY_RULES: LazyLock<Vec<(Regex, LazyBlockFunc)>> =
-            LazyLock::new(|| {
-                vec![
-                    (
-                        Regex::new("(?i)^(SELECT @@(.*))").unwrap(),
-                        MySQLFederated::select_variable_data_block,
-                    ),
-                    (
-                        Regex::new("(?i)^(/\\* mysql-connector-java(.*))").unwrap(),
-                        MySQLFederated::select_variable_data_block,
-                    ),
-                ]
-            });
+        static SELECT_VARIABLES_RULES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+            vec![
+                Regex::new("(?i)^(SELECT @@(.*))").unwrap(),
+                Regex::new("(?i)^(/\\* mysql-connector-java(.*))").unwrap(),
+            ]
+        });
 
-        FederatedHelper::lazy_block_match_rule(query, &SELECT_VARIABLES_LAZY_RULES)
+        for regex in SELECT_VARIABLES_RULES.iter() {
+            if regex.is_match(query) {
+                return self.select_variable_data_block(query);
+            }
+        }
+
+        None
     }
 
     // Check SHOW VARIABLES LIKE.

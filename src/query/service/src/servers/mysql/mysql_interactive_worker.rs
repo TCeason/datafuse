@@ -43,9 +43,13 @@ use log::info;
 use opensrv_mysql::AsyncMysqlShim;
 use opensrv_mysql::ErrorKind;
 use opensrv_mysql::InitWriter;
+use opensrv_mysql::OkResponse;
 use opensrv_mysql::ParamParser;
 use opensrv_mysql::QueryResultWriter;
+use opensrv_mysql::SessionStateChange;
+use opensrv_mysql::SessionStateVariable;
 use opensrv_mysql::StatementMetaWriter;
+use opensrv_mysql::StatusFlags;
 use rand::thread_rng;
 use rand::Rng as _;
 use rand::RngCore;
@@ -67,6 +71,7 @@ use crate::servers::mysql::MYSQL_VERSION;
 use crate::sessions::QueryContext;
 use crate::sessions::Session;
 use crate::sessions::TableContext;
+use crate::sessions::MYSQL_SQL_SELECT_LIMIT_UNLIMITED;
 use crate::stream::DataBlockStream;
 
 struct InteractiveWorkerBase {
@@ -80,6 +85,375 @@ pub struct InteractiveWorker {
     salt: [u8; 20],
     client_addr: String,
     keep_alive_task_started: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SetNamesCommand {
+    charset: Option<String>,
+    collation: Option<String>,
+}
+
+fn strip_identifier_quotes(token: &str) -> &str {
+    token.trim_matches(|c| matches!(c, '\'' | '"' | '`'))
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    if input.len() < prefix.len() {
+        return None;
+    }
+    if input[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&input[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn parse_set_names(query: &str) -> Option<SetNamesCommand> {
+    let mut trimmed = query.trim();
+    if trimmed.len() < 8 {
+        return None;
+    }
+    trimmed = trimmed
+        .trim_end_matches(|c: char| c == ';' || c.is_ascii_whitespace())
+        .trim_start();
+
+    let mut rest = strip_prefix_ignore_ascii_case(trimmed, "set")?.trim_start();
+    rest = strip_prefix_ignore_ascii_case(rest, "names")?.trim_start();
+
+    if let Some(after_eq) = rest.strip_prefix('=') {
+        rest = after_eq.trim_start();
+    }
+
+    if rest.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let charset_token = strip_identifier_quotes(parts[0]);
+    if charset_token.eq_ignore_ascii_case("default") {
+        return Some(SetNamesCommand {
+            charset: None,
+            collation: None,
+        });
+    }
+
+    let charset = charset_token.to_ascii_lowercase();
+    let mut collation: Option<String> = None;
+    if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("collate") {
+        let collation_token = strip_identifier_quotes(parts[2]);
+        if !collation_token.is_empty() {
+            collation = Some(collation_token.to_ascii_lowercase());
+        }
+    }
+
+    Some(SetNamesCommand {
+        charset: Some(charset),
+        collation,
+    })
+}
+
+fn default_collation_for_charset(charset: &str) -> Option<&'static str> {
+    if charset.eq_ignore_ascii_case("utf8mb4") {
+        Some("utf8mb4_0900_ai_ci")
+    } else if charset.eq_ignore_ascii_case("utf8") {
+        Some("utf8_general_ci")
+    } else if charset.eq_ignore_ascii_case("latin1") {
+        Some("latin1_swedish_ci")
+    } else {
+        None
+    }
+}
+
+fn parse_set_charset_variable(query: &str) -> Option<(String, String)> {
+    let trimmed = query.trim();
+    if trimmed.len() < 3 {
+        return None;
+    }
+    let stmt = trimmed
+        .trim_end_matches(|c: char| c == ';' || c.is_ascii_whitespace())
+        .trim_start();
+    if !stmt[..3].eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let rest = stmt[3..].trim_start();
+    let eq_idx = rest.find('=')?;
+    let (lhs, rhs_with_eq) = rest.split_at(eq_idx);
+    let var = lhs.trim().trim_matches(|c| matches!(c, '`'));
+    let value = rhs_with_eq[1..].trim();
+    if var.eq_ignore_ascii_case("character_set_results")
+        || var.eq_ignore_ascii_case("character_set_client")
+        || var.eq_ignore_ascii_case("character_set_connection")
+        || var.eq_ignore_ascii_case("collation_connection")
+    {
+        Some((var.to_ascii_lowercase(), value.to_string()))
+    } else {
+        None
+    }
+}
+
+fn normalize_charset_value(value: &str, default_charset: &str) -> String {
+    if value.eq_ignore_ascii_case("null") || value.eq_ignore_ascii_case("default") {
+        default_charset.to_string()
+    } else {
+        strip_identifier_quotes(value).to_ascii_lowercase()
+    }
+}
+
+fn parse_set_session_variable(query: &str) -> Option<(String, String)> {
+    let trimmed = query.trim();
+    if trimmed.len() < 3 {
+        return None;
+    }
+    let without_trailing = trimmed
+        .trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ';')
+        .trim_end();
+
+    if without_trailing.len() < 3 || !without_trailing[..3].eq_ignore_ascii_case("set") {
+        return None;
+    }
+
+    let mut rest = without_trailing[3..].trim_start();
+
+    loop {
+        if let Some(after) = strip_prefix_ignore_ascii_case(rest, "session ") {
+            rest = after.trim_start();
+        } else if let Some(after) = strip_prefix_ignore_ascii_case(rest, "global ") {
+            rest = after.trim_start();
+        } else {
+            break;
+        }
+    }
+
+    if rest.starts_with("@@") {
+        rest = rest[2..].trim_start();
+    }
+
+    if let Some(after) = strip_prefix_ignore_ascii_case(rest, "session.") {
+        rest = after.trim_start();
+    } else if let Some(after) = strip_prefix_ignore_ascii_case(rest, "global.") {
+        rest = after.trim_start();
+    }
+
+    let eq_idx = rest.find('=')?;
+    let (lhs, rhs_with_eq) = rest.split_at(eq_idx);
+    let mut lhs_trim = lhs.trim();
+    if lhs_trim.is_empty() {
+        return None;
+    }
+    lhs_trim = lhs_trim.trim_end_matches(':').trim();
+    lhs_trim = lhs_trim.trim_matches('`').trim();
+    if lhs_trim.is_empty() {
+        return None;
+    }
+    let var_name = lhs_trim.to_ascii_lowercase();
+
+    let mut value = rhs_with_eq[1..].trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        value = &value[1..value.len() - 1];
+    } else if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        value = &value[1..value.len() - 1];
+    }
+
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let value = if value.eq_ignore_ascii_case("default") {
+        "DEFAULT".to_string()
+    } else {
+        value.to_string()
+    };
+
+    Some((var_name, value))
+}
+
+fn parse_switch_value(value: &str, default: bool) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Some(true),
+        "0" | "off" | "false" => Some(false),
+        "default" => Some(default),
+        _ => None,
+    }
+}
+
+fn normalize_sql_select_limit(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("default") {
+        return Some(MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string());
+    }
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn parse_set_autocommit(query: &str) -> Option<bool> {
+    let (var, value) = parse_set_session_variable(query)?;
+    if var != "autocommit" {
+        return None;
+    }
+    parse_switch_value(&value, true)
+}
+
+fn parse_set_sql_auto_is_null(query: &str) -> Option<bool> {
+    let (var, value) = parse_set_session_variable(query)?;
+    if var != "sql_auto_is_null" {
+        return None;
+    }
+    parse_switch_value(&value, false)
+}
+
+fn parse_set_sql_select_limit(query: &str) -> Option<String> {
+    let (var, value) = parse_set_session_variable(query)?;
+    if var != "sql_select_limit" {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("null") {
+        return normalize_sql_select_limit("default");
+    }
+    normalize_sql_select_limit(&value)
+}
+
+#[cfg(test)]
+mod mysql_set_names_tests {
+    use super::default_collation_for_charset;
+    use super::parse_set_autocommit;
+    use super::parse_set_charset_variable;
+    use super::parse_set_names;
+    use super::parse_set_session_variable;
+    use super::parse_set_sql_auto_is_null;
+    use super::parse_set_sql_select_limit;
+    use super::parse_switch_value;
+    use crate::sessions::MYSQL_SQL_SELECT_LIMIT_UNLIMITED;
+
+    #[test]
+    fn parse_basic_set_names() {
+        let cmd = parse_set_names("SET NAMES utf8mb4").unwrap();
+        assert_eq!(cmd.charset.as_deref(), Some("utf8mb4"));
+        assert!(cmd.collation.is_none());
+    }
+
+    #[test]
+    fn parse_set_names_with_collation() {
+        let cmd = parse_set_names("set names 'utf8mb4' collate \"utf8mb4_general_ci\" ").unwrap();
+        assert_eq!(cmd.charset.as_deref(), Some("utf8mb4"));
+        assert_eq!(cmd.collation.as_deref(), Some("utf8mb4_general_ci"));
+    }
+
+    #[test]
+    fn parse_set_names_default() {
+        let cmd = parse_set_names("SET NAMES DEFAULT").unwrap();
+        assert!(cmd.charset.is_none());
+        assert!(cmd.collation.is_none());
+    }
+
+    #[test]
+    fn default_collations() {
+        assert_eq!(
+            default_collation_for_charset("utf8mb4"),
+            Some("utf8mb4_0900_ai_ci")
+        );
+        assert_eq!(
+            default_collation_for_charset("UTF8"),
+            Some("utf8_general_ci")
+        );
+        assert_eq!(
+            default_collation_for_charset("latin1"),
+            Some("latin1_swedish_ci")
+        );
+        assert_eq!(default_collation_for_charset("gbk"), None);
+    }
+
+    #[test]
+    fn parse_set_charset_results_stmt() {
+        let parsed =
+            parse_set_charset_variable("SET character_set_results = NULL").expect("parsed");
+        assert_eq!(parsed.0, "character_set_results");
+        assert_eq!(parsed.1.trim(), "NULL");
+    }
+
+    #[test]
+    fn parse_set_autocommit_variants() {
+        assert_eq!(parse_set_autocommit("SET autocommit=1"), Some(true));
+        assert_eq!(parse_set_autocommit("set autocommit = OFF"), Some(false));
+        assert_eq!(parse_set_autocommit("SET AUTOCOMMIT=default"), Some(true));
+        assert_eq!(parse_set_autocommit("SET sql_mode='STRICT'"), None);
+    }
+
+    #[test]
+    fn parse_set_session_variable_variants() {
+        assert_eq!(
+            parse_set_session_variable("SET autocommit=0"),
+            Some(("autocommit".to_string(), "0".to_string()))
+        );
+        assert_eq!(
+            parse_set_session_variable("set @@session.autocommit = ON "),
+            Some(("autocommit".to_string(), "ON".to_string()))
+        );
+        assert_eq!(
+            parse_set_session_variable("SET SQL_AUTO_IS_NULL = 0"),
+            Some(("sql_auto_is_null".to_string(), "0".to_string()))
+        );
+        assert_eq!(
+            parse_set_session_variable("set @@sql_select_limit=DEFAULT"),
+            Some(("sql_select_limit".to_string(), "DEFAULT".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_switch_values_with_defaults() {
+        assert_eq!(parse_switch_value("0", true), Some(false));
+        assert_eq!(parse_switch_value("ON", false), Some(true));
+        assert_eq!(parse_switch_value("DEFAULT", true), Some(true));
+        assert_eq!(parse_switch_value("DEFAULT", false), Some(false));
+        assert_eq!(parse_switch_value("foo", true), None);
+    }
+
+    #[test]
+    fn parse_set_sql_auto_is_null_variants() {
+        assert_eq!(
+            parse_set_sql_auto_is_null("SET SQL_AUTO_IS_NULL = 1"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_set_sql_auto_is_null("set sql_auto_is_null = off"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_set_sql_auto_is_null("SET @@session.sql_auto_is_null = DEFAULT"),
+            Some(false)
+        );
+        assert_eq!(parse_set_sql_auto_is_null("SET sql_mode='STRICT'"), None);
+    }
+
+    #[test]
+    fn parse_set_sql_select_limit_variants() {
+        assert_eq!(
+            parse_set_sql_select_limit("SET SQL_SELECT_LIMIT = 100"),
+            Some("100".to_string())
+        );
+        assert_eq!(
+            parse_set_sql_select_limit("set sql_select_limit = DEFAULT"),
+            Some(MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string())
+        );
+        assert_eq!(
+            parse_set_sql_select_limit("set @@sql_select_limit = null"),
+            Some(MYSQL_SQL_SELECT_LIMIT_UNLIMITED.to_string())
+        );
+        assert_eq!(parse_set_sql_select_limit("SET autocommit=0"), None);
+    }
 }
 
 #[async_trait::async_trait]
@@ -218,7 +592,208 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
         let query_id = Uuid::now_v7();
         // Ensure the query id shares the same representation as trace_id.
         let query_id_str = query_id.simple().to_string();
-        info!("--- on_query:221 Federated query: {}", query.clone());
+        info!("--- on_query:221 Federated query: {}", query);
+
+        if let Some(mut set_names) = parse_set_names(query) {
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
+
+            let (charset_value, collation_value) = if let Some(charset) = set_names.charset.take() {
+                let resolved_collation = set_names
+                    .collation
+                    .take()
+                    .or_else(|| default_collation_for_charset(&charset).map(|s| s.to_string()));
+                self.base
+                    .session
+                    .set_mysql_set_names(&charset, resolved_collation.as_deref());
+                (charset, resolved_collation)
+            } else {
+                self.base.session.reset_mysql_set_names();
+                let snapshot = self.base.session.mysql_set_names_snapshot();
+                (snapshot.character_set_client, snapshot.collation_connection)
+            };
+
+            let mut variables = vec![
+                SessionStateVariable::new(
+                    "character_set_client",
+                    charset_value.clone().into_bytes(),
+                ),
+                SessionStateVariable::new(
+                    "character_set_results",
+                    charset_value.clone().into_bytes(),
+                ),
+                SessionStateVariable::new(
+                    "character_set_connection",
+                    charset_value.clone().into_bytes(),
+                ),
+            ];
+            if let Some(collation) = &collation_value {
+                variables.push(SessionStateVariable::new(
+                    "collation_connection",
+                    collation.clone().into_bytes(),
+                ));
+            }
+
+            let mut ok = OkResponse::default();
+            ok.status_flags
+                .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
+            ok.session_state_changes = vec![SessionStateChange::SystemVariables(variables)];
+
+            writer.completed(ok).await?;
+            return Ok(());
+        }
+
+        if let Some(new_value) = parse_set_autocommit(query) {
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
+
+            self.base.session.set_mysql_autocommit(new_value);
+            info!(
+                "mysql session: handling autocommit -> {}",
+                if new_value { "1" } else { "0" }
+            );
+
+            let mut status = StatusFlags::SERVER_SESSION_STATE_CHANGED;
+            if new_value {
+                status.insert(StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+            }
+
+            let variable =
+                SessionStateVariable::new("autocommit", if new_value { "1" } else { "0" });
+
+            let mut ok = OkResponse::default();
+            ok.status_flags = status;
+            ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![variable])];
+            writer.completed(ok).await?;
+            return Ok(());
+        }
+
+        if let Some(new_value) = parse_set_sql_auto_is_null(query) {
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
+
+            self.base.session.set_mysql_sql_auto_is_null(new_value);
+            info!(
+                "mysql session: handling sql_auto_is_null -> {}",
+                if new_value { "1" } else { "0" }
+            );
+
+            let mut ok = OkResponse::default();
+            ok.status_flags
+                .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
+            ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
+                SessionStateVariable::new("sql_auto_is_null", if new_value { "1" } else { "0" }),
+            ])];
+            writer.completed(ok).await?;
+            return Ok(());
+        }
+
+        if let Some(value) = parse_set_sql_select_limit(query) {
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
+
+            info!("mysql session: handling sql_select_limit -> {}", value);
+            self.base.session.set_mysql_sql_select_limit(value.clone());
+
+            let mut ok = OkResponse::default();
+            ok.status_flags
+                .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
+            ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
+                SessionStateVariable::new("sql_select_limit", value.clone().into_bytes()),
+            ])];
+            writer.completed(ok).await?;
+            return Ok(());
+        }
+
+        if let Some((var, raw_value)) = parse_set_charset_variable(query) {
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
+
+            let (default_charset, _) = self.base.session.mysql_default_set_names();
+            let mut variables = Vec::new();
+            match var.as_str() {
+                "character_set_results" => {
+                    let charset_value = normalize_charset_value(&raw_value, &default_charset);
+                    info!(
+                        "mysql session: handling character_set_results -> {}",
+                        charset_value
+                    );
+                    self.base
+                        .session
+                        .set_mysql_character_set_results(&charset_value);
+                    variables.push(SessionStateVariable::new(
+                        "character_set_results",
+                        charset_value.clone().into_bytes(),
+                    ));
+                }
+                "character_set_client" => {
+                    let charset_value = normalize_charset_value(&raw_value, &default_charset);
+                    info!(
+                        "mysql session: handling character_set_client -> {}",
+                        charset_value
+                    );
+                    self.base
+                        .session
+                        .set_mysql_character_set_client(&charset_value);
+                    variables.push(SessionStateVariable::new(
+                        "character_set_client",
+                        charset_value.clone().into_bytes(),
+                    ));
+                }
+                "character_set_connection" => {
+                    let charset_value = normalize_charset_value(&raw_value, &default_charset);
+                    info!(
+                        "mysql session: handling character_set_connection -> {}",
+                        charset_value
+                    );
+                    self.base
+                        .session
+                        .set_mysql_character_set_connection(&charset_value);
+                    variables.push(SessionStateVariable::new(
+                        "character_set_connection",
+                        charset_value.clone().into_bytes(),
+                    ));
+                }
+                "collation_connection" => {
+                    let collation_value = if raw_value.eq_ignore_ascii_case("null")
+                        || raw_value.eq_ignore_ascii_case("default")
+                    {
+                        default_collation_for_charset(&default_charset).map(|s| s.to_string())
+                    } else {
+                        Some(strip_identifier_quotes(&raw_value).to_ascii_lowercase())
+                    };
+                    info!(
+                        "mysql session: handling collation_connection -> {:?}",
+                        collation_value
+                    );
+                    self.base
+                        .session
+                        .set_mysql_collation_connection(collation_value.as_deref());
+                    if let Some(collation) = &collation_value {
+                        variables.push(SessionStateVariable::new(
+                            "collation_connection",
+                            collation.clone().into_bytes(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
+            if !variables.is_empty() {
+                let mut ok = OkResponse::default();
+                ok.status_flags
+                    .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
+                ok.session_state_changes = vec![SessionStateChange::SystemVariables(variables)];
+                writer.completed(ok).await?;
+                return Ok(());
+            }
+        }
+
         let sampled =
             thread_rng().gen_range(0..100) <= self.base.session.get_trace_sample_rate()?;
         let span_context =
@@ -385,7 +960,7 @@ impl InteractiveWorkerBase {
         {
             return None;
         }
-        let federated = MySQLFederated::create();
+        let federated = MySQLFederated::with_session(self.session.clone());
         federated.check(query)
     }
 
