@@ -635,10 +635,16 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
                 ));
             }
 
+            info!(
+                "mysql session: replying SET NAMES -> charset={}, collation={:?}",
+                charset_value, collation_value
+            );
+
             let mut ok = OkResponse::default();
             ok.status_flags
                 .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(variables)];
+            info!("mysql session: SET NAMES OK response => {:?}", ok);
 
             writer.completed(ok).await?;
             return Ok(());
@@ -666,6 +672,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
             let mut ok = OkResponse::default();
             ok.status_flags = status;
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![variable])];
+            info!("mysql session: autocommit OK response => {:?}", ok);
             writer.completed(ok).await?;
             return Ok(());
         }
@@ -687,6 +694,10 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
                 SessionStateVariable::new("sql_auto_is_null", if new_value { "1" } else { "0" }),
             ])];
+            info!(
+                "mysql session: sql_auto_is_null OK response => {:?}",
+                ok
+            );
             writer.completed(ok).await?;
             return Ok(());
         }
@@ -705,6 +716,10 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
             ok.session_state_changes = vec![SessionStateChange::SystemVariables(vec![
                 SessionStateVariable::new("sql_select_limit", value.clone().into_bytes()),
             ])];
+            info!(
+                "mysql session: sql_select_limit OK response => {:?}",
+                ok
+            );
             writer.completed(ok).await?;
             return Ok(());
         }
@@ -789,6 +804,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
                 ok.status_flags
                     .set(StatusFlags::SERVER_SESSION_STATE_CHANGED, true);
                 ok.session_state_changes = vec![SessionStateChange::SystemVariables(variables)];
+                info!("mysql session: SET {} OK response => {:?}", var, ok);
                 writer.completed(ok).await?;
                 return Ok(());
             }

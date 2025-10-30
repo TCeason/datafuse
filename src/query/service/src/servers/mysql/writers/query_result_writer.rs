@@ -28,7 +28,7 @@ use databend_common_expression::SendableDataBlockStream;
 use databend_common_formats::field_encoder::FieldEncoderValues;
 use databend_common_io::prelude::FormatSettings;
 use futures_util::StreamExt;
-use log::error;
+use log::{error, info};
 use opensrv_mysql::*;
 
 use crate::sessions::Session;
@@ -152,12 +152,15 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
                 .extra_info
                 .map(|r| r.affected_rows())
                 .unwrap_or_default();
-            dataset_writer
-                .completed(OkResponse {
-                    affected_rows,
-                    ..Default::default()
-                })
-                .await?;
+            let response = OkResponse {
+                affected_rows,
+                ..Default::default()
+            };
+            info!(
+                "mysql writer: non-result query '{}' completed with {:?}",
+                query_result.sql, response
+            );
+            dataset_writer.completed(response).await?;
             return Ok(());
         }
 
