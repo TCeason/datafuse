@@ -32,29 +32,29 @@ impl ColumnsTable {
     pub fn create(table_id: u64, ctl_name: &str) -> Arc<dyn Table> {
         let query = format!(
             "SELECT
-            database AS table_catalog,
-            database AS table_schema,
-            table AS table_name,
-            name AS column_name,
+            cols.database AS table_catalog,
+            cols.database AS table_schema,
+            cols.table AS table_name,
+            cols.name AS column_name,
             1 AS ordinal_position,
             NULL AS column_default,
-            comment AS column_comment,
+            cols.comment AS column_comment,
             NULL AS column_key,
-            case when is_nullable='NO' then 0
-            when is_nullable='YES' then 1
+            case when cols.is_nullable='NO' then 0
+            when cols.is_nullable='YES' then 1
             end as nullable,
-            is_nullable AS is_nullable,
-            LOWER(data_type) AS data_type,
+            cols.is_nullable AS is_nullable,
+            cols.type AS data_type,
             CASE
-                WHEN UPPER(data_type) IN ('VARCHAR', 'STRING') THEN CONCAT('varchar(', '255', ')')
-                ELSE LOWER(data_type)
+                WHEN UPPER(cols.data_type) IN ('VARCHAR', 'STRING') THEN CONCAT('varchar(', '16382', ')')
+                ELSE cols.data_type
             END AS column_type,
             CASE
-                WHEN UPPER(data_type) IN ('VARCHAR', 'STRING') THEN 255
+                WHEN UPPER(cols.data_type) IN ('VARCHAR', 'STRING') THEN CAST(16382 AS BIGINT)
                 ELSE NULL
             END AS character_maximum_length,
             CASE
-                WHEN UPPER(data_type) IN ('VARCHAR', 'STRING') THEN 255 * 4
+                WHEN UPPER(cols.data_type) IN ('VARCHAR', 'STRING') THEN CAST(16382 * 4 AS BIGINT)
                 ELSE NULL
             END AS character_octet_length,
             NULL AS numeric_precision,
@@ -64,22 +64,22 @@ impl ColumnsTable {
             NULL AS character_set_catalog,
             NULL AS character_set_schema,
             CASE
-                WHEN UPPER(data_type) IN ('VARCHAR', 'STRING') THEN 'utf8mb4'
+                WHEN UPPER(cols.data_type) IN ('VARCHAR', 'STRING') THEN 'utf8mb4'
                 ELSE NULL
             END AS character_set_name,
             NULL AS collation_catalog,
             NULL AS collation_schema,
             CASE
-                WHEN UPPER(data_type) IN ('VARCHAR', 'STRING') THEN 'utf8mb4_general_ci'
+                WHEN UPPER(cols.data_type) IN ('VARCHAR', 'STRING') THEN 'utf8mb4_general_ci'
                 ELSE NULL
             END AS collation_name,
             NULL AS domain_catalog,
             NULL AS domain_schema,
             NULL AS domain_name,
             NULL AS privileges,
-            default_expression as default,
+            cols.default_expression as default,
             NULL AS extra
-        FROM {}.system.columns;",
+        FROM {}.system.columns AS cols;",
             ctl_name
         );
 
