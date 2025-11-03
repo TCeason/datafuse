@@ -19,6 +19,8 @@ use databend_common_meta_app::data_mask::DataMaskId;
 use databend_common_meta_app::data_mask::DataMaskIdIdent;
 use databend_common_meta_app::data_mask::DataMaskNameIdent;
 use databend_common_meta_app::data_mask::DatamaskMeta;
+use databend_common_meta_app::data_mask::MaskPolicyIdTableId;
+use databend_common_meta_app::data_mask::MaskPolicyTableIdIdent;
 use databend_common_meta_app::data_mask::MaskPolicyTableIdListIdent;
 use databend_common_meta_app::data_mask::MaskpolicyTableIdList;
 use databend_common_meta_app::id_generator::IdGenerator;
@@ -26,13 +28,18 @@ use databend_common_meta_app::schema::CreateOption;
 use databend_common_meta_app::tenant::Tenant;
 use databend_common_meta_app::KeyWithTenant;
 use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_kvapi::kvapi::DirName;
 use databend_common_meta_types::MetaError;
 use databend_common_meta_types::SeqV;
 use databend_common_meta_types::TxnRequest;
 use fastrace::func_name;
+use futures::TryStreamExt;
 use log::debug;
 
 use crate::data_mask_api::DatamaskApi;
+use crate::errors::MaskingPolicyError;
+use crate::errors::SecurityPolicyError;
+use crate::errors::SecurityPolicyKind;
 use crate::fetch_id;
 use crate::kv_app_error::KVAppError;
 use crate::kv_pb_api::KVPbApi;
@@ -135,12 +142,16 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
     async fn drop_data_mask(
         &self,
         name_ident: &DataMaskNameIdent,
-    ) -> Result<Option<(SeqV<DataMaskId>, SeqV<DatamaskMeta>)>, KVAppError> {
+    ) -> Result<Option<(SeqV<DataMaskId>, SeqV<DatamaskMeta>)>, MaskingPolicyError> {
         debug!(name_ident :? =(name_ident); "DatamaskApi: {}", func_name!());
 
         let mut trials = txn_backoff(None, func_name!());
         loop {
-            trials.next().unwrap()?.await;
+            trials
+                .next()
+                .unwrap()
+                .map_err(MaskingPolicyError::from)?
+                .await;
             let mut txn = TxnRequest::default();
 
             let res = self.get_id_and_value(name_ident).await?;
@@ -149,6 +160,19 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
             let Some((seq_id, seq_meta)) = res else {
                 return Ok(None);
             };
+
+            // Prevent dropping a policy that is still referenced.
+            let policy_id = *seq_id.data;
+            if mask_policy_is_in_use(self, name_ident.tenant(), policy_id).await? {
+                let tenant = name_ident.tenant().tenant_name().to_string();
+                let policy_name = name_ident.data_mask_name().to_string();
+                let err = SecurityPolicyError::policy_in_use(
+                    tenant,
+                    SecurityPolicyKind::Masking,
+                    policy_name,
+                );
+                return Err(err.into());
+            }
 
             let id_ident = seq_id.data.into_t_ident(name_ident.tenant());
 
@@ -195,7 +219,7 @@ async fn clear_table_column_mask_policy(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     name_ident: &DataMaskNameIdent,
     txn: &mut TxnRequest,
-) -> Result<(), MetaError> {
+) -> Result<(), MaskingPolicyError> {
     let id_list_key = MaskPolicyTableIdListIdent::new_from(name_ident.clone());
 
     let seq_id_list = kv_api.get_pb(&id_list_key).await?;
@@ -206,4 +230,20 @@ async fn clear_table_column_mask_policy(
 
     txn_delete_exact(txn, &id_list_key, seq_id_list.seq);
     Ok(())
+}
+
+async fn mask_policy_is_in_use(
+    kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
+    tenant: &Tenant,
+    policy_id: u64,
+) -> Result<bool, MaskingPolicyError> {
+    let binding_prefix = DirName::new(MaskPolicyTableIdIdent::new_generic(
+        tenant.clone(),
+        MaskPolicyIdTableId {
+            policy_id,
+            table_id: 0,
+        },
+    ));
+    let mut bindings = kv_api.list_pb_keys(&binding_prefix).await?;
+    Ok(bindings.try_next().await?.is_some())
 }

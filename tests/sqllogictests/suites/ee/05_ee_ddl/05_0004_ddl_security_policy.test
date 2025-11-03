@@ -148,7 +148,10 @@ alter table t_1 drop column id;
 statement ok
 alter table t ADD ROW ACCESS POLICY rap_it ON (empl_id);
 
-## t apply row access policy rpa_it(means if current role == account_admin will return false)
+## t apply row access policy rpa_it
+statement error 1133
+drop row access policy rap_it;
+
 query I
 select id from t;
 ----
@@ -303,6 +306,9 @@ CREATE MASKING POLICY maskc AS (val int) RETURNS int -> CASE WHEN current_role()
 
 statement ok
 alter table data_mask_test modify column b set masking policy maskb;
+
+statement error 1133
+drop masking policy maskb;
 
 statement error 1132
 alter table data_mask_test modify column b string not null;
