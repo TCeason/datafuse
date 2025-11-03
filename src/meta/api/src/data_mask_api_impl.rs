@@ -161,9 +161,12 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
                 return Ok(None);
             };
 
-            // Prevent dropping a policy that is still referenced.
+            let id_ident = seq_id.data.into_t_ident(name_ident.tenant());
+
+            // Check if policy is still in use by existing non-dropped tables.
+            // This also cleans up stale bindings to dropped tables in the txn.
             let policy_id = *seq_id.data;
-            if mask_policy_is_in_use(self, name_ident.tenant(), policy_id).await? {
+            if mask_policy_is_in_use(self, name_ident.tenant(), policy_id, &mut txn).await? {
                 let tenant = name_ident.tenant().tenant_name().to_string();
                 let policy_name = name_ident.data_mask_name().to_string();
                 let err = SecurityPolicyError::policy_in_use(
@@ -173,8 +176,6 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
                 );
                 return Err(err.into());
             }
-
-            let id_ident = seq_id.data.into_t_ident(name_ident.tenant());
 
             txn_delete_exact(&mut txn, name_ident, seq_id.seq);
             txn_delete_exact(&mut txn, &id_ident, seq_meta.seq);
@@ -232,11 +233,16 @@ async fn clear_table_column_mask_policy(
     Ok(())
 }
 
+/// Check if a masking policy has any valid bindings to existing, non-dropped tables.
+/// Also cleans up stale bindings to dropped or non-existent tables in the transaction.
 async fn mask_policy_is_in_use(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     tenant: &Tenant,
     policy_id: u64,
+    txn: &mut TxnRequest,
 ) -> Result<bool, MaskingPolicyError> {
+    use databend_common_meta_app::schema::TableId;
+
     let binding_prefix = DirName::new(MaskPolicyTableIdIdent::new_generic(
         tenant.clone(),
         MaskPolicyIdTableId {
@@ -244,6 +250,40 @@ async fn mask_policy_is_in_use(
             table_id: 0,
         },
     ));
-    let mut bindings = kv_api.list_pb_keys(&binding_prefix).await?;
-    Ok(bindings.try_next().await?.is_some())
+    let bindings = kv_api.list_pb_keys(&binding_prefix).await?;
+
+    let binding_keys: Vec<_> = bindings.try_collect().await?;
+
+    // Check each binding to see if the referenced table actually exists and is not dropped
+    let mut has_valid_binding = false;
+
+    for binding_key in binding_keys {
+        let table_id = binding_key.name().table_id;
+
+        // Check if the table exists and is not dropped
+        let table_id_ident = TableId { table_id };
+        let seq_table_meta = kv_api.get_pb(&table_id_ident).await?;
+
+        match seq_table_meta {
+            Some(seq_meta) if seq_meta.data.drop_on.is_none() => {
+                // Table exists and is not dropped - this is a valid binding
+                has_valid_binding = true;
+            }
+            _ => {
+                // Table doesn't exist or is dropped - clean up this stale binding
+                // We need to get the seq for the binding to delete it exactly
+                let seq_binding = kv_api.get_pb(&binding_key).await?;
+                if let Some(seq_binding) = seq_binding {
+                    debug!(
+                        table_id = table_id,
+                        policy_id = policy_id;
+                        "Cleaning up stale policy binding to non-existent or dropped table"
+                    );
+                    txn_delete_exact(txn, &binding_key, seq_binding.seq);
+                }
+            }
+        }
+    }
+
+    Ok(has_valid_binding)
 }

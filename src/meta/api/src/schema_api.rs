@@ -488,6 +488,15 @@ pub async fn handle_undrop_table(
         }
 
         {
+            // Clean up references to dropped policies before undropping the table
+            clean_dropped_policy_references(
+                kv_api,
+                tenant_dbname_tbname.tenant(),
+                table_id,
+                &mut seq_table_meta.data,
+            )
+            .await?;
+
             // reset drop on time
             seq_table_meta.drop_on = None;
 
@@ -531,6 +540,63 @@ pub async fn handle_undrop_table(
             }
         }
     }
+}
+
+/// Clean up references to non-existent masking and row access policies in table metadata.
+/// This is called during undrop to ensure that if a policy was dropped while the table
+/// was dropped, the table won't reference a non-existent policy after being undropped.
+async fn clean_dropped_policy_references(
+    kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
+    tenant: &Tenant,
+    table_id: u64,
+    table_meta: &mut TableMeta,
+) -> Result<(), KVAppError> {
+    use databend_common_meta_app::data_mask::DataMaskId;
+    use databend_common_meta_app::data_mask::DataMaskIdIdent;
+    use databend_common_meta_app::row_access_policy::RowAccessPolicyId;
+    use databend_common_meta_app::row_access_policy::RowAccessPolicyIdIdent;
+
+    // Clean up masking policy references
+    let mut invalid_columns = Vec::new();
+    for (column_id, policy_map) in &table_meta.column_mask_policy_columns_ids {
+        let policy_id = DataMaskId::new(policy_map.policy_id);
+        let policy_ident = DataMaskIdIdent::new_generic(tenant, policy_id);
+
+        // Check if the policy still exists
+        if kv_api.get_pb(&policy_ident).await?.is_none() {
+            debug!(
+                table_id = table_id,
+                column_id = column_id,
+                policy_id = policy_map.policy_id;
+                "Removing reference to dropped masking policy during undrop"
+            );
+            invalid_columns.push(*column_id);
+        }
+    }
+
+    // Remove invalid masking policy references
+    for column_id in invalid_columns {
+        table_meta.column_mask_policy_columns_ids.remove(&column_id);
+    }
+
+    // Clean up row access policy reference
+    if let Some(ref policy_map) = table_meta.row_access_policy_columns_ids {
+        let policy_id = RowAccessPolicyId::new(policy_map.policy_id);
+        let policy_ident = RowAccessPolicyIdIdent::new_generic(tenant, policy_id);
+
+        // Check if the policy still exists
+        if kv_api.get_pb(&policy_ident).await?.is_none() {
+            debug!(
+                table_id = table_id,
+                policy_id = policy_map.policy_id;
+                "Removing reference to dropped row access policy during undrop"
+            );
+            table_meta.row_access_policy_columns_ids = None;
+            table_meta.row_access_policy = None;
+        }
+    }
+
+    Ok(())
 }
 
 /// add __fd_marked_deleted_index/<table_id>/<index_id> -> marked_deleted_index_meta
