@@ -25,6 +25,8 @@ use databend_common_meta_app::data_mask::MaskPolicyTableIdListIdent;
 use databend_common_meta_app::data_mask::MaskpolicyTableIdList;
 use databend_common_meta_app::id_generator::IdGenerator;
 use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::schema::TableId;
+use databend_common_meta_app::schema::TableMeta;
 use databend_common_meta_app::tenant::Tenant;
 use databend_common_meta_app::KeyWithTenant;
 use databend_common_meta_kvapi::kvapi;
@@ -33,7 +35,6 @@ use databend_common_meta_types::MetaError;
 use databend_common_meta_types::SeqV;
 use databend_common_meta_types::TxnRequest;
 use fastrace::func_name;
-use futures::TryStreamExt;
 use log::debug;
 
 use crate::data_mask_api::DatamaskApi;
@@ -163,7 +164,8 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
 
             // Prevent dropping a policy that is still referenced.
             let policy_id = *seq_id.data;
-            if mask_policy_is_in_use(self, name_ident.tenant(), policy_id).await? {
+            let usage = collect_mask_policy_usage(self, name_ident.tenant(), policy_id).await?;
+            if !usage.active_tables.is_empty() {
                 let tenant = name_ident.tenant().tenant_name().to_string();
                 let policy_name = name_ident.data_mask_name().to_string();
                 let err = SecurityPolicyError::policy_in_use(
@@ -178,6 +180,16 @@ impl<KV: kvapi::KVApi<Error = MetaError>> DatamaskApi for KV {
 
             txn_delete_exact(&mut txn, name_ident, seq_id.seq);
             txn_delete_exact(&mut txn, &id_ident, seq_meta.seq);
+            for binding in &usage.stale_bindings {
+                txn_delete_exact(&mut txn, &binding.ident, binding.seq);
+            }
+            for update in &usage.table_updates {
+                txn.condition
+                    .push(txn_cond_eq_seq(&update.table_id, update.seq));
+                let op = txn_op_put_pb(&update.table_id, &update.meta, None)
+                    .map_err(|e| MaskingPolicyError::from(MetaError::from(e)))?;
+                txn.if_then.push(op);
+            }
             // TODO: Tentative retention for compatibility MaskPolicyTableIdListIdent related logic. It can be directly deleted later
             clear_table_column_mask_policy(self, name_ident, &mut txn).await?;
             let (succ, _responses) = send_txn(self, txn).await?;
@@ -232,11 +244,48 @@ async fn clear_table_column_mask_policy(
     Ok(())
 }
 
-async fn mask_policy_is_in_use(
+#[derive(Default)]
+struct MaskPolicyUsage {
+    active_tables: Vec<u64>,
+    stale_bindings: Vec<BindingEntry>,
+    table_updates: Vec<TableMetaUpdate>,
+}
+
+struct BindingEntry {
+    ident: MaskPolicyTableIdIdent,
+    seq: u64,
+}
+
+struct TableMetaUpdate {
+    table_id: TableId,
+    seq: u64,
+    meta: TableMeta,
+}
+
+fn strip_mask_policy_from_table_meta(table_meta: &mut TableMeta, policy_id: u64) -> bool {
+    let mut removed = false;
+    table_meta
+        .column_mask_policy_columns_ids
+        .retain(|_, policy| {
+            let keep = policy.policy_id != policy_id;
+            if !keep {
+                removed = true;
+            }
+            keep
+        });
+
+    if removed && table_meta.column_mask_policy.is_some() {
+        table_meta.column_mask_policy = None;
+    }
+
+    removed
+}
+
+async fn collect_mask_policy_usage(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     tenant: &Tenant,
     policy_id: u64,
-) -> Result<bool, MaskingPolicyError> {
+) -> Result<MaskPolicyUsage, MaskingPolicyError> {
     let binding_prefix = DirName::new(MaskPolicyTableIdIdent::new_generic(
         tenant.clone(),
         MaskPolicyIdTableId {
@@ -244,6 +293,45 @@ async fn mask_policy_is_in_use(
             table_id: 0,
         },
     ));
-    let mut bindings = kv_api.list_pb_keys(&binding_prefix).await?;
-    Ok(bindings.try_next().await?.is_some())
+    let bindings = kv_api
+        .list_pb_vec(&binding_prefix)
+        .await
+        .map_err(MaskingPolicyError::from)?;
+
+    let mut usage = MaskPolicyUsage::default();
+    for (binding_ident, seqv) in bindings {
+        let table_id = binding_ident.name().table_id;
+        let table_key = TableId::new(table_id);
+        match kv_api
+            .get_pb(&table_key)
+            .await
+            .map_err(MaskingPolicyError::from)?
+        {
+            Some(mut table_meta_seqv) => {
+                if table_meta_seqv.data.drop_on.is_none() {
+                    usage.active_tables.push(table_id);
+                } else {
+                    if strip_mask_policy_from_table_meta(&mut table_meta_seqv.data, policy_id) {
+                        usage.table_updates.push(TableMetaUpdate {
+                            table_id: table_key,
+                            seq: table_meta_seqv.seq,
+                            meta: table_meta_seqv.data.clone(),
+                        });
+                    }
+                    usage.stale_bindings.push(BindingEntry {
+                        ident: binding_ident,
+                        seq: seqv.seq,
+                    });
+                }
+            }
+            None => {
+                usage.stale_bindings.push(BindingEntry {
+                    ident: binding_ident,
+                    seq: seqv.seq,
+                });
+            }
+        }
+    }
+
+    Ok(usage)
 }
