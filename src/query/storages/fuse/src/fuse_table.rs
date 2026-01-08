@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::any::Any;
+
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -449,6 +451,21 @@ impl FuseTable {
             // for backward compatibility, we check the legacy table option
             .or_else(|| options.get(OPT_KEY_LEGACY_SNAPSHOT_LOC))
             .cloned()
+    }
+
+    /// Returns a stable identifier for query result cache invalidation.
+    ///
+    /// This ID changes whenever table data is mutated (INSERT, UPDATE, DELETE,
+    /// COMPACT, RECLUSTER, etc.), ensuring stale cache entries are invalidated.
+    ///
+    /// Returns a SHA256 hash of the snapshot location (or a sentinel for empty tables).
+    /// Using hash instead of raw path keeps the key short and avoids exposing internal paths.
+    pub fn query_result_cache_id(&self) -> String {
+        let raw = self.snapshot_loc().unwrap_or_else(|| {
+            format!("fuse:empty:{}", self.get_table_info().ident.table_id)
+        });
+        let hash = sha2::Sha256::digest(raw.as_bytes());
+        format!("{:x}", hash)
     }
 
     pub fn get_operator(&self) -> Operator {
