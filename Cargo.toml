@@ -15,6 +15,7 @@ members = [
     "src/query/codegen",
     "src/tests/sqlsmith",
     "tests/sqllogictests",
+    "tools/metactl-cleanup",
 ]
 default-members = [
     "src/bendsave",

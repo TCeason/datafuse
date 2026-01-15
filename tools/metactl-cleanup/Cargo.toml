@@ -1,0 +1,14 @@
+[package]
+name = "metactl-cleanup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+databend-common-meta-client = { workspace = true }
+databend-common-meta-kvapi = { workspace = true }
+databend-common-meta-types = { workspace = true }
+databend-common-version = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
