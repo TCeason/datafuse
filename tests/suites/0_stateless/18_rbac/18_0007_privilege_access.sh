@@ -36,6 +36,7 @@ drop role if exists 'test-role2';
 create user 'test-user' IDENTIFIED BY '$TEST_USER_PASSWORD';
 create role \`test-role1\`;
 create role \`test-role2\`;
+drop materialized view if exists mv_priv_access;
 drop table if exists t20_0012;
 create table t20_0012(c int not null);
 "
@@ -107,6 +108,11 @@ select * from t20_0012 order by c;
 echo "select 'test -- optimize table'" | $TEST_USER_CONNECT
 echo "optimize table t20_0012 all" | $TEST_USER_CONNECT
 
+## show create materialized view requires SUPER, even when SELECT is granted
+run_root_sql "CREATE MATERIALIZED VIEW mv_priv_access AS SELECT c FROM t20_0012;"
+echo "select 'test -- show create materialized view'" | $TEST_USER_CONNECT
+echo "show create materialized view mv_priv_access" | $TEST_USER_CONNECT
+
 ## grant user privilege and test optimize
 run_root_sql "GRANT Super ON *.* TO 'test-user';"
 run_test_user "
@@ -174,6 +180,7 @@ select count(*)>=1 from fuse_block('default', 't20_0012_a');
 
 ## Drop table.
 run_root_sql "
+drop materialized view mv_priv_access;
 drop table default.t20_0012 all;
 drop table default.t20_0012_a all;
 drop table default.t20_0012_b all;

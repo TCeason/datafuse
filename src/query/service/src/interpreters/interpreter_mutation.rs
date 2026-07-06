@@ -43,6 +43,7 @@ use log::info;
 use crate::interpreters::HookOperator;
 use crate::interpreters::Interpreter;
 use crate::interpreters::common::check_deduplicate_label;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::dml_build_update_stream_req;
 use crate::physical_plans::MutationBuildInfo;
 use crate::physical_plans::PhysicalPlan;
@@ -213,6 +214,7 @@ pub async fn build_mutation_info(
             &mutation.table_name,
         )
         .await?;
+    check_not_materialized_view(table.as_ref(), &mutation.database_name)?;
     // Check if the table supports mutation.
     table.check_mutable()?;
     let fuse_table = table.as_any().downcast_ref::<FuseTable>().ok_or_else(|| {

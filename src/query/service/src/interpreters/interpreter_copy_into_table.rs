@@ -68,6 +68,7 @@ use crate::interpreters::HookOperator;
 use crate::interpreters::Interpreter;
 use crate::interpreters::SelectInterpreter;
 use crate::interpreters::common::check_deduplicate_label;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::dml_build_update_stream_req;
 use crate::physical_plans::CopyIntoTable;
 use crate::physical_plans::CopyIntoTableSource;
@@ -977,6 +978,7 @@ impl Interpreter for CopyIntoTableInterpreter {
             )
             .await?;
 
+        check_not_materialized_view(to_table.as_ref(), &plan.database_name)?;
         to_table.check_mutable()?;
 
         if self.plan.no_file_to_copy {

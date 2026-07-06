@@ -49,6 +49,7 @@ use crate::interpreters::Interpreter;
 use crate::interpreters::InterpreterPtr;
 use crate::interpreters::SelectInterpreter;
 use crate::interpreters::common::check_deduplicate_label;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::dml_build_update_stream_req;
 #[cfg(feature = "storage-stage")]
 use crate::interpreters::interpreter_copy_into_table::CopyIntoTableInterpreter;
@@ -152,6 +153,7 @@ impl ReplaceInterpreter {
             .get_table(&plan.catalog, &plan.database, &plan.table)
             .await?;
 
+        check_not_materialized_view(table.as_ref(), &plan.database)?;
         // check mutability
         table.check_mutable()?;
 

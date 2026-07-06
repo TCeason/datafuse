@@ -26,6 +26,7 @@ use databend_common_expression::FromData;
 use databend_common_expression::SendableDataBlockStream;
 use databend_common_expression::types::UInt64Type;
 use databend_common_meta_app::schema::Constraint;
+use databend_common_meta_app::schema::is_fuse_backed_engine;
 use databend_common_pipeline::sources::AsyncSourcer;
 use databend_common_pipeline_transforms::TransformPipelineHelper;
 #[cfg(feature = "storage-stage")]
@@ -47,6 +48,7 @@ use crate::interpreters::HookOperator;
 use crate::interpreters::Interpreter;
 use crate::interpreters::InterpreterPtr;
 use crate::interpreters::common::check_deduplicate_label;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::dml_build_update_stream_req;
 use crate::physical_plans::DistributedInsertSelect;
 use crate::physical_plans::Exchange;
@@ -129,10 +131,14 @@ impl Interpreter for InsertInterpreter {
                 .await?
         };
 
+        if self.plan.table_info.is_none() {
+            check_not_materialized_view(table.as_ref(), &self.plan.database)?;
+        }
+
         let mut table_constraints = Vec::new();
         // check mutability
         table.check_mutable()?;
-        let table_meta_timestamps = if table.engine() == "FUSE" {
+        let table_meta_timestamps = if is_fuse_backed_engine(table.engine()) {
             let fuse_table =
                 databend_common_storages_fuse::FuseTable::try_from_table(table.as_ref())?;
 
