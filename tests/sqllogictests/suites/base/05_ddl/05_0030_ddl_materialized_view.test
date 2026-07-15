@@ -170,7 +170,13 @@ ALTER TABLE test_mv RENAME TO test_mv_renamed
 statement error
 ALTER TABLE test_mv SWAP WITH mv_base_t
 
-# ALTER TABLE schema changes are blocked on materialized views.
+# All ALTER TABLE operations are blocked on materialized views.
+statement error 1302
+ALTER TABLE test_mv COMMENT = 'changed'
+
+statement error 1302
+ALTER TABLE test_mv CONNECTION = (CONNECTION_NAME = 'missing')
+
 statement error 1302
 ALTER TABLE test_mv ADD COLUMN new_col INT
 
@@ -179,6 +185,36 @@ ALTER TABLE test_mv DROP COLUMN val
 
 statement error 1302
 ALTER TABLE test_mv RENAME COLUMN val TO value
+
+statement error 1302
+ALTER TABLE test_mv MODIFY COLUMN amount BIGINT
+
+statement error 1302
+ALTER TABLE test_mv ADD CONSTRAINT positive_id CHECK (id > 0)
+
+statement error 1302
+ALTER TABLE test_mv DROP CONSTRAINT positive_id
+
+statement error 1302
+ALTER TABLE test_mv RECLUSTER
+
+statement error 1302
+ALTER TABLE test_mv FLASHBACK TO (SNAPSHOT => '00000000-0000-0000-0000-000000000000')
+
+statement error 1302
+ALTER TABLE test_mv REFRESH CACHE
+
+statement error 1302
+ALTER TABLE test_mv CREATE TAG mv_snapshot
+
+statement error 1302
+ALTER TABLE test_mv DROP TAG mv_snapshot
+
+statement error 1302
+ALTER TABLE test_mv SET TAG missing_tag = 'value'
+
+statement error 1302
+ALTER TABLE test_mv UNSET TAG missing_tag
 
 # TRUNCATE is blocked on materialized views.
 statement error 1302

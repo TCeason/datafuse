@@ -22,6 +22,7 @@ use databend_common_sql::plans::DropTableConstraintPlan;
 use databend_common_storages_fuse::FuseTable;
 
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::interpreter_table_add_column::update_table_meta;
 use crate::pipelines::PipelineBuildResult;
 use crate::sessions::QueryContext;
@@ -57,6 +58,7 @@ impl Interpreter for DropTableConstraintInterpreter {
         let tbl = self.ctx.get_table(catalog_name, db_name, tbl_name).await?;
         // check mutability
         tbl.check_mutable()?;
+        check_not_materialized_view(tbl.as_ref(), db_name)?;
 
         let table_info = tbl.get_table_info();
         let engine = table_info.engine();

@@ -65,6 +65,7 @@ use log::warn;
 
 use crate::interpreters::Interpreter;
 use crate::interpreters::InterpreterClusteringHistory;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::hook::vacuum_hook::hook_clear_m_cte_temp_table;
 use crate::interpreters::hook::vacuum_hook::hook_disk_temp_dir;
 use crate::interpreters::hook::vacuum_hook::hook_vacuum_temp_files;
@@ -248,6 +249,7 @@ impl ReclusterTableInterpreter {
         let tbl = self.ctx.get_table(catalog, database, table).await?;
         // check mutability
         tbl.check_mutable()?;
+        check_not_materialized_view(tbl.as_ref(), database)?;
         let Some(cluster_type) = tbl.cluster_type() else {
             return Err(ErrorCode::UnclusteredTable(format!(
                 "Unclustered table '{}.{}'",
