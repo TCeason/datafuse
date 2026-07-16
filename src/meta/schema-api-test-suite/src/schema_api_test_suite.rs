@@ -37,6 +37,7 @@ use databend_common_meta_api::DictionaryApi;
 use databend_common_meta_api::GarbageCollectionApi;
 use databend_common_meta_api::IndexApi;
 use databend_common_meta_api::LockApi2;
+use databend_common_meta_api::MaterializedViewApi;
 use databend_common_meta_api::RowAccessPolicyApi;
 use databend_common_meta_api::SecurityApi;
 use databend_common_meta_api::SequenceApi;
@@ -115,7 +116,18 @@ use databend_common_meta_app::schema::LockInfo;
 use databend_common_meta_app::schema::LockKey;
 use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::LockType;
+use databend_common_meta_app::schema::MATERIALIZED_VIEW_ENGINE;
+use databend_common_meta_app::schema::MVDefinition;
+use databend_common_meta_app::schema::MVDefinitionIdent;
+use databend_common_meta_app::schema::MVId;
+use databend_common_meta_app::schema::MVMeta;
+use databend_common_meta_app::schema::MVMetaIdent;
+use databend_common_meta_app::schema::MVSourceIndexCondition;
+use databend_common_meta_app::schema::MVSourceIndexIdent;
+use databend_common_meta_app::schema::MVState;
 use databend_common_meta_app::schema::MarkedDeletedIndexType;
+use databend_common_meta_app::schema::MarkedDeletedMVId;
+use databend_common_meta_app::schema::MarkedDeletedMVIdent;
 use databend_common_meta_app::schema::RenameDatabaseReq;
 use databend_common_meta_app::schema::RenameDictionaryReq;
 use databend_common_meta_app::schema::RenameTableReq;
@@ -124,6 +136,7 @@ use databend_common_meta_app::schema::SequenceIdent;
 use databend_common_meta_app::schema::SetSecurityPolicyAction;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
 use databend_common_meta_app::schema::SetTableRowAccessPolicyReq;
+use databend_common_meta_app::schema::SourceProgress;
 use databend_common_meta_app::schema::SwapTableReq;
 use databend_common_meta_app::schema::TableCopiedFileInfo;
 use databend_common_meta_app::schema::TableCopiedFileNameIdent;
@@ -144,6 +157,7 @@ use databend_common_meta_app::schema::TagNameIdent;
 use databend_common_meta_app::schema::TruncateTableReq;
 use databend_common_meta_app::schema::UndropDatabaseReq;
 use databend_common_meta_app::schema::UndropTableReq;
+use databend_common_meta_app::schema::UpdateMVMetaReq;
 use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
 use databend_common_meta_app::schema::UpdateTableMetaReq;
 use databend_common_meta_app::schema::UpsertTableCopiedFileReq;
@@ -203,6 +217,51 @@ struct LockSummary {
     meta: LockMetaSummary,
 }
 
+struct StagedMaterializedView {
+    mv_id: MVId,
+    prev_mv_id: Option<MVId>,
+    meta_ident: MVMetaIdent,
+    definition_ident: MVDefinitionIdent,
+    source_index_ident: MVSourceIndexIdent,
+    orphan_ident: TableIdHistoryIdent,
+}
+
+fn new_mv_meta(source_table_id: u64, table_meta_seq: u64) -> MVMeta {
+    MVMeta {
+        source_table_id,
+        source_progress: SourceProgress {
+            table_meta_seq,
+            snapshot_location: None,
+        },
+        state: MVState::Valid,
+        last_refresh_time: Some(Utc::now()),
+        last_refresh_error: None,
+    }
+}
+
+fn new_mv_definition(db_name: &str) -> MVDefinition {
+    MVDefinition {
+        original_query: "SELECT number FROM source_table".to_string(),
+        query: format!("SELECT number FROM default.{db_name}.source_table"),
+    }
+}
+
+fn table_meta_update_req(
+    table: &TableInfo,
+    new_table_meta: TableMeta,
+) -> (UpdateTableMetaReq, TableInfo) {
+    (
+        UpdateTableMetaReq {
+            table_id: table.ident.table_id,
+            seq: MatchSeq::Exact(table.ident.seq),
+            new_table_meta,
+            base_snapshot_location: None,
+            lvt_check: None,
+        },
+        table.clone(),
+    )
+}
+
 fn summarize_lock_meta(meta: &LockMeta) -> LockMetaSummary {
     LockMetaSummary {
         user: meta.user.clone(),
@@ -244,6 +303,122 @@ fn summarize_locks(locks: &[LockInfo]) -> Vec<LockSummary> {
 pub struct SchemaApiTestSuite {}
 
 impl SchemaApiTestSuite {
+    async fn create_test_table<MT>(
+        &self,
+        mt: &MT,
+        util: &DbTableHarness<'_, MT>,
+        name: &str,
+        create_option: CreateOption,
+        engine: &str,
+        as_dropped: bool,
+    ) -> Result<CreateTableReply, KVAppError>
+    where
+        MT: kvapi::KVApi<Error = MetaError> + TableApi,
+    {
+        mt.create_table(CreateTableReq {
+            create_option,
+            catalog_name: (create_option == CreateOption::CreateOrReplace)
+                .then(|| "default".to_string()),
+            name_ident: TableNameIdent::new(util.tenant(), util.db_name(), name),
+            table_meta: TableMeta {
+                schema: util.schema(),
+                engine: engine.to_string(),
+                drop_on: as_dropped.then(Utc::now),
+                ..TableMeta::default()
+            },
+            as_dropped,
+            table_properties: None,
+            table_partition: None,
+        })
+        .await
+    }
+
+    async fn stage_materialized_view<MT>(
+        &self,
+        mt: &MT,
+        util: &DbTableHarness<'_, MT>,
+        name: &str,
+        create_option: CreateOption,
+        source_table_id: u64,
+    ) -> anyhow::Result<StagedMaterializedView>
+    where
+        MT: kvapi::KVApi<Error = MetaError> + TableApi,
+    {
+        let tenant = util.tenant();
+        let create = self
+            .create_test_table(
+                mt,
+                util,
+                name,
+                create_option,
+                MATERIALIZED_VIEW_ENGINE,
+                true,
+            )
+            .await?;
+        let mv_id = MVId::new(create.table_id);
+
+        Ok(StagedMaterializedView {
+            mv_id,
+            prev_mv_id: create.prev_table_id.map(MVId::new),
+            meta_ident: MVMetaIdent::new_generic(tenant.clone(), mv_id),
+            definition_ident: MVDefinitionIdent::new_generic(tenant.clone(), mv_id),
+            source_index_ident: MVSourceIndexIdent::new_generic(tenant, source_table_id),
+            orphan_ident: TableIdHistoryIdent {
+                database_id: create.db_id,
+                table_name: create
+                    .orphan_table_name
+                    .ok_or_else(|| anyhow::anyhow!("MV CTAS must have an orphan cleanup record"))?,
+            },
+        })
+    }
+
+    async fn commit_staged_materialized_view<MT>(
+        &self,
+        mt: &MT,
+        staged: &StagedMaterializedView,
+        mv_meta: &MVMeta,
+        definition: &MVDefinition,
+    ) -> anyhow::Result<Option<MVId>>
+    where
+        MT: kvapi::KVApi<Error = MetaError> + MaterializedViewApi,
+    {
+        Ok(mt
+            .commit_materialized_view(
+                &staged.meta_ident,
+                staged.prev_mv_id,
+                &staged.orphan_ident,
+                mv_meta,
+                definition,
+            )
+            .await??)
+    }
+
+    async fn create_mv_test_db<'a, MT>(
+        &self,
+        mt: &'a MT,
+        case: &str,
+    ) -> anyhow::Result<(DbTableHarness<'a, MT>, u64, u64)>
+    where
+        MT: kvapi::KVApi<Error = MetaError> + DatabaseApi + TableApi,
+    {
+        let mut util = DbTableHarness::new(
+            mt,
+            format!("tenant_mv_{case}"),
+            format!("db_mv_{case}"),
+            "source_table",
+            "FUSE",
+        );
+        util.create_db().await?;
+        let (source_table_id, _) = util.create_table().await?;
+        let source_seq = mt
+            .get_table_by_id(source_table_id)
+            .await?
+            .expect("source TableMeta must exist")
+            .seq;
+
+        Ok((util, source_table_id, source_seq))
+    }
+
     /// Test SchemaAPI on a single node
     pub async fn test_single_node<B, MT>(b: B) -> anyhow::Result<()>
     where
@@ -256,6 +431,7 @@ impl SchemaApiTestSuite {
             + GarbageCollectionApi
             + IndexApi
             + LockApi2
+            + MaterializedViewApi
             + SecurityApi
             + DatamaskApi
             + SequenceApi
@@ -304,6 +480,7 @@ impl SchemaApiTestSuite {
             + DatabaseApi
             + TableApi
             + GarbageCollectionApi
+            + MaterializedViewApi
             + 'static,
     {
         self.table_commit_table_meta(&b.build().await).await?;
@@ -311,6 +488,7 @@ impl SchemaApiTestSuite {
         self.database_drop_out_of_retention_time_history(&b.build().await)
             .await?;
         self.table_create_get_drop(&b.build().await).await?;
+        self.materialized_view_metadata(&b.build().await).await?;
         self.table_drop_without_db_id_to_name(&b.build().await)
             .await?;
         self.list_db_without_db_id_list(&b.build().await).await?;
@@ -451,7 +629,7 @@ impl SchemaApiTestSuite {
     pub async fn test_cluster<B, MT>(b: B) -> anyhow::Result<()>
     where
         B: kvapi::ApiBuilder<MT>,
-        MT: kvapi::KVApi<Error = MetaError> + DatabaseApi + TableApi,
+        MT: kvapi::KVApi<Error = MetaError> + DatabaseApi + MaterializedViewApi + TableApi,
     {
         let suite = SchemaApiTestSuite {};
 
@@ -1643,6 +1821,630 @@ impl SchemaApiTestSuite {
                 }
                 other => panic!("unexpected undrop error: {other:?}"),
             }
+        }
+
+        Ok(())
+    }
+
+    async fn materialized_view_metadata<
+        MT: kvapi::KVApi<Error = MetaError>
+            + DatabaseApi
+            + GarbageCollectionApi
+            + MaterializedViewApi
+            + TableApi,
+    >(
+        &self,
+        mt: &MT,
+    ) -> anyhow::Result<()> {
+        // Publish, guard the table/MV type boundary, replace, drop, and GC.
+        {
+            let (mut util, source_table_id, source_seq) =
+                self.create_mv_test_db(mt, "meta").await?;
+            let tenant = util.tenant();
+            let db_id = *util.db_id();
+
+            let mv_name = "mv_table";
+            let staged_mv = self
+                .stage_materialized_view(mt, &util, mv_name, CreateOption::Create, source_table_id)
+                .await?;
+
+            let mv_meta = new_mv_meta(source_table_id, source_seq);
+            let definition = new_mv_definition(&util.db_name());
+            let mv_id = staged_mv.mv_id;
+            let mv_meta_ident = staged_mv.meta_ident.clone();
+            let definition_ident = staged_mv.definition_ident.clone();
+            self.commit_staged_materialized_view(mt, &staged_mv, &mv_meta, &definition)
+                .await?
+                .expect("MV target must remain unchanged while publishing");
+
+            let stored = mt
+                .get_mv_meta(&mv_meta_ident)
+                .await?
+                .expect("MVMeta must be published with the MV");
+            assert_eq!(stored.data, mv_meta);
+            assert_eq!(
+                mt.get_mv_definition(&definition_ident)
+                    .await?
+                    .expect("MVDefinition must be published with the MV")
+                    .data,
+                definition
+            );
+            assert!(
+                mt.get_pb(&staged_mv.orphan_ident).await?.is_none(),
+                "committing the MV must remove its CTAS orphan record"
+            );
+
+            let source_index_ident = staged_mv.source_index_ident.clone();
+            assert_eq!(
+                mt.get_pb(&source_index_ident)
+                    .await?
+                    .expect("source index must exist")
+                    .data
+                    .mv_ids(),
+                &[mv_id]
+            );
+            let history_ident = TableIdHistoryIdent {
+                database_id: db_id,
+                table_name: mv_name.to_string(),
+            };
+
+            // Generic CREATE OR REPLACE must not cross the MATERIALIZED VIEW
+            // boundary. This check lives in TableApi so an interpreter-side lookup
+            // can not be invalidated before the metadata transaction commits.
+            let replace_mv_with_table_err = self
+                .create_test_table(
+                    mt,
+                    &util,
+                    mv_name,
+                    CreateOption::CreateOrReplace,
+                    "FUSE",
+                    false,
+                )
+                .await
+                .expect_err("a generic table transaction must not replace an MV");
+            assert!(matches!(
+                replace_mv_with_table_err,
+                KVAppError::AppError(AppError::MaterializedViewReplacementConflict(_))
+            ));
+            assert_eq!(
+                mt.get_table(GetTableReq::new(&tenant, util.db_name(), mv_name))
+                    .await?
+                    .ident
+                    .table_id,
+                *mv_id
+            );
+
+            let regular_name = "regular_table";
+            let regular_create = self
+                .create_test_table(mt, &util, regular_name, CreateOption::Create, "FUSE", false)
+                .await?;
+            let replace_table_with_mv_err = self
+                .create_test_table(
+                    mt,
+                    &util,
+                    regular_name,
+                    CreateOption::CreateOrReplace,
+                    MATERIALIZED_VIEW_ENGINE,
+                    true,
+                )
+                .await
+                .expect_err("an MV transaction must not replace a regular table");
+            assert!(matches!(
+                replace_table_with_mv_err,
+                KVAppError::AppError(AppError::MaterializedViewReplacementConflict(_))
+            ));
+            assert_eq!(
+                mt.get_table(GetTableReq::new(&tenant, util.db_name(), regular_name))
+                    .await?
+                    .ident
+                    .table_id,
+                regular_create.table_id
+            );
+
+            // Reproduce the CTAS race deterministically: stage a regular table,
+            // publish an MV with the same name, then try to publish the staged
+            // regular table. The final commit must reject the cross-type replace.
+            let ctas_race_name = "ctas_race_mv";
+            let ctas_race_name_ident = TableNameIdent::new(&tenant, util.db_name(), ctas_race_name);
+            let staged_table = self
+                .create_test_table(
+                    mt,
+                    &util,
+                    ctas_race_name,
+                    CreateOption::CreateOrReplace,
+                    "FUSE",
+                    true,
+                )
+                .await?;
+            let racing_mv = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    ctas_race_name,
+                    CreateOption::Create,
+                    source_table_id,
+                )
+                .await?;
+            self.commit_staged_materialized_view(mt, &racing_mv, &mv_meta, &definition)
+                .await?
+                .expect("racing MV target must remain unchanged while publishing");
+
+            let staged_table_orphan_ident = TableIdHistoryIdent {
+                database_id: db_id,
+                table_name: staged_table
+                    .orphan_table_name
+                    .clone()
+                    .expect("regular CTAS must have an orphan cleanup record"),
+            };
+            let ctas_commit_err = mt
+                .commit_table_meta(CommitTableMetaReq {
+                    name_ident: ctas_race_name_ident,
+                    db_id,
+                    table_id: staged_table.table_id,
+                    prev_table_id: staged_table.prev_table_id,
+                    orphan_table_name: staged_table.orphan_table_name,
+                })
+                .await
+                .expect_err("CTAS commit must not replace an MV published after staging");
+            assert!(matches!(
+                ctas_commit_err,
+                KVAppError::AppError(AppError::MaterializedViewReplacementConflict(_))
+            ));
+            assert_eq!(
+                mt.get_table(GetTableReq::new(&tenant, util.db_name(), ctas_race_name))
+                    .await?
+                    .ident
+                    .table_id,
+                *racing_mv.mv_id
+            );
+            assert!(mt.get_pb(&staged_table_orphan_ident).await?.is_some());
+            mt.drop_materialized_view(&racing_mv.meta_ident)
+                .await?
+                .expect("racing MV must be dropped");
+            assert_eq!(
+                mt.get_pb(&source_index_ident)
+                    .await?
+                    .expect("source index must retain the first MV")
+                    .data
+                    .mv_ids(),
+                &[mv_id]
+            );
+
+            let replacement = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    mv_name,
+                    CreateOption::CreateOrReplace,
+                    source_table_id,
+                )
+                .await?;
+            assert_eq!(replacement.prev_mv_id, Some(mv_id));
+            let replacement_id = replacement.mv_id;
+            self.commit_staged_materialized_view(mt, &replacement, &mv_meta, &MVDefinition {
+                original_query: "SELECT number + 1 FROM source_table".to_string(),
+                query: "SELECT number + 1 FROM default.db_mv_meta.source_table".to_string(),
+            })
+            .await?
+            .expect("replacement MV target must remain unchanged while publishing");
+
+            assert!(mt.get_pb(&mv_meta_ident).await?.is_none());
+            assert!(mt.get_pb(&definition_ident).await?.is_none());
+            let replacement_source_index = replacement.source_index_ident.clone();
+            assert_eq!(source_index_ident, replacement_source_index);
+            assert_eq!(
+                mt.get_pb(&replacement_source_index)
+                    .await?
+                    .expect("source index must contain the replacement")
+                    .data
+                    .mv_ids(),
+                &[replacement_id]
+            );
+            let replacement_definition_ident = replacement.definition_ident.clone();
+            assert!(mt.get_pb(&replacement_definition_ident).await?.is_some());
+            let replaced_mv_tombstone = MarkedDeletedMVIdent::new_generic(
+                tenant.clone(),
+                MarkedDeletedMVId::new(db_id, mv_id),
+            );
+            assert!(mt.get_pb(&replaced_mv_tombstone).await?.is_some());
+            let dropped = mt
+                .get_drop_table_infos(ListDroppedTableReq::new(&tenant).with_db(util.db_name()))
+                .await?;
+            assert!(dropped.drop_ids.iter().any(|drop_id| {
+                matches!(drop_id, DroppedId::Table { id, .. } if id.table_id == *mv_id)
+            }));
+
+            // A source drop must not remove the dependency index. The MV lifecycle
+            // owns it, so missing-source handling remains a refresh/rewrite concern.
+            util.drop_table_by_id().await?;
+            mt.upsert_pb(&UpsertPB::delete(TableId::new(source_table_id)))
+                .await?;
+            assert!(mt.get_pb(&replacement_source_index).await?.is_some());
+
+            mt.drop_materialized_view(&replacement.meta_ident)
+                .await?
+                .expect("replacement MV must be dropped");
+
+            assert!(mt.get_mv_meta(&replacement.meta_ident).await?.is_none());
+            assert!(mt.get_pb(&replacement_definition_ident).await?.is_none());
+            assert!(mt.get_pb(&replacement_source_index).await?.is_none());
+            assert!(
+                mt.get_pb(&history_ident).await?.is_none(),
+                "DROP MATERIALIZED VIEW must not create table history"
+            );
+            let dropped_mv_tombstone = MarkedDeletedMVIdent::new_generic(
+                tenant.clone(),
+                MarkedDeletedMVId::new(db_id, replacement_id),
+            );
+            assert!(mt.get_pb(&dropped_mv_tombstone).await?.is_some());
+            let dropped = mt
+                .get_drop_table_infos(ListDroppedTableReq::new(&tenant).with_db(util.db_name()))
+                .await?;
+            assert!(dropped.drop_ids.iter().any(|drop_id| {
+                matches!(drop_id, DroppedId::Table { id, .. } if id.table_id == *replacement_id)
+            }));
+            mt.gc_drop_tables(GcDroppedTableReq {
+                tenant: tenant.clone(),
+                catalog: "default".to_string(),
+                drop_ids: dropped.drop_ids,
+            })
+            .await?;
+            assert!(mt.get_pb(&replaced_mv_tombstone).await?.is_none());
+            assert!(mt.get_pb(&dropped_mv_tombstone).await?.is_none());
+            assert!(
+                mt.get_table_by_id(*mv_id).await?.is_none(),
+                "vacuum metadata GC must remove the replaced MV TableMeta"
+            );
+            assert!(
+                mt.get_table_by_id(*replacement_id).await?.is_none(),
+                "vacuum metadata GC must remove the dropped MV TableMeta"
+            );
+            let undrop_err = mt
+                .undrop_table(UndropTableReq {
+                    name_ident: TableNameIdent::new(&tenant, util.db_name(), mv_name),
+                })
+                .await
+                .expect_err("materialized views do not support UNDROP");
+            assert!(matches!(
+                undrop_err,
+                KVAppError::AppError(AppError::UndropTableHasNoHistory(_))
+            ));
+        }
+
+        // Dropping a database must also collect its history-free MV metadata.
+        {
+            let (util, source_table_id, source_seq) =
+                self.create_mv_test_db(mt, "database_gc").await?;
+            let tenant = util.tenant();
+            let db_id = *util.db_id();
+
+            let mv_name = "mv_in_dropped_database";
+            let staged_mv = self
+                .stage_materialized_view(mt, &util, mv_name, CreateOption::Create, source_table_id)
+                .await?;
+            self.commit_staged_materialized_view(
+                mt,
+                &staged_mv,
+                &new_mv_meta(source_table_id, source_seq),
+                &new_mv_definition(&util.db_name()),
+            )
+            .await?
+            .expect("database GC MV target must remain unchanged while publishing");
+
+            mt.drop_database(DropDatabaseReq {
+                if_exists: false,
+                name_ident: DatabaseNameIdent::new(&tenant, util.db_name()),
+            })
+            .await?;
+
+            let dropped = mt
+                .get_drop_table_infos(ListDroppedTableReq::new(&tenant))
+                .await?;
+            let dropped_table_ids = dropped
+                .drop_ids
+                .iter()
+                .filter_map(|drop_id| match drop_id {
+                    DroppedId::Table { id, .. } => Some(id.table_id),
+                    DroppedId::Db { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(dropped_table_ids.len(), 2);
+            assert_eq!(
+                dropped_table_ids.into_iter().collect::<HashSet<_>>(),
+                HashSet::from([source_table_id, *staged_mv.mv_id]),
+                "database GC must enumerate the history-backed source table and history-free MV once"
+            );
+            assert!(dropped.drop_ids.iter().any(|drop_id| {
+            matches!(drop_id, DroppedId::Db { db_id: dropped_db_id, .. } if *dropped_db_id == db_id)
+        }));
+
+            mt.gc_drop_tables(GcDroppedTableReq {
+                tenant: tenant.clone(),
+                catalog: "default".to_string(),
+                drop_ids: dropped.drop_ids,
+            })
+            .await?;
+
+            assert!(mt.get_pb(&staged_mv.meta_ident).await?.is_none());
+            assert!(mt.get_pb(&staged_mv.definition_ident).await?.is_none());
+            assert!(mt.get_pb(&staged_mv.source_index_ident).await?.is_none());
+            assert!(mt.get_pb(&TableId::new(source_table_id)).await?.is_none());
+            assert!(mt.get_pb(&TableId::new(*staged_mv.mv_id)).await?.is_none());
+            assert!(
+                mt.get_pb(&TableIdToName {
+                    table_id: *staged_mv.mv_id,
+                })
+                .await?
+                .is_none()
+            );
+        }
+
+        // Concurrent commits must not lose either source-index update.
+        {
+            let (util, source_table_id, source_seq) =
+                self.create_mv_test_db(mt, "concurrent_index").await?;
+
+            let first = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    "mv_first",
+                    CreateOption::Create,
+                    source_table_id,
+                )
+                .await?;
+            let second = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    "mv_second",
+                    CreateOption::Create,
+                    source_table_id,
+                )
+                .await?;
+            assert_eq!(first.source_index_ident, second.source_index_ident);
+
+            let mv_meta = new_mv_meta(source_table_id, source_seq);
+            let first_definition = new_mv_definition(&util.db_name());
+            let second_definition = first_definition.clone();
+
+            let (first_result, second_result) = futures::future::join(
+                mt.commit_materialized_view(
+                    &first.meta_ident,
+                    first.prev_mv_id,
+                    &first.orphan_ident,
+                    &mv_meta,
+                    &first_definition,
+                ),
+                mt.commit_materialized_view(
+                    &second.meta_ident,
+                    second.prev_mv_id,
+                    &second.orphan_ident,
+                    &mv_meta,
+                    &second_definition,
+                ),
+            )
+            .await;
+            first_result??.expect("first concurrent MV must be published");
+            second_result??.expect("second concurrent MV must be published after retry");
+
+            assert_eq!(
+                mt.get_pb(&first.source_index_ident)
+                    .await?
+                    .expect("source index must contain both concurrent MVs")
+                    .data
+                    .mv_ids(),
+                &[first.mv_id, second.mv_id]
+            );
+        }
+
+        // Source, MV table, and MVMeta updates must commit atomically.
+        {
+            let (util, source_table_id, _) = self.create_mv_test_db(mt, "atomic_update").await?;
+            let tenant = util.tenant();
+            let source = util.get_table().await?;
+
+            let mv_name = "mv_table";
+            let staged_mv = self
+                .stage_materialized_view(mt, &util, mv_name, CreateOption::Create, source_table_id)
+                .await?;
+            let mut initial_mv_meta = new_mv_meta(source_table_id, source.ident.seq);
+            initial_mv_meta.last_refresh_time = None;
+            self.commit_staged_materialized_view(
+                mt,
+                &staged_mv,
+                &initial_mv_meta,
+                &new_mv_definition(&util.db_name()),
+            )
+            .await?
+            .expect("MV target must remain unchanged while publishing");
+
+            let mv = mt
+                .get_table(GetTableReq::new(&tenant, util.db_name(), mv_name))
+                .await?;
+            let stored_mv_meta = mt
+                .get_mv_meta(&staged_mv.meta_ident)
+                .await?
+                .expect("MVMeta must exist");
+            let source_index = mt
+                .get_pb(&staged_mv.source_index_ident)
+                .await?
+                .expect("source index must exist");
+
+            let mut new_source_meta = source.meta.clone();
+            new_source_meta.comment = "source committed".to_string();
+            let mut new_mv_table_meta = mv.meta.clone();
+            new_mv_table_meta.comment = "mv committed".to_string();
+            let new_mv_meta = MVMeta {
+                source_progress: SourceProgress {
+                    table_meta_seq: source.ident.seq + 1,
+                    snapshot_location: Some("source-snapshot".to_string()),
+                },
+                state: MVState::Valid,
+                last_refresh_time: Some(Utc::now()),
+                ..stored_mv_meta.data.clone()
+            };
+
+            mt.update_multi_table_meta(UpdateMultiTableMetaReq {
+                update_table_metas: vec![
+                    table_meta_update_req(&source, new_source_meta.clone()),
+                    table_meta_update_req(&mv, new_mv_table_meta.clone()),
+                ],
+                update_mv_metas: vec![UpdateMVMetaReq {
+                    ident: staged_mv.meta_ident.clone(),
+                    mv_meta_seq: MatchSeq::Exact(stored_mv_meta.seq),
+                    new_mv_meta: new_mv_meta.clone(),
+                }],
+                mv_source_index_conditions: vec![MVSourceIndexCondition {
+                    ident: staged_mv.source_index_ident.clone(),
+                    source_index_seq: source_index.seq,
+                }],
+                ..Default::default()
+            })
+            .await?
+            .expect("base table, MV table, and MVMeta must commit together");
+
+            let committed_source = util.get_table().await?;
+            let committed_mv = mt
+                .get_table(GetTableReq::new(&tenant, util.db_name(), mv_name))
+                .await?;
+            let committed_mv_meta = mt
+                .get_mv_meta(&staged_mv.meta_ident)
+                .await?
+                .expect("MVMeta must still exist");
+            assert_eq!(committed_source.meta, new_source_meta);
+            assert_eq!(committed_mv.meta, new_mv_table_meta);
+            assert_eq!(committed_mv_meta.data, new_mv_meta);
+
+            let mut rejected_source_meta = committed_source.meta.clone();
+            rejected_source_meta.comment = "source must not commit".to_string();
+            let mut rejected_mv_table_meta = committed_mv.meta.clone();
+            rejected_mv_table_meta.comment = "mv must not commit".to_string();
+            let mut rejected_mv_meta = committed_mv_meta.data.clone();
+            rejected_mv_meta.state = MVState::Failed;
+            rejected_mv_meta.last_refresh_error = Some("must not commit".to_string());
+
+            let mut changed_source_index = source_index.data.clone();
+            changed_source_index.add(MVId::new(u64::MAX));
+            mt.upsert_pb(&UpsertPB::update(
+                staged_mv.source_index_ident.clone(),
+                changed_source_index,
+            ))
+            .await?;
+
+            let err = mt
+                .update_multi_table_meta(UpdateMultiTableMetaReq {
+                    update_table_metas: vec![
+                        table_meta_update_req(&committed_source, rejected_source_meta),
+                        table_meta_update_req(&committed_mv, rejected_mv_table_meta),
+                    ],
+                    update_mv_metas: vec![UpdateMVMetaReq {
+                        ident: staged_mv.meta_ident.clone(),
+                        mv_meta_seq: MatchSeq::Exact(committed_mv_meta.seq),
+                        new_mv_meta: rejected_mv_meta,
+                    }],
+                    mv_source_index_conditions: vec![MVSourceIndexCondition {
+                        ident: staged_mv.source_index_ident.clone(),
+                        source_index_seq: source_index.seq,
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .expect_err("a stale source-index version must reject the entire update");
+            assert!(matches!(
+                err,
+                KVAppError::AppError(AppError::MultiStatementTxnCommitFailed(_))
+            ));
+
+            assert_eq!(util.get_table().await?.meta, new_source_meta);
+            assert_eq!(
+                mt.get_table(GetTableReq::new(&tenant, util.db_name(), mv_name))
+                    .await?
+                    .meta,
+                new_mv_table_meta
+            );
+            assert_eq!(
+                mt.get_mv_meta(&staged_mv.meta_ident)
+                    .await?
+                    .expect("MVMeta must still exist")
+                    .data,
+                new_mv_meta
+            );
+        }
+
+        // Failed publication must preserve the staged orphan for later GC.
+        {
+            let (util, source_table_id, source_seq) = self.create_mv_test_db(mt, "failure").await?;
+            let tenant = util.tenant();
+            let db_id = *util.db_id();
+
+            let stale_name = "mv_stale_source";
+            let stale_mv = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    stale_name,
+                    CreateOption::Create,
+                    source_table_id,
+                )
+                .await?;
+            let committed = self
+                .commit_staged_materialized_view(
+                    mt,
+                    &stale_mv,
+                    &new_mv_meta(source_table_id, source_seq + 1),
+                    &new_mv_definition(&util.db_name()),
+                )
+                .await?;
+            assert!(
+                committed.is_none(),
+                "a changed source seq must skip MV publication"
+            );
+            assert!(mt.get_pb(&stale_mv.source_index_ident).await?.is_none());
+            assert!(
+                mt.get_table_by_id(*stale_mv.mv_id)
+                    .await?
+                    .expect("failed publication keeps the orphan table")
+                    .data
+                    .drop_on
+                    .is_some()
+            );
+            let dropped = mt
+                .get_drop_table_infos(ListDroppedTableReq::new(&tenant).with_db(util.db_name()))
+                .await?;
+            assert!(dropped.drop_ids.iter().any(|drop_id| {
+                matches!(drop_id, DroppedId::Table { id, .. } if id.table_id == *stale_mv.mv_id)
+            }));
+
+            let mv_meta = new_mv_meta(source_table_id, source_seq);
+            let definition = new_mv_definition(&util.db_name());
+            let changed_target_name = "mv_changed_target";
+            let changed_target_mv = self
+                .stage_materialized_view(
+                    mt,
+                    &util,
+                    changed_target_name,
+                    CreateOption::Create,
+                    source_table_id,
+                )
+                .await?;
+            let changed_target_name_ident = DBIdTableName::new(db_id, changed_target_name);
+            mt.upsert_pb(&UpsertPB::insert(
+                changed_target_name_ident.clone(),
+                TableId::new(source_table_id),
+            ))
+            .await?;
+
+            let committed = self
+                .commit_staged_materialized_view(mt, &changed_target_mv, &mv_meta, &definition)
+                .await?;
+            assert!(
+                committed.is_none(),
+                "a changed target name mapping must skip MV publication"
+            );
+            assert!(mt.get_pb(&changed_target_mv.orphan_ident).await?.is_some());
+            mt.upsert_pb(&UpsertPB::delete(changed_target_name_ident))
+                .await?;
         }
 
         Ok(())
@@ -5830,6 +6632,50 @@ impl SchemaApiTestSuite {
                 orphan_table_name: create_table_as_dropped_resp.orphan_table_name.clone(),
             };
             mt.commit_table_meta(commit_table_req).await?;
+        }
+
+        // A regular CTAS created after DROP must continue from table history.
+        {
+            let table_name = "ctas_after_drop";
+            let name_ident = TableNameIdent {
+                tenant: util.tenant(),
+                db_name: db_name.to_string(),
+                table_name: table_name.to_string(),
+            };
+            let create = self
+                .create_test_table(mt, &util, table_name, CreateOption::Create, "JSON", false)
+                .await?;
+            mt.drop_table_by_id(DropTableByIdReq {
+                if_exists: false,
+                tenant: util.tenant(),
+                tb_id: create.table_id,
+                table_name: table_name.to_string(),
+                db_id: *db_id,
+                db_name: db_name.to_string(),
+                engine: "JSON".to_string(),
+                temp_prefix: String::new(),
+            })
+            .await?;
+
+            let staged = self
+                .create_test_table(mt, &util, table_name, CreateOption::Create, "JSON", true)
+                .await?;
+            assert_eq!(staged.prev_table_id, Some(create.table_id));
+            mt.commit_table_meta(CommitTableMetaReq {
+                name_ident: name_ident.clone(),
+                db_id: staged.db_id,
+                table_id: staged.table_id,
+                prev_table_id: staged.prev_table_id,
+                orphan_table_name: staged.orphan_table_name,
+            })
+            .await?;
+            assert_eq!(
+                mt.get_table(GetTableReq::new(&util.tenant(), db_name, table_name))
+                    .await?
+                    .ident
+                    .table_id,
+                staged.table_id
+            );
         }
 
         // verify the orphan table id list will be vacuum

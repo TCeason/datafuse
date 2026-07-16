@@ -4587,6 +4587,7 @@ dependencies = [
  "databend-common-proto-conv",
  "databend-meta-client 260205.14.0",
  "fastrace",
+ "futures",
  "log",
  "maplit",
 ]
