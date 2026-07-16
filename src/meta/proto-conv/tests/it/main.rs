@@ -172,3 +172,4 @@ mod v177_arrow_file_format_params;
 mod v178_storage_config;
 mod v179_task_delete_task_id;
 mod v180_paimon_catalog_option;
+mod v180_materialized_view_meta;
