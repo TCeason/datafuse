@@ -305,7 +305,8 @@ pub fn reduce_cluster_statistics<T: Borrow<Option<ClusterStatistics>>>(
                 .map(Scalar::as_ref)
                 .cmp(y.iter().map(Scalar::as_ref))
         })
-        .unwrap();
+        .unwrap()
+        .clone();
     let max = max_stats
         .into_iter()
         .max_by(|x, y| {
@@ -313,16 +314,11 @@ pub fn reduce_cluster_statistics<T: Borrow<Option<ClusterStatistics>>>(
                 .map(Scalar::as_ref)
                 .cmp(y.iter().map(Scalar::as_ref))
         })
-        .unwrap();
+        .unwrap()
+        .clone();
     let level = levels.into_iter().max().unwrap_or(0);
 
-    Some(ClusterStatistics::new(
-        cluster_key_id,
-        min.clone(),
-        max.clone(),
-        level,
-        None,
-    ))
+    Some(ClusterStatistics::new(cluster_key_id, min, max, level))
 }
 
 pub fn merge_statistics(

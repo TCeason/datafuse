@@ -142,6 +142,14 @@ async fn test_binder_clauses_and_ordering() -> Result<()> {
             sql: "SELECT number FROM t HAVING count(*) > 0",
         },
         SqlTestCase {
+            name: "having_aggregate_reuses_select_alias_name_as_input_column",
+            description: "A HAVING aggregate argument should resolve to the input column even when a SELECT aggregate has the same alias.",
+            setup_sqls: &[
+                "CREATE TABLE t(creative_name String, impressions UInt64, clicks UInt64, cost UInt64, installs UInt64)",
+            ],
+            sql: "SELECT creative_name, sum(cost) AS cost FROM t GROUP BY creative_name HAVING sum(impressions) > 0 OR sum(clicks) > 0 OR sum(cost) > 0 OR sum(installs) > 0",
+        },
+        SqlTestCase {
             name: "order_by_can_introduce_aggregate_in_aggregate_query",
             description: "ORDER BY may introduce a new aggregate expression when the query is already aggregated.",
             setup_sqls: &["CREATE TABLE t(number UInt64)"],
@@ -445,6 +453,12 @@ async fn test_binder_named_window_paths() -> Result<()> {
             sql: "SELECT depname, sum(sum(salary)) OVER w FROM empsalary GROUP BY depname",
         },
         SqlTestCase {
+            name: "named_window_rejects_duplicate_name",
+            description: "A WINDOW clause must reject duplicate names instead of silently keeping the later definition.",
+            setup_sqls: &["CREATE TABLE empsalary(depname String, salary UInt64)"],
+            sql: "SELECT rank() OVER w FROM empsalary WINDOW w AS (PARTITION BY depname), W AS (ORDER BY salary)",
+        },
+        SqlTestCase {
             name: "inherited_named_window_rejects_partition_override",
             description: "Referencing a named window must not add a new PARTITION BY clause.",
             setup_sqls: &["CREATE TABLE empsalary(depname String, salary UInt64)"],
@@ -565,6 +579,14 @@ async fn test_binder_grouping_and_srf_paths() -> Result<()> {
             description: "A non-window WITHIN GROUP aggregate should register its sort descriptors in the aggregate phase.",
             setup_sqls: &["CREATE TABLE empsalary(empno UInt64, salary UInt64)"],
             sql: "SELECT listagg(cast(salary as varchar), '|') WITHIN GROUP (ORDER BY empno DESC) FROM empsalary",
+        },
+        SqlTestCase {
+            name: "grouping_sets_select_alias_with_grouping_func_does_not_shadow_column",
+            description: "A SELECT alias containing grouping() must not shadow the underlying column in GROUPING SETS items.",
+            setup_sqls: &[
+                "CREATE TABLE events(category_id UInt64, label String, amount Decimal(18,6))",
+            ],
+            sql: "SELECT if(grouping(category_id)=1, 0, category_id) AS category_id, label, sum(amount) FROM events GROUP BY GROUPING SETS ((label), (category_id, label))",
         },
     ];
 

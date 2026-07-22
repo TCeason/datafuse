@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -35,9 +34,7 @@ use databend_common_expression::types::TimestampType;
 use databend_common_expression::types::VariantType;
 use databend_common_sql::analyze_cluster_keys;
 use databend_common_sql::parse_cluster_keys;
-use databend_storages_common_table_meta::meta::CompactSegmentInfo;
 use databend_storages_common_table_meta::meta::SegmentInfo;
-use databend_storages_common_table_meta::table::ClusterType;
 use jsonb::Value as JsonbValue;
 use serde::Deserialize;
 use serde::Serialize;
@@ -46,8 +43,10 @@ use crate::FuseTable;
 use crate::Table;
 use crate::io::SegmentsIO;
 use crate::sessions::TableContext;
+use crate::statistics::BlockOverlapDepth;
 use crate::statistics::calculate_block_overlap_depths;
 use crate::statistics::get_min_max_stats;
+use crate::statistics::prepare_cluster_key_exprs;
 use crate::table_functions::SimpleArgFunc;
 use crate::table_functions::SimpleArgFuncTemplate;
 use crate::table_functions::parse_db_tb_opt_args;
@@ -154,8 +153,7 @@ impl<'a> ClusteringInformationImpl<'a> {
         &self,
         cluster_key: &Option<String>,
     ) -> Result<ClusteringInformationResponse> {
-        match (self.table.cluster_type(), cluster_key) {
-            (Some(ClusterType::Hilbert), None) => self.get_hilbert_clustering_info().await,
+        match (self.table.cluster_key_meta(), cluster_key) {
             (None, None) => Err(ErrorCode::UnclusteredTable(format!(
                 "Unclustered table {}",
                 self.table.table_info.desc,
@@ -223,6 +221,22 @@ impl<'a> ClusteringInformationImpl<'a> {
         let snapshot = snapshot.unwrap();
 
         let schema = self.table.schema();
+        let scalar_exprs = exprs
+            .into_iter()
+            .filter(|expr| !matches!(expr.data_type().remove_nullable(), DataType::Vector(_)))
+            .collect::<Vec<_>>();
+        let scalar_cluster_key_types = scalar_exprs
+            .iter()
+            .map(|v| {
+                let data_type = v.data_type();
+                if matches!(*data_type, DataType::String) {
+                    data_type.wrap_nullable()
+                } else {
+                    data_type.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let prepared_cluster_key_exprs = prepare_cluster_key_exprs(&scalar_exprs, schema.as_ref());
 
         let mut ranges = Vec::with_capacity(snapshot.summary.block_count as usize);
         let mut constant_block_count = 0;
@@ -237,14 +251,14 @@ impl<'a> ClusteringInformationImpl<'a> {
         for chunk in snapshot.segments.chunks(chunk_size) {
             let segments: Vec<Result<SegmentInfo>> = segments_io.read_segments(chunk, true).await?;
 
-            for segment in segments.into_iter().flatten() {
+            for segment in segments {
+                let segment = segment?;
                 for block in segment.blocks {
                     let (min, max) = get_min_max_stats(
-                        &exprs,
+                        &prepared_cluster_key_exprs,
                         &block.col_stats,
                         block.cluster_stats.as_ref(),
                         default_cluster_key_id,
-                        schema.as_ref(),
                     );
                     assert_eq!(min.len(), max.len());
                     if min == max {
@@ -256,25 +270,34 @@ impl<'a> ClusteringInformationImpl<'a> {
         }
         drop(snapshot);
 
-        let cluster_key_types = exprs
-            .into_iter()
-            .map(|v| {
-                let data_type = v.data_type();
-                if matches!(*data_type, DataType::String) {
-                    data_type.wrap_nullable()
-                } else {
-                    data_type.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-        let stats = calculate_block_overlap_depths(&ranges, &cluster_key_types)?;
+        let stats = if scalar_cluster_key_types.is_empty() {
+            vec![BlockOverlapDepth::default(); ranges.len()]
+        } else {
+            calculate_block_overlap_depths(&ranges, &scalar_cluster_key_types)?
+        };
+        if stats.is_empty() {
+            return Ok(ClusteringInformationResponse {
+                cluster_key,
+                cluster_type,
+                timestamp,
+                info: serde_json::to_value(LinerClusterStatistics {
+                    total_block_count,
+                    ..Default::default()
+                })?,
+            });
+        }
 
         let mut sum_overlap = 0;
         let mut sum_depth = 0;
         let length = stats.len();
-        let mp = stats.into_iter().fold(BTreeMap::new(), |mut acc, stat| {
+        let mut depth_counts = BTreeMap::new();
+        let bucket_counts = stats.into_iter().fold(BTreeMap::new(), |mut acc, stat| {
             sum_overlap += stat.overlap;
             sum_depth += stat.depth;
+            depth_counts
+                .entry(stat.depth)
+                .and_modify(|v| *v += 1)
+                .or_insert(1);
 
             let bucket = get_buckets(stat.depth);
             acc.entry(bucket).and_modify(|v| *v += 1).or_insert(1);
@@ -285,103 +308,27 @@ impl<'a> ClusteringInformationImpl<'a> {
         let average_overlaps = (10000.0 * sum_overlap as f64 / length as f64).round() / 10000.0;
 
         let block_depth_histogram =
-            mp.into_iter()
+            bucket_counts
+                .into_iter()
                 .fold(BTreeMap::new(), |mut acc, (bucket, count)| {
                     acc.insert(format!("{:05}", bucket), count);
                     acc
                 });
+        let p95_depth = percentile_depth(&depth_counts, length, 95);
+        let p99_depth = percentile_depth(&depth_counts, length, 99);
 
         let info = LinerClusterStatistics {
             total_block_count,
             constant_block_count,
             average_overlaps,
             average_depth,
+            p95_depth,
+            p99_depth,
             block_depth_histogram,
         };
         Ok(ClusteringInformationResponse {
             cluster_key,
             cluster_type,
-            timestamp,
-            info: serde_json::to_value(info)?,
-        })
-    }
-
-    #[async_backtrace::framed]
-    async fn get_hilbert_clustering_info(&self) -> Result<ClusteringInformationResponse> {
-        let Some((cluster_key_id, cluster_key_str)) = self.table.cluster_key_meta() else {
-            unreachable!("Unclustered table {}", self.table.table_info.desc);
-        };
-
-        let snapshot = self.table.read_table_snapshot().await?;
-        let now = Utc::now();
-        let timestamp = snapshot
-            .as_ref()
-            .map_or(now, |s| s.timestamp.unwrap_or(now))
-            .timestamp_micros();
-        let mut total_segment_count = 0;
-        let mut total_block_count = 0;
-        let mut stable_segment_count = 0;
-        let mut stable_block_count = 0;
-        let mut partial_segment_count = 0;
-        let mut partial_block_count = 0;
-        let mut unclustered_segment_count = 0;
-        let mut unclustered_block_count = 0;
-        if let Some(snapshot) = snapshot {
-            let total_count = snapshot.segments.len();
-            total_segment_count = total_count as u64;
-            total_block_count = snapshot.summary.block_count;
-            let chunk_size = cmp::min(
-                self.ctx.get_settings().get_max_threads()? as usize * 4,
-                total_count,
-            )
-            .max(1);
-            let segments_io = SegmentsIO::create(
-                self.ctx.clone(),
-                self.table.operator.clone(),
-                self.table.schema(),
-            );
-            for chunk in snapshot.segments.chunks(chunk_size) {
-                let segments = segments_io
-                    .read_segments::<Arc<CompactSegmentInfo>>(chunk, true)
-                    .await?;
-                for segment in segments {
-                    let segment = segment?;
-                    if segment
-                        .summary
-                        .cluster_stats
-                        .as_ref()
-                        .is_none_or(|v| v.cluster_key_id != cluster_key_id)
-                    {
-                        unclustered_segment_count += 1;
-                        unclustered_block_count += segment.summary.block_count;
-                        continue;
-                    }
-                    let level = segment.summary.cluster_stats.as_ref().unwrap().level;
-                    if level == -1 {
-                        stable_block_count += segment.summary.block_count;
-                        stable_segment_count += 1;
-                    } else {
-                        partial_block_count += segment.summary.block_count;
-                        partial_segment_count += 1;
-                    }
-                }
-            }
-        }
-
-        let info = HilbertClusterStatistics {
-            total_segment_count,
-            stable_segment_count,
-            partial_segment_count,
-            unclustered_segment_count,
-            total_block_count,
-            stable_block_count,
-            partial_block_count,
-            unclustered_block_count,
-        };
-
-        Ok(ClusteringInformationResponse {
-            cluster_key: cluster_key_str.to_string(),
-            cluster_type: "hilbert".to_string(),
             timestamp,
             info: serde_json::to_value(info)?,
         })
@@ -418,19 +365,9 @@ struct LinerClusterStatistics {
     constant_block_count: u64,
     average_overlaps: f64,
     average_depth: f64,
+    p95_depth: usize,
+    p99_depth: usize,
     block_depth_histogram: BTreeMap<String, u64>,
-}
-
-#[derive(Serialize)]
-struct HilbertClusterStatistics {
-    total_segment_count: u64,
-    stable_segment_count: u64,
-    partial_segment_count: u64,
-    unclustered_segment_count: u64,
-    total_block_count: u64,
-    stable_block_count: u64,
-    partial_block_count: u64,
-    unclustered_block_count: u64,
 }
 
 /// The histogram contains buckets with widths:
@@ -449,4 +386,40 @@ fn get_buckets(val: usize) -> u32 {
     val |= val >> 8;
     val |= val >> 16;
     val + 1
+}
+
+fn percentile_depth(
+    depth_counts: &BTreeMap<usize, u64>,
+    total_count: usize,
+    percentile: u64,
+) -> usize {
+    if total_count == 0 {
+        return 0;
+    }
+
+    let rank = ((total_count as u64) * percentile).div_ceil(100);
+    let mut seen = 0;
+    for (depth, count) in depth_counts {
+        seen += count;
+        if seen >= rank {
+            return *depth;
+        }
+    }
+
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_percentile_depth_uses_nearest_rank() {
+        let depth_counts = BTreeMap::from([(1, 3), (2, 2), (3, 1), (20, 1)]);
+
+        assert_eq!(percentile_depth(&depth_counts, 7, 50), 2);
+        assert_eq!(percentile_depth(&depth_counts, 7, 95), 20);
+        assert_eq!(percentile_depth(&depth_counts, 7, 99), 20);
+        assert_eq!(percentile_depth(&BTreeMap::new(), 0, 99), 0);
+    }
 }

@@ -25,11 +25,11 @@ use databend_common_catalog::table_args::TableArgs;
 use databend_common_catalog::table_function::TableFunction;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
 use databend_common_expression::TableSchemaRefExt;
 use databend_common_expression::cast_scalar;
-use databend_common_expression::infer_schema_type;
 use databend_common_expression::types::DataType;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_meta_app::principal::StageType;
@@ -39,6 +39,7 @@ use databend_common_meta_app::storage::StorageParams;
 use databend_common_pipeline::core::Pipeline;
 use databend_common_pipeline::sources::AsyncSourcer;
 use databend_common_sql::StageLocationParam;
+use databend_common_sql::binder::StagePathAccess;
 use databend_common_sql::binder::StageResolver;
 
 use crate::pipelines::builders::UdtfFunctionDesc;
@@ -77,7 +78,7 @@ impl UDTFTable {
             .zip(udtf.arg_types.iter())
             .enumerate()
         {
-            if dest_type.remove_nullable() == DataType::StageLocation {
+            if dest_type.remove_nullable() == TableDataType::StageLocation {
                 let Some(location) = argument.as_string() else {
                     return Err(ErrorCode::SemanticError(format!(
                         "invalid parameter {argument} for udf function, expected constant string",
@@ -91,7 +92,7 @@ impl UDTFTable {
                         .allow_insecure,
                 )?;
                 let (stage_info, relative_path) = databend_common_base::runtime::block_on(
-                    stage_resolver.resolve_stage_location(location),
+                    stage_resolver.resolve_stage_location(location, StagePathAccess::Read),
                 )?;
 
                 if !matches!(stage_info.stage_type, StageType::External) {
@@ -136,6 +137,7 @@ impl UDTFTable {
             .cloned()
             .zip(udtf.arg_types)
             .map(|(scalar, ty)| {
+                let ty = DataType::from(&ty);
                 cast_scalar(Span::None, scalar, &ty, &BUILTIN_FUNCTIONS).map(|scalar| (scalar, ty))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -145,7 +147,10 @@ impl UDTFTable {
                 name: table_func_name.to_string(),
                 func_name: udtf.handler,
                 return_ty: DataType::Tuple(
-                    udtf.return_types.into_iter().map(|(_, ty)| ty).collect(),
+                    udtf.return_types
+                        .into_iter()
+                        .map(|(_, ty)| DataType::from(&ty))
+                        .collect(),
                 ),
                 args,
                 headers: udtf.headers,
@@ -159,8 +164,8 @@ impl UDTFTable {
         let fields = udtf
             .return_types
             .iter()
-            .map(|(name, ty)| infer_schema_type(ty).map(|ty| TableField::new(name.as_str(), ty)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|(name, ty)| TableField::new(name.as_str(), ty.clone()))
+            .collect::<Vec<_>>();
 
         Ok(TableSchemaRefExt::create(fields))
     }

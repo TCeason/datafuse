@@ -44,10 +44,6 @@ impl TableContext for QueryContext {
         &self.written_segment_locs
     }
 
-    fn selected_segment_locations(&self) -> &SegmentLocationsState {
-        &self.shared.selected_segment_locs
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -244,6 +240,10 @@ impl TableContextQueryState for QueryContext {
 
     fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         self.shared.get_error()
+    }
+
+    fn get_nodes_memory_usage(&self) -> usize {
+        self.shared.get_nodes_memory_usage()
     }
 
     fn push_warning(&self, warn: String) {

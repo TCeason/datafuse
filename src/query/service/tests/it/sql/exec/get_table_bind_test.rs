@@ -123,8 +123,6 @@ use databend_common_meta_app::schema::TruncateTableReq;
 use databend_common_meta_app::schema::UndropDatabaseReply;
 use databend_common_meta_app::schema::UndropDatabaseReq;
 use databend_common_meta_app::schema::UndropTableReq;
-use databend_common_meta_app::schema::UpdateDictionaryReply;
-use databend_common_meta_app::schema::UpdateDictionaryReq;
 use databend_common_meta_app::schema::UpdateIndexReply;
 use databend_common_meta_app::schema::UpdateIndexReq;
 use databend_common_meta_app::schema::UpsertTableOptionReply;
@@ -457,10 +455,6 @@ impl Catalog for FakedCatalog {
         todo!()
     }
 
-    async fn update_dictionary(&self, _req: UpdateDictionaryReq) -> Result<UpdateDictionaryReply> {
-        todo!()
-    }
-
     async fn drop_dictionary(
         &self,
         _dict_ident: DictionaryNameIdent,
@@ -551,10 +545,6 @@ impl TableContext for CtxDelegation {
         self.ctx.written_segment_locations()
     }
 
-    fn selected_segment_locations(&self) -> &SegmentLocationsState {
-        self.ctx.selected_segment_locations()
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -571,6 +561,10 @@ impl TableContextQueryState for CtxDelegation {
 
     fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         todo!()
+    }
+
+    fn get_nodes_memory_usage(&self) -> usize {
+        self.ctx.get_nodes_memory_usage()
     }
 
     fn push_warning(&self, _warn: String) {

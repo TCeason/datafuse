@@ -24,7 +24,11 @@ use databend_common_expression::TableField;
 use databend_common_expression::converts::datavalues::from_scalar;
 use databend_common_expression::converts::meta::IndexScalar;
 use databend_common_expression::types::DataType;
+use databend_common_expression::types::F32;
 use databend_common_frozen_api::FrozenAPI;
+use databend_common_vector::angular_distance;
+use databend_common_vector::l1_distance;
+use databend_common_vector::l2_distance;
 use log::info;
 use serde::de::Error;
 
@@ -65,12 +69,6 @@ pub struct ClusterStatistics {
     )]
     pub max: Vec<Scalar>,
     pub level: i32,
-
-    #[serde(
-        serialize_with = "serialize_index_scalar_option_vec",
-        deserialize_with = "deserialize_index_scalar_option_vec"
-    )]
-    pub pages: Option<Vec<Scalar>>,
 }
 
 /// Spatial statistics for geometry columns.
@@ -87,6 +85,136 @@ pub struct SpatialStatistics {
     // Srid mixed or all rects are empty.
     #[serde(default)]
     pub is_valid: bool,
+}
+
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FrozenAPI,
+)]
+pub enum VectorDistanceType {
+    L1,
+    L2,
+    Dot,
+}
+
+impl VectorDistanceType {
+    pub fn from_index_option(distance_type: &str) -> Option<Self> {
+        match distance_type.trim() {
+            "cosine" | "dot" => Some(Self::Dot),
+            "l1" => Some(Self::L1),
+            "l2" => Some(Self::L2),
+            _ => None,
+        }
+    }
+
+    pub fn from_index_options<'a>(
+        column_name: &str,
+        distances: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> databend_common_exception::Result<Self> {
+        let mut distance_types = Vec::new();
+        for distance in distances {
+            let Some(distance) = distance else {
+                return Err(databend_common_exception::ErrorCode::InvalidClusterKeys(
+                    format!(
+                        "Vector cluster key `{column_name}` requires a vector index with distance option"
+                    ),
+                ));
+            };
+
+            for distance in distance.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let Some(distance_type) = Self::from_index_option(distance) else {
+                    return Err(databend_common_exception::ErrorCode::InvalidClusterKeys(
+                        format!(
+                            "Vector cluster key `{column_name}` has unsupported vector index distance type `{distance}`"
+                        ),
+                    ));
+                };
+                if !distance_types.contains(&distance_type) {
+                    distance_types.push(distance_type);
+                }
+            }
+        }
+
+        match distance_types.as_slice() {
+            [distance_type] => Ok(*distance_type),
+            [] => Err(databend_common_exception::ErrorCode::InvalidClusterKeys(
+                format!(
+                    "Vector cluster key `{column_name}` requires a vector index with distance option"
+                ),
+            )),
+            _ => Err(databend_common_exception::ErrorCode::InvalidClusterKeys(
+                format!(
+                    "Vector cluster key `{column_name}` has multiple vector index distance types; use exactly one distance type for vector clustering"
+                ),
+            )),
+        }
+    }
+
+    pub fn as_string(&self) -> String {
+        match self {
+            Self::L1 => "l1".to_string(),
+            Self::L2 => "l2".to_string(),
+            Self::Dot => "dot".to_string(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, FrozenAPI)]
+pub struct VectorColumnStatistics {
+    pub centroid: Vec<F32>,
+    pub radius: F32,
+    pub row_count: u64,
+}
+
+impl VectorColumnStatistics {
+    pub fn centroid_values(&self) -> Vec<f32> {
+        self.centroid.iter().map(|value| value.0).collect()
+    }
+
+    pub fn spheres_overlap(
+        &self,
+        other: &VectorColumnStatistics,
+        distance_type: VectorDistanceType,
+    ) -> databend_common_exception::Result<bool> {
+        let left_centroid = self.centroid_values();
+        let right_centroid = other.centroid_values();
+        let distance = match distance_type {
+            VectorDistanceType::L1 => l1_distance(&left_centroid, &right_centroid)?,
+            VectorDistanceType::L2 => l2_distance(&left_centroid, &right_centroid)?,
+            VectorDistanceType::Dot => angular_distance(&left_centroid, &right_centroid)?,
+        };
+
+        Ok(distance <= self.radius.0 + other.radius.0)
+    }
+
+    pub fn distance_domain(
+        &self,
+        query: &[f32],
+        distance_type: VectorDistanceType,
+    ) -> databend_common_exception::Result<(f32, f32)> {
+        let centroid = self.centroid_values();
+        let distance = match distance_type {
+            VectorDistanceType::L1 => l1_distance(query, &centroid)?,
+            VectorDistanceType::L2 => l2_distance(query, &centroid)?,
+            VectorDistanceType::Dot => angular_distance(query, &centroid)?,
+        };
+        let lower_bound = (distance - self.radius.0).max(0.0);
+        if matches!(distance_type, VectorDistanceType::Dot) {
+            let upper_bound = (distance + self.radius.0).min(std::f32::consts::PI);
+            return Ok((1.0 - lower_bound.cos(), 1.0 - upper_bound.cos()));
+        }
+
+        Ok((lower_bound, distance + self.radius.0))
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default, FrozenAPI)]
@@ -200,19 +328,12 @@ impl ColumnStatistics {
 }
 
 impl ClusterStatistics {
-    pub fn new(
-        cluster_key_id: u32,
-        min: Vec<Scalar>,
-        max: Vec<Scalar>,
-        level: i32,
-        pages: Option<Vec<Scalar>>,
-    ) -> Self {
+    pub fn new(cluster_key_id: u32, min: Vec<Scalar>, max: Vec<Scalar>, level: i32) -> Self {
         Self {
             cluster_key_id,
             min,
             max,
             level,
-            pages,
         }
     }
 
@@ -262,7 +383,6 @@ impl ClusterStatistics {
             min,
             max,
             level: v0.level,
-            pages: None,
         })
     }
 }
@@ -386,40 +506,6 @@ where D: serde::Deserializer<'de> {
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn serialize_index_scalar_option_vec<S>(
-    scalars: &Option<Vec<Scalar>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match scalars {
-        Some(scalars) => serialize_index_scalar_vec(scalars, serializer),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn deserialize_index_scalar_option_vec<'de, D>(
-    deserializer: D,
-) -> Result<Option<Vec<Scalar>>, D::Error>
-where D: serde::Deserializer<'de> {
-    <Option<Vec<IndexScalar>> as serde::Deserialize>::deserialize(deserializer)?
-        .map(|index_scalars| {
-            index_scalars
-                .into_iter()
-                .map(|index_scalar| {
-                    Scalar::try_from(index_scalar).map_err(|e| {
-                        D::Error::custom(format!(
-                            "Failed to convert IndexScalar to Scalar: {:?}",
-                            e
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-}
-
 /// Deserializes the `col_stats` field of the `BlockMeta` and `Statistics` struct.
 ///
 /// This function is designed to handle legacy `ColumnStatistics` items that incorrectly
@@ -488,5 +574,64 @@ impl<'de> serde::de::Visitor<'de> for ColStatsVisitor {
         }
 
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::converts::meta::IndexScalar;
+
+    use super::*;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyClusterStatistics {
+        cluster_key_id: u32,
+        min: Vec<IndexScalar>,
+        max: Vec<IndexScalar>,
+        level: i32,
+        pages: Option<Vec<IndexScalar>>,
+    }
+
+    fn legacy_stats() -> LegacyClusterStatistics {
+        LegacyClusterStatistics {
+            cluster_key_id: 7,
+            min: vec![IndexScalar::Number(1_i64.into())],
+            max: vec![IndexScalar::Number(9_i64.into())],
+            level: 2,
+            pages: Some(vec![IndexScalar::Tuple(vec![IndexScalar::Number(
+                1_i64.into(),
+            )])]),
+        }
+    }
+
+    #[test]
+    fn reads_legacy_cluster_statistics_with_pages() {
+        let bytes = rmp_serde::to_vec_named(&legacy_stats()).unwrap();
+        let stats: ClusterStatistics = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            stats,
+            ClusterStatistics::new(
+                7,
+                vec![Scalar::Number(1_i64.into())],
+                vec![Scalar::Number(9_i64.into())],
+                2,
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_reader_accepts_cluster_statistics_without_pages() {
+        let stats = ClusterStatistics::new(
+            7,
+            vec![Scalar::Number(1_i64.into())],
+            vec![Scalar::Number(9_i64.into())],
+            2,
+        );
+        let bytes = rmp_serde::to_vec_named(&stats).unwrap();
+        let legacy: LegacyClusterStatistics = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(legacy.cluster_key_id, 7);
+        assert_eq!(legacy.pages, None);
     }
 }

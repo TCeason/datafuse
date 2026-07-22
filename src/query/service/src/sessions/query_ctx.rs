@@ -45,6 +45,7 @@ use databend_common_base::base::SpillProgress;
 use databend_common_base::base::WatchNotify;
 use databend_common_base::runtime::ExecutorStatsSnapshot;
 use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_base::runtime::IoStatsSnapshot;
 use databend_common_base::runtime::MemStat;
 use databend_common_base::runtime::PerfConfig;
 use databend_common_base::runtime::PerfEvent;
@@ -126,8 +127,6 @@ use databend_common_storage::FileStatus;
 use databend_common_storage::StageFileInfo;
 use databend_common_storage::StageFilesInfo;
 use databend_common_storage::StorageMetrics;
-#[cfg(feature = "storage-stage")]
-use databend_common_storage::init_stage_operator;
 use databend_common_storages_basic::ResultScan;
 use databend_common_storages_delta::DeltaTable;
 use databend_common_storages_fuse::FuseTable;
@@ -139,7 +138,11 @@ use databend_common_users::GrantObjectVisibilityChecker;
 use databend_common_users::Object;
 use databend_common_users::UserApiProvider;
 #[cfg(feature = "storage-stage")]
+use databend_query_storage_stage_support::ArrowIpcMode;
+#[cfg(feature = "storage-stage")]
 use databend_query_storage_stage_support::StageTable;
+#[cfg(feature = "storage-stage")]
+use databend_query_storage_stage_support::infer_arrow_schema_from_file;
 use databend_storages_common_blocks::memory::IN_MEMORY_R_CTE_DATA;
 use databend_storages_common_blocks::memory::InMemoryDataKey;
 use databend_storages_common_session::SessionState;
@@ -156,6 +159,7 @@ use log::debug;
 use log::info;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use tokio::sync::Semaphore;
 
 use crate::catalogs::Catalog;
 use crate::clusters::Cluster;
@@ -207,11 +211,18 @@ impl QueryContext {
     pub fn create_from_shared(shared: Arc<QueryContextShared>) -> Arc<QueryContext> {
         debug!("Creating new QueryContext instance");
 
-        let tenant = GlobalConfig::instance().query.tenant_id.clone();
+        let query_config = &GlobalConfig::instance().query;
+        let tenant = query_config.tenant_id.clone();
         let query_settings = Settings::create(tenant);
+        let product_name = query_config.common.product_name.trim();
+        let version = if product_name.is_empty() {
+            shared.version.commit_detail.to_string()
+        } else {
+            format!("{} {}", product_name, shared.version.commit_detail)
+        };
         Arc::new(QueryContext {
             partition_queue: Arc::new(RwLock::new(VecDeque::new())),
-            version: format!("Databend Query {}", shared.version.commit_detail),
+            version,
             mysql_version: format!("{MYSQL_VERSION}-{}", shared.version.commit_detail),
             shared,
             query_settings,
@@ -491,6 +502,14 @@ impl QueryContext {
         self.shared.get_data_metrics()
     }
 
+    pub fn merge_io_stats(&self, stats: &IoStatsSnapshot) {
+        self.shared.merge_io_stats(stats);
+    }
+
+    pub fn get_io_stats(&self) -> IoStatsSnapshot {
+        self.shared.get_io_stats()
+    }
+
     pub fn set_affect(self: &Arc<Self>, affect: QueryAffect) {
         self.shared.set_affect(affect)
     }
@@ -550,6 +569,10 @@ impl QueryContext {
                 stats.incr(&p);
             })
             .or_insert(p);
+    }
+
+    pub fn clear_cluster_spill_progress(&self) {
+        self.shared.cluster_spill_progress.write().clear();
     }
 
     pub fn add_spill_file(&self, location: spillers::Location, layout: spillers::Layout) {
@@ -676,7 +699,6 @@ impl QueryContext {
             has_bloom: bool,
             has_inlist: bool,
             has_min_max: bool,
-            has_spatial: bool,
             stats: RuntimeFilterStatsSnapshot,
             build_rows: usize,
             build_table_rows: Option<u64>,
@@ -702,7 +724,6 @@ impl QueryContext {
                     has_bloom: entry.bloom.is_some(),
                     has_inlist: entry.inlist.is_some(),
                     has_min_max: entry.min_max.is_some(),
-                    has_spatial: entry.spatial.is_some(),
                     stats: entry.stats.snapshot(),
                     build_rows: entry.build_rows,
                     build_table_rows: entry.build_table_rows,
@@ -735,7 +756,6 @@ impl QueryContext {
                     has_bloom,
                     has_inlist,
                     has_min_max,
-                    has_spatial,
                     stats,
                     build_rows,
                     build_table_rows,
@@ -751,9 +771,6 @@ impl QueryContext {
                 }
                 if has_min_max {
                     types.push("min_max");
-                }
-                if has_spatial {
-                    types.push("spatial");
                 }
                 let type_text = if types.is_empty() {
                     "none".to_string()
@@ -801,20 +818,6 @@ impl QueryContext {
                     detail_children.push(FormatTreeNode::new(format!(
                         "min-max partitions pruned: {}",
                         stats.min_max_partitions_pruned
-                    )));
-                }
-                if has_spatial {
-                    detail_children.push(FormatTreeNode::new(format!(
-                        "spatial time: {:?}",
-                        Duration::from_nanos(stats.spatial_time_ns)
-                    )));
-                    detail_children.push(FormatTreeNode::new(format!(
-                        "spatial rows filtered: {}",
-                        stats.spatial_rows_filtered
-                    )));
-                    detail_children.push(FormatTreeNode::new(format!(
-                        "spatial partitions pruned: {}",
-                        stats.spatial_partitions_pruned
                     )));
                 }
 
@@ -964,6 +967,10 @@ impl QueryContext {
 }
 
 impl QueryContext {
+    pub(crate) fn get_row_fetch_io_semaphore(&self, max_threads: usize) -> Arc<Semaphore> {
+        self.shared.get_row_fetch_io_semaphore(max_threads)
+    }
+
     /// Tries to spawn a new asynchronous task, returning a JoinHandle for it.
     /// The task will run in the current context thread_pool not the global.
     #[track_caller]
@@ -987,4 +994,70 @@ pub fn convert_query_log_timestamp(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::new(0, 0))
         .as_micros() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use databend_common_base::runtime::IoStatsSnapshot;
+
+    use super::QueryContext;
+    use crate::test_kits::TestFixture;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_fetch_io_semaphore_is_shared_by_child_contexts()
+    -> databend_common_exception::Result<()> {
+        let fixture = TestFixture::setup().await?;
+        let ctx = fixture.new_query_ctx().await?;
+        let child_ctx = QueryContext::create_from(&ctx);
+
+        let semaphore = ctx.get_row_fetch_io_semaphore(2);
+        let child_semaphore = child_ctx.get_row_fetch_io_semaphore(8);
+
+        assert!(Arc::ptr_eq(&semaphore, &child_semaphore));
+        assert_eq!(semaphore.available_permits(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn io_stats_merge() -> databend_common_exception::Result<()> {
+        let fixture = TestFixture::setup().await?;
+        let ctx = fixture.new_query_ctx().await?;
+
+        ctx.merge_io_stats(&IoStatsSnapshot {
+            list_count: 1,
+            list_duration_ms: 2,
+            read_count: 2,
+            read_bytes: 3,
+            read_duration_ms: 4,
+            write_count: 4,
+            write_bytes: 5,
+            write_duration_ms: 6,
+        });
+        ctx.merge_io_stats(&IoStatsSnapshot {
+            list_count: 10,
+            list_duration_ms: 20,
+            read_count: 20,
+            read_bytes: 30,
+            read_duration_ms: 40,
+            write_count: 40,
+            write_bytes: 50,
+            write_duration_ms: 60,
+        });
+
+        assert_eq!(ctx.get_io_stats(), IoStatsSnapshot {
+            list_count: 11,
+            list_duration_ms: 22,
+            read_count: 22,
+            read_bytes: 33,
+            read_duration_ms: 44,
+            write_count: 44,
+            write_bytes: 55,
+            write_duration_ms: 66,
+        });
+
+        Ok(())
+    }
 }

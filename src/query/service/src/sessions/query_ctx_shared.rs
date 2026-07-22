@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -26,8 +27,11 @@ use async_channel::Receiver;
 use databend_common_base::base::Progress;
 use databend_common_base::base::SpillProgress;
 use databend_common_base::base::WatchNotify;
+use databend_common_base::base::mask_connection_info;
 use databend_common_base::base::short_sql;
 use databend_common_base::runtime::ExecutorStatsSnapshot;
+use databend_common_base::runtime::IoStats;
+use databend_common_base::runtime::IoStatsSnapshot;
 use databend_common_base::runtime::MemStat;
 use databend_common_base::runtime::PerfConfig;
 use databend_common_base::runtime::PerfEvent;
@@ -45,7 +49,6 @@ use databend_common_component::BroadcastRegistry;
 use databend_common_component::CopyState;
 use databend_common_component::MutationState;
 use databend_common_component::ResultCacheState;
-use databend_common_component::SegmentLocationsState;
 use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -61,11 +64,13 @@ use databend_common_users::GrantObjectVisibilityChecker;
 use databend_storages_common_table_meta::meta::TableMetaTimestamps;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::clusters::Cluster;
 use crate::clusters::ClusterDiscovery;
 use crate::pipelines::executor::PipelineExecutor;
+use crate::pipelines::executor::PlanNodeMemoryUsage;
 use crate::pipelines::processors::transforms::MaterializedCtePayload;
 use crate::servers::flight::v1::packets::NodePerfCounters;
 use crate::sessions::BuildInfoRef;
@@ -158,10 +163,9 @@ pub struct QueryContextShared {
     pub(super) mem_stat: Arc<RwLock<Option<Arc<MemStat>>>>,
     pub(super) node_memory_usage: Arc<RwLock<HashMap<String, Arc<MemoryUpdater>>>>,
 
-    // Used by hilbert clustering when do recluster.
-    pub(super) selected_segment_locs: SegmentLocationsState,
-
     pub(super) pruned_partitions_stats: Arc<RwLock<HashMap<u32, PartStatistics>>>,
+
+    pub(super) io_stats: Arc<IoStats>,
 
     pub(super) broadcast_registry: BroadcastRegistry,
 
@@ -182,6 +186,10 @@ pub struct QueryContextShared {
     /// Cached full visibility checker (ignore_ownership=false, Object::All).
     /// Shared across all QueryContext instances within this query.
     pub(super) visibility_checker_cache: tokio::sync::OnceCell<Arc<GrantObjectVisibilityChecker>>,
+
+    /// Limits concurrent RowFetch reads and decodes across all pipelines and
+    /// QueryContext instances belonging to this query on the local node.
+    row_fetch_io_semaphore: OnceLock<Arc<Semaphore>>,
 }
 
 impl QueryContextShared {
@@ -243,8 +251,8 @@ impl QueryContextShared {
             warehouse_cache: Arc::new(RwLock::new(None)),
             mem_stat: Arc::new(RwLock::new(None)),
             node_memory_usage: Arc::new(RwLock::new(HashMap::new())),
-            selected_segment_locs: Default::default(),
             pruned_partitions_stats: Arc::new(RwLock::new(HashMap::new())),
+            io_stats: Default::default(),
             broadcast_registry: Default::default(),
             perf_config: Mutex::new(PerfConfig::default()),
             nodes_perf: Arc::new(Mutex::new(HashMap::new())),
@@ -253,7 +261,14 @@ impl QueryContextShared {
             recursive_cte_temp_tables: Arc::new(RwLock::new(Vec::new())),
             logical_recursive_cte_runtime_ids: Arc::new(RwLock::new(HashMap::new())),
             visibility_checker_cache: Default::default(),
+            row_fetch_io_semaphore: Default::default(),
         }))
+    }
+
+    pub(super) fn get_row_fetch_io_semaphore(&self, max_threads: usize) -> Arc<Semaphore> {
+        self.row_fetch_io_semaphore
+            .get_or_init(|| Arc::new(Semaphore::new(max_threads.max(1))))
+            .clone()
     }
 
     pub fn get_version(&self) -> &BuildInfoRef {
@@ -378,6 +393,14 @@ impl QueryContextShared {
         StorageMetrics::merge(&metrics)
     }
 
+    pub fn merge_io_stats(&self, stats: &IoStatsSnapshot) {
+        self.io_stats.merge_snapshot(stats);
+    }
+
+    pub fn get_io_stats(&self) -> IoStatsSnapshot {
+        self.io_stats.snapshot()
+    }
+
     pub fn get_tenant(&self) -> Tenant {
         self.session.get_current_tenant()
     }
@@ -493,6 +516,8 @@ impl QueryContextShared {
                                     &source_database_name,
                                     &source_table_name,
                                     max_batch_size,
+                                    self.get_settings()
+                                        .get_enable_stream_batch_snapshot_forward_scan()?,
                                     self.get_settings().get_s3_storage_class()?,
                                 )
                                 .await?;
@@ -570,7 +595,7 @@ impl QueryContextShared {
         {
             let mut running_query = self.running_query.write();
             *running_query = Some(short_sql(
-                query,
+                mask_connection_info(&query),
                 self.get_settings()
                     .get_short_sql_max_length()
                     .unwrap_or(1000),
@@ -692,6 +717,13 @@ impl QueryContextShared {
         }
     }
 
+    pub fn get_top_memory_plan_nodes(&self, limit: usize) -> Vec<PlanNodeMemoryUsage> {
+        match self.executor.read().upgrade() {
+            None => Vec::new(),
+            Some(executor) => executor.top_memory_plan_nodes(limit),
+        }
+    }
+
     pub fn get_query_profiles(&self) -> Vec<PlanProfile> {
         if let Some(executor) = self.executor.read().upgrade() {
             self.add_query_profiles(&executor.fetch_profiling(false));
@@ -797,6 +829,10 @@ impl QueryContextShared {
             .entry(plan_id)
             .and_modify(|s| s.merge(&stats))
             .or_insert(stats);
+    }
+
+    pub fn clear_pruned_partitions_stats(&self) {
+        self.pruned_partitions_stats.write().clear();
     }
 
     pub fn merge_pruned_partitions_stats(&self, other: &HashMap<u32, PartStatistics>) {

@@ -139,40 +139,13 @@ impl Display for ShowDropTablesStmt {
 }
 
 #[derive(Debug, Clone, PartialEq, Drive, DriveMut, Walk, WalkMut)]
-pub enum ClusterType {
-    Linear,
-    Hilbert,
-}
-
-impl Display for ClusterType {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        match self {
-            ClusterType::Linear => write!(f, "LINEAR"),
-            ClusterType::Hilbert => write!(f, "HILBERT"),
-        }
-    }
-}
-
-impl std::str::FromStr for ClusterType {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "linear" => Ok(ClusterType::Linear),
-            "hilbert" => Ok(ClusterType::Hilbert),
-            _ => Err(()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Drive, DriveMut, Walk, WalkMut)]
 pub struct ClusterOption {
-    pub cluster_type: ClusterType,
     pub cluster_exprs: Vec<Expr>,
 }
 
 impl Display for ClusterOption {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CLUSTER BY {}(", self.cluster_type)?;
+        write!(f, "CLUSTER BY (")?;
         write_comma_separated_list(f, &self.cluster_exprs)?;
         write!(f, ")")
     }
@@ -842,6 +815,14 @@ pub struct AnalyzeTableStmt {
     pub database: Option<Identifier>,
     pub table: Identifier,
     pub no_scan: bool,
+    pub histogram_options: Option<AnalyzeHistogramOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut, Walk, WalkMut)]
+pub struct AnalyzeHistogramOptions {
+    pub algorithm: Option<String>,
+    #[drive(skip)]
+    pub error_rate: Option<f64>,
 }
 
 impl Display for AnalyzeTableStmt {
@@ -856,6 +837,17 @@ impl Display for AnalyzeTableStmt {
         )?;
         if self.no_scan {
             write!(f, " NOSCAN")?;
+        }
+        if let Some(options) = &self.histogram_options {
+            write!(f, " WITH HISTOGRAM")?;
+            let mut sep = " ";
+            if let Some(algorithm) = &options.algorithm {
+                write!(f, "{sep}ALGORITHM = '{algorithm}'")?;
+                sep = ", ";
+            }
+            if let Some(error_rate) = options.error_rate {
+                write!(f, "{sep}ERROR_RATE = {error_rate}")?;
+            }
         }
 
         Ok(())

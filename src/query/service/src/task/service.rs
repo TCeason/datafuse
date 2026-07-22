@@ -94,6 +94,10 @@ use crate::task::session::get_task_user;
 
 pub type TaskMessageStream = BoxStream<'static, Result<(String, TaskMessage)>>;
 
+const OVERLAPPING_EXECUTION: &str = "OVERLAPPING_EXECUTION";
+const WHEN_CONDITION_EVALUATION_ERROR: &str = "WHEN_CONDITION_EVALUATION_ERROR";
+const WHEN_CONDITION_FALSE: &str = "WHEN_CONDITION_FALSE";
+
 /// Currently, query uses the watch in meta to imitate channel to obtain tasks. When task messages are sent to channels, they are stored in meta using TaskMessage::key.
 /// TaskMessage::key is divided into only 4 types of keys that will overwrite each other to avoid repeated storage and repeated processing.
 /// Whenever a new key is inserted for overwriting, each query will receive the corresponding key change and process it, thus realizing the channel
@@ -208,7 +212,7 @@ impl TaskService {
     }
 
     async fn work(&self, tenant: &Tenant, runtime: Arc<Runtime>) -> Result<()> {
-        let mut scheduled_tasks: HashMap<String, CancellationToken> = HashMap::new();
+        let mut scheduled_tasks: HashMap<String, (u64, CancellationToken)> = HashMap::new();
         let task_mgr = UserApiProvider::instance().task_api(tenant);
 
         let mut steam = self.subscribe().await?;
@@ -217,19 +221,34 @@ impl TaskService {
             let (_, task_message) = result?;
             let task_key = TaskMessageIdent::new(tenant, task_message.key());
 
-            if let Some(WarehouseOptions {
-                warehouse: Some(warehouse),
-                ..
-            }) = task_message.warehouse_options()
+            // Delete cleanup updates shared metadata, so it must run even if the
+            // task's assigned warehouse currently has no live query node.
+            let is_delete = matches!(&task_message, TaskMessage::DeleteTask(_, _, _));
+            if is_delete
+                && self
+                    .create_context(None)
+                    .await?
+                    .get_cluster()
+                    .get_warehouse_id()
+                    .is_err()
             {
-                if warehouse
-                    != &self
-                        .create_context(None)
-                        .await?
-                        .get_cluster()
-                        .get_warehouse_id()?
+                continue;
+            }
+            if !is_delete {
+                if let Some(WarehouseOptions {
+                    warehouse: Some(warehouse),
+                    ..
+                }) = task_message.warehouse_options()
                 {
-                    continue;
+                    if warehouse
+                        != &self
+                            .create_context(None)
+                            .await?
+                            .get_cluster()
+                            .get_warehouse_id()?
+                    {
+                        continue;
+                    }
                 }
             }
             match task_message {
@@ -238,7 +257,7 @@ impl TaskService {
                     debug_assert!(task.schedule_options.is_some());
                     if let Some(schedule_options) = &task.schedule_options {
                         // clean old task if alter
-                        if let Some(token) = scheduled_tasks.remove(&task.task_name) {
+                        if let Some((_, token)) = scheduled_tasks.remove(&task.task_name) {
                             token.cancel();
                         }
                         match task.status {
@@ -248,6 +267,7 @@ impl TaskService {
 
                         let token = CancellationToken::new();
                         let child_token = token.child_token();
+                        let task_id = task.task_id;
                         let task_name = task.task_name.to_string();
                         let task_name_clone = task_name.clone();
                         let task_service = TaskService::instance();
@@ -275,18 +295,29 @@ impl TaskService {
                                 runtime
                                     .spawn(async move {
                                         let mut fn_work = async move || {
-                                            task.next_scheduled_at = Some(Utc::now() + duration);
-                                            task_mgr.update_task(task.clone()).await??;
+                                            let committed_at = Utc::now();
+                                            task.next_scheduled_at = Some(committed_at + duration);
+                                            task.updated_at = committed_at;
+                                            if !task_mgr.update_task(task.clone()).await?? {
+                                                return Ok(());
+                                            }
                                             loop {
                                                 tokio::select! {
                                                     _ = sleep(duration) => {
                                                         let Some(_guard) = fn_lock(&task_service, &task_key, duration.as_millis() as u64).await? else {
                                                             continue;
                                                         };
+                                                        let committed_at = Utc::now();
+                                                        task.next_scheduled_at = Some(committed_at + duration);
+                                                        task.updated_at = committed_at;
+                                                        if !task_mgr.update_task(task.clone()).await?? {
+                                                            break;
+                                                        }
                                                         if task_service.has_executing_task_run(&task.task_name).await? {
+                                                            task_service.record_overlapping_skip(&task).await?;
                                                             continue;
                                                         }
-                                                        if !Self::check_when(&task, &owner, &task_service).await? {
+                                                        if !Self::check_when_and_record(&task, &owner, &task_service).await? {
                                                             continue;
                                                         }
                                                         task_mgr.send(TaskMessage::ExecuteTask(task.clone())).await.map_err(meta_service_error)?;
@@ -318,25 +349,38 @@ impl TaskService {
                                 runtime
                                     .spawn(async move {
                                         let mut fn_work = async move || {
-                                            let upcoming = schedule.upcoming(tz);
+                                            let mut upcoming = schedule.upcoming(tz).peekable();
 
-                                            for next_time in upcoming {
+                                            while let Some(next_time) = upcoming.next() {
                                                 let now = Utc::now();
                                                 let duration = (next_time.with_timezone(&Utc) - now)
                                                     .to_std()
                                                     .unwrap_or(Duration::ZERO);
 
-                                                task.next_scheduled_at = Some(Utc::now() + duration);
-                                                task_mgr.update_task(task.clone()).await??;
+                                                task.next_scheduled_at = Some(next_time.with_timezone(&Utc));
+                                                task.updated_at = now;
+                                                if !task_mgr.update_task(task.clone()).await?? {
+                                                    break;
+                                                }
                                                 tokio::select! {
                                                     _ = sleep(duration) => {
                                                         let Some(_guard) = fn_lock(&task_service, &task_key, duration.as_millis() as u64).await? else {
                                                             continue;
                                                         };
+                                                        let committed_at = Utc::now();
+                                                        let next_scheduled_at = upcoming
+                                                            .peek()
+                                                            .map(|next| next.with_timezone(&Utc));
+                                                        task.next_scheduled_at = next_scheduled_at;
+                                                        task.updated_at = committed_at;
+                                                        if !task_mgr.update_task(task.clone()).await?? {
+                                                            break;
+                                                        }
                                                         if task_service.has_executing_task_run(&task.task_name).await? {
+                                                            task_service.record_overlapping_skip(&task).await?;
                                                             continue;
                                                         }
-                                                        if !Self::check_when(&task, &owner, &task_service).await? {
+                                                        if !Self::check_when_and_record(&task, &owner, &task_service).await? {
                                                             continue;
                                                         }
                                                         task_mgr.send(TaskMessage::ExecuteTask(task.clone())).await.map_err(meta_service_error)?;
@@ -354,7 +398,7 @@ impl TaskService {
                                     });
                             }
                         }
-                        let _ = scheduled_tasks.insert(task_name_clone, token);
+                        let _ = scheduled_tasks.insert(task_name_clone, (task_id, token));
                     }
                 }
                 TaskMessage::ExecuteTask(task) => {
@@ -382,6 +426,7 @@ impl TaskService {
                     };
 
                     if task_service.has_executing_task_run(&task_name).await? {
+                        task_service.record_overlapping_skip(&task).await?;
                         continue;
                     }
                     let mut task_run = Self::new_task_run(&task);
@@ -415,19 +460,22 @@ impl TaskService {
                                                 .ok_or_else(|| ErrorCode::UnknownTask(next_task))?;
                                             let next_owner =
                                                 Self::get_task_owner(&next_task, &tenant).await?;
-                                            if Self::check_when(
+                                            if task_service
+                                                .has_executing_task_run(&next_task.task_name)
+                                                .await?
+                                            {
+                                                task_service
+                                                    .record_overlapping_skip(&next_task)
+                                                    .await?;
+                                                continue;
+                                            }
+                                            if Self::check_when_and_record(
                                                 &next_task,
                                                 &next_owner,
                                                 &task_service,
                                             )
                                             .await?
                                             {
-                                                if task_service
-                                                    .has_executing_task_run(&next_task.task_name)
-                                                    .await?
-                                                {
-                                                    continue;
-                                                }
                                                 task_mgr
                                                     .send(TaskMessage::ExecuteTask(next_task))
                                                     .await
@@ -443,12 +491,27 @@ impl TaskService {
                                         task_run.error_code = err.code() as i64;
                                         task_run.error_message = Some(err.message());
                                         task_service.update_or_create_task_run(&task_run).await?;
-                                        task_run.run_id = Self::make_run_id();
+                                        if task_run.attempt_number <= 0 {
+                                            task_mgr
+                                                .alter_task(
+                                                    &task.task_name,
+                                                    &AlterTaskOptions::Suspend,
+                                                )
+                                                .await??;
+                                            break;
+                                        } else {
+                                            task_run.run_id = Self::make_run_id();
+                                            task_run.state = State::Executing;
+                                            task_run.scheduled_at = Utc::now();
+                                            task_run.completed_at = None;
+                                            task_run.error_code = 0;
+                                            task_run.error_message = None;
+                                            task_service
+                                                .update_or_create_task_run(&task_run)
+                                                .await?;
+                                        }
                                     }
                                 }
-                                task_mgr
-                                    .alter_task(&task.task_name, &AlterTaskOptions::Suspend)
-                                    .await??;
                             }
 
                             Result::Ok(())
@@ -458,9 +521,15 @@ impl TaskService {
                         }
                     });
                 }
-                TaskMessage::DeleteTask(task_name, _) => {
-                    if let Some(token) = scheduled_tasks.remove(&task_name) {
-                        token.cancel();
+                TaskMessage::DeleteTask(task_name, _, task_id) => {
+                    if task_id.is_none_or(|task_id| {
+                        scheduled_tasks
+                            .get(&task_name)
+                            .is_some_and(|(scheduled_task_id, _)| *scheduled_task_id == task_id)
+                    }) {
+                        if let Some((_, token)) = scheduled_tasks.remove(&task_name) {
+                            token.cancel();
+                        }
                     }
                     if task_mgr
                         .accept(&task_key)
@@ -468,6 +537,14 @@ impl TaskService {
                         .map_err(meta_service_error)?
                     {
                         self.clean_task_afters(&task_name).await?;
+                        if let Some(task_id) = task_id {
+                            self.cancel_open_task_runs(
+                                &task_name,
+                                task_id,
+                                "task was dropped while execution status was still open",
+                            )
+                            .await?;
+                        }
                     }
                     task_mgr
                         .accept(&TaskMessageIdent::new(
@@ -571,6 +648,58 @@ impl TaskService {
         }
     }
 
+    fn new_terminal_task_run(
+        task: &Task,
+        state: State,
+        error_code: i64,
+        error_message: String,
+    ) -> TaskRun {
+        let now = Utc::now();
+        TaskRun {
+            task: task.clone(),
+            run_id: Self::make_run_id(),
+            attempt_number: 0,
+            state,
+            scheduled_at: now,
+            completed_at: Some(now),
+            error_code,
+            error_message: Some(error_message),
+            root_task_id: EMPTY_TASK_ID,
+        }
+    }
+
+    async fn record_overlapping_skip(&self, task: &Task) -> Result<()> {
+        let reason = format!("{OVERLAPPING_EXECUTION}: previous task run is still executing");
+        let task_run = Self::new_terminal_task_run(task, State::Skipped, 0, reason);
+        self.update_or_create_task_run(&task_run).await?;
+        Ok(())
+    }
+
+    async fn check_when_and_record(
+        task: &Task,
+        user: &UserInfo,
+        task_service: &Arc<TaskService>,
+    ) -> Result<bool> {
+        match Self::check_when(task, user, task_service).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let condition = task.when_condition.as_deref().unwrap_or_default();
+                let reason =
+                    format!("{WHEN_CONDITION_FALSE}: condition '{condition}' evaluated to false");
+                let task_run = Self::new_terminal_task_run(task, State::Skipped, 0, reason);
+                task_service.update_or_create_task_run(&task_run).await?;
+                Ok(false)
+            }
+            Err(err) => {
+                let reason = format!("{WHEN_CONDITION_EVALUATION_ERROR}: {}", err.message());
+                let task_run =
+                    Self::new_terminal_task_run(task, State::Failed, err.code() as i64, reason);
+                task_service.update_or_create_task_run(&task_run).await?;
+                Ok(false)
+            }
+        }
+    }
+
     async fn check_when(
         task: &Task,
         user: &UserInfo,
@@ -646,12 +775,13 @@ impl TaskService {
     }
 
     pub async fn has_executing_task_run(&self, task_name: &str) -> Result<bool> {
+        let task_name = Self::sql_string_literal(task_name);
         let blocks = self
             .execute_sql(
                 None,
                 &format!(
                     "SELECT count(*) FROM system_task.task_run \
-                    WHERE task_name = '{task_name}' \
+                    WHERE task_name = {task_name} \
                     AND state = 'EXECUTING' \
                     AND completed_at IS NULL;"
                 ),
@@ -679,6 +809,7 @@ impl TaskService {
             State::Succeeded => "SUCCEEDED".to_string(),
             State::Failed => "FAILED".to_string(),
             State::Cancelled => "CANCELLED".to_string(),
+            State::Skipped => "SKIPPED".to_string(),
         };
         let scheduled_at = task_run.scheduled_at.timestamp();
         let completed_at = task_run
@@ -688,11 +819,12 @@ impl TaskService {
         let error_message = task_run
             .error_message
             .as_ref()
-            .map(|s| format!("'{s}'"))
+            .map(|s| Self::sql_string_literal(s))
             .unwrap_or_else(|| "null".to_string());
         let root_task_id = task_run.root_task_id;
+        let task_name = Self::sql_string_literal(&task_run.task.task_name);
 
-        let is_exists = self.execute_sql(None, &format!("UPDATE system_task.task_run SET run_id = {}, state = '{}', scheduled_at = {}, completed_at = {}, error_message = {}, root_task_id = {} WHERE task_name = '{}' AND run_id = {}", task_run.run_id, state, scheduled_at, completed_at, error_message, root_task_id, task_run.task.task_name, task_run.run_id)).await?
+        let is_exists = self.execute_sql(None, &format!("UPDATE system_task.task_run SET run_id = {}, attempt_number = {}, state = '{}', scheduled_at = {}, completed_at = {}, error_code = {}, error_message = {}, root_task_id = {} WHERE task_name = {} AND run_id = {}", task_run.run_id, task_run.attempt_number, state, scheduled_at, completed_at, task_run.error_code, error_message, root_task_id, task_name, task_run.run_id)).await?
             .first()
             .and_then(|block| {
                 block.get_by_offset(0).index(0).and_then(|s| s.as_number().and_then(|n| n.as_u_int64().cloned()))
@@ -712,6 +844,7 @@ impl TaskService {
         task_name: &'a str,
     ) -> impl Stream<Item = Result<String>> + '_ {
         stream! {
+            let task_name = Self::sql_string_literal(task_name);
             let check = format!("
             WITH latest_task_run AS (
     SELECT
@@ -725,6 +858,7 @@ impl TaskService {
             completed_at,
             ROW_NUMBER() OVER (PARTITION BY task_name ORDER BY completed_at DESC) AS rn
         FROM system_task.task_run
+        WHERE NOT (state = 'SKIPPED' AND COALESCE(error_message, '') LIKE 'OVERLAPPING_EXECUTION:%')
     ) ranked
     WHERE rn = 1
 ),
@@ -736,7 +870,7 @@ next_task_time AS (
 )
 SELECT DISTINCT ta.next_task
 FROM system_task.task_after ta
-WHERE ta.task_name = '{task_name}'
+WHERE ta.task_name = {task_name}
   AND NOT EXISTS (
     SELECT 1
     FROM system_task.task_after ta_dep
@@ -752,18 +886,32 @@ WHERE ta.task_name = '{task_name}'
         OR (nt.completed_at IS NOT NULL AND tr.completed_at <= nt.completed_at)
       )
   );");
-            if let Some(next_task) = self.execute_sql(None, &check).await?.first().and_then(|block| block.columns()[0].index(0).and_then(|scalar| { scalar.as_string().map(|s| s.to_string()) })) {
+            let blocks = self.execute_sql(None, &check).await?;
+            for next_task in Self::next_task_names_from_blocks(&blocks) {
                 yield Result::Ok(next_task);
             }
         }
+    }
+
+    fn next_task_names_from_blocks(blocks: &[DataBlock]) -> impl Iterator<Item = String> + '_ {
+        blocks.iter().flat_map(|block| {
+            let column = block.columns().first();
+            (0..block.num_rows()).filter_map(move |row| {
+                column.and_then(|column| {
+                    column
+                        .index(row)
+                        .and_then(|scalar| scalar.as_string().map(|s| s.to_string()))
+                })
+            })
+        })
     }
 
     pub async fn clean_task_afters(&self, task_name: &str) -> Result<()> {
         self.execute_sql(
             None,
             &format!(
-                "DELETE FROM system_task.task_after WHERE next_task = '{}'",
-                task_name
+                "DELETE FROM system_task.task_after WHERE next_task = {}",
+                Self::sql_string_literal(task_name)
             ),
         )
         .await?;
@@ -771,12 +919,62 @@ WHERE ta.task_name = '{task_name}'
         Ok(())
     }
 
+    pub async fn cancel_open_task_runs(
+        &self,
+        task_name: &str,
+        task_id: u64,
+        error_message: &str,
+    ) -> Result<u64> {
+        let task_name = Self::sql_string_literal(task_name);
+        let error_message = Self::sql_string_literal(error_message);
+
+        let blocks = self
+            .execute_sql(
+                None,
+                &format!(
+                    "UPDATE system_task.task_run \
+                SET state = 'CANCELLED', \
+                    completed_at = {}, \
+                    error_code = 0, \
+                    error_message = {} \
+                WHERE task_name = {} \
+                    AND task_id <= {} \
+                    AND state = 'EXECUTING' \
+                    AND completed_at IS NULL;",
+                    Utc::now().timestamp(),
+                    error_message,
+                    task_name,
+                    task_id
+                ),
+            )
+            .await?;
+
+        let affected_rows = blocks
+            .first()
+            .and_then(|block| block.get_by_offset(0).index(0))
+            .and_then(|scalar| {
+                scalar
+                    .as_number()
+                    .and_then(|number| number.as_u_int64())
+                    .cloned()
+            })
+            .unwrap_or(0);
+
+        Ok(affected_rows)
+    }
+
     pub async fn update_task_afters(&self, task: &Task) -> Result<()> {
         self.clean_task_afters(&task.task_name).await?;
         let values = task
             .after
             .iter()
-            .map(|after| format!("('{}', '{}')", after, task.task_name))
+            .map(|after| {
+                format!(
+                    "({}, {})",
+                    Self::sql_string_literal(after),
+                    Self::sql_string_literal(&task.task_name)
+                )
+            })
             .join(", ");
         self.execute_sql(
             None,
@@ -792,6 +990,58 @@ WHERE ta.task_name = '{task_name}'
 
     fn task_run2insert(task_run: &TaskRun) -> Result<String> {
         let task = &task_run.task;
+        let task_name = Self::sql_string_literal(&task.task_name);
+        let query_text = Self::sql_string_literal(&task.task_sql.query_text());
+        let when_condition = Self::sql_optional_string(task.when_condition.as_deref());
+        let after = if !task.after.is_empty() {
+            Self::sql_string_literal(&task.after.join(", "))
+        } else {
+            "null".to_string()
+        };
+        let comment = Self::sql_optional_string(task.comment.as_deref());
+        let owner = Self::sql_string_literal(&task.owner);
+        let owner_user = Self::sql_string_literal(&task.owner_user);
+        let warehouse_name = Self::sql_optional_string(
+            task.warehouse_options
+                .as_ref()
+                .and_then(|w| w.warehouse.as_deref()),
+        );
+        let using_warehouse_size = Self::sql_optional_string(
+            task.warehouse_options
+                .as_ref()
+                .and_then(|w| w.using_warehouse_size.as_deref()),
+        );
+        let cron = Self::sql_optional_string(
+            task.schedule_options
+                .as_ref()
+                .and_then(|s| s.cron.as_deref()),
+        );
+        let time_zone = Self::sql_optional_string(
+            task.schedule_options
+                .as_ref()
+                .and_then(|s| s.time_zone.as_deref()),
+        );
+        let state = Self::sql_string_literal(match task_run.state {
+            State::Scheduled => "SCHEDULED",
+            State::Executing => "EXECUTING",
+            State::Succeeded => "SUCCEEDED",
+            State::Failed => "FAILED",
+            State::Cancelled => "CANCELLED",
+            State::Skipped => "SKIPPED",
+        });
+        let error_message = Self::sql_optional_string(task_run.error_message.as_deref());
+        let completed_at = task_run
+            .completed_at
+            .as_ref()
+            .map(|d| d.timestamp().to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let error_integration = Self::sql_optional_string(task.error_integration.as_deref());
+        let status = Self::sql_string_literal(match task.status {
+            Status::Suspended => "SUSPENDED",
+            Status::Started => "STARTED",
+        });
+        let session_params =
+            Self::sql_string_literal(&serde_json::to_string(&task.session_params)?);
 
         let sql = format!(
             "INSERT INTO system_task.task_run (\
@@ -828,13 +1078,6 @@ WHERE ta.task_name = '{task_name}'
             suspend_task_after_num_failures
             ) values (
                 {},
-                '{}',
-                '{}',
-                {},
-                {},
-                {},
-                '{}',
-                '{}',
                 {},
                 {},
                 {},
@@ -844,7 +1087,6 @@ WHERE ta.task_name = '{task_name}'
                 {},
                 {},
                 {},
-                '{}',
                 {},
                 {},
                 {},
@@ -852,7 +1094,15 @@ WHERE ta.task_name = '{task_name}'
                 {},
                 {},
                 {},
-                '{}',
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
                 {},
                 {},
                 {},
@@ -860,33 +1110,15 @@ WHERE ta.task_name = '{task_name}'
                 {}
             );",
             task.task_id,
-            task.task_name,
-            task.task_sql.query_text().replace('\'', "''"),
-            task.when_condition
-                .as_ref()
-                .map(|s| format!("'{}'", s.replace('\'', "''")))
-                .unwrap_or_else(|| "null".to_string()),
-            if !task.after.is_empty() {
-                format!("'{}'", task.after.join(", "))
-            } else {
-                "null".to_string()
-            },
-            task.comment
-                .as_ref()
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
-            task.owner,
-            task.owner_user.replace('\'', "''"),
-            task.warehouse_options
-                .as_ref()
-                .and_then(|w| w.warehouse.as_ref())
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
-            task.warehouse_options
-                .as_ref()
-                .and_then(|w| w.using_warehouse_size.as_ref())
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
+            task_name,
+            query_text,
+            when_condition,
+            after,
+            comment,
+            owner,
+            owner_user,
+            warehouse_name,
+            using_warehouse_size,
             task.schedule_options
                 .as_ref()
                 .map(|s| match s.schedule_type {
@@ -904,53 +1136,25 @@ WHERE ta.task_name = '{task_name}'
                 .and_then(|s| s.milliseconds_interval)
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),
-            task.schedule_options
-                .as_ref()
-                .and_then(|s| s.cron.as_ref())
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
-            task.schedule_options
-                .as_ref()
-                .and_then(|s| s.time_zone.as_ref())
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
+            cron,
+            time_zone,
             task_run.run_id,
             task_run.attempt_number,
-            match task_run.state {
-                State::Scheduled => "SCHEDULED".to_string(),
-                State::Executing => "EXECUTING".to_string(),
-                State::Succeeded => "SUCCEEDED".to_string(),
-                State::Failed => "FAILED".to_string(),
-                State::Cancelled => "CANCELLED".to_string(),
-            },
+            state,
             task_run.error_code,
-            task_run
-                .error_message
-                .as_ref()
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
+            error_message,
             task_run.root_task_id,
             task_run.scheduled_at.timestamp(),
-            task_run
-                .completed_at
-                .as_ref()
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "null".to_string()),
+            completed_at,
             task.next_scheduled_at
                 .as_ref()
                 .map(|d| d.timestamp().to_string())
                 .unwrap_or_else(|| "null".to_string()),
-            task.error_integration
-                .as_ref()
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "null".to_string()),
-            match task.status {
-                Status::Suspended => "SUSPENDED".to_string(),
-                Status::Started => "STARTED".to_string(),
-            },
+            error_integration,
+            status,
             task.created_at.timestamp(),
             task.updated_at.timestamp(),
-            serde_json::to_string(&task.session_params).map(|s| format!("'{s}'"))?,
+            session_params,
             task.last_suspended_at
                 .as_ref()
                 .map(|d| d.timestamp().to_string())
@@ -960,6 +1164,16 @@ WHERE ta.task_name = '{task_name}'
                 .unwrap_or_else(|| "null".to_string())
         );
         Ok(sql)
+    }
+
+    fn sql_string_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn sql_optional_string(value: Option<&str>) -> String {
+        value
+            .map(Self::sql_string_literal)
+            .unwrap_or_else(|| "null".to_string())
     }
 
     async fn execute_sql(&self, other_user: Option<UserInfo>, sql: &str) -> Result<Vec<DataBlock>> {

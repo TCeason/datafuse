@@ -38,8 +38,10 @@ use databend_storages_common_table_meta::meta::TableSnapshot;
 use crate::FuseTable;
 use crate::io::SegmentsIO;
 use crate::sessions::TableContext;
+use crate::statistics::BlockOverlapDepth;
 use crate::statistics::calculate_block_overlap_depths;
 use crate::statistics::get_min_max_stats;
+use crate::statistics::prepare_cluster_key_exprs;
 use crate::table_functions::TableMetaFunc;
 use crate::table_functions::TableMetaFuncTemplate;
 
@@ -60,7 +62,9 @@ impl TableMetaFunc for ClusteringStatistics {
                 TableDataType::Number(NumberDataType::Int32).wrap_nullable(),
             ),
             TableField::new("block_depth", TableDataType::Number(NumberDataType::UInt64)),
-            TableField::new("pages", TableDataType::String.wrap_nullable()),
+            // `pages` is intentionally removed from this public schema rather than kept as an
+            // always-NULL compatibility placeholder. It represented the removed Native-format
+            // page statistics, and retaining it would expose a capability that no longer exists.
         ])
     }
 
@@ -93,7 +97,11 @@ impl TableMetaFunc for ClusteringStatistics {
 
         let cluster_keys = tbl.resolve_cluster_keys().unwrap();
         let exprs = parse_cluster_keys(ctx.clone(), Arc::new(tbl.clone()), cluster_keys)?;
-        let cluster_key_types = exprs
+        let scalar_exprs = exprs
+            .into_iter()
+            .filter(|expr| !matches!(expr.data_type().remove_nullable(), DataType::Vector(_)))
+            .collect::<Vec<_>>();
+        let scalar_cluster_key_types = scalar_exprs
             .iter()
             .map(|v| {
                 let data_type = v.data_type();
@@ -109,10 +117,10 @@ impl TableMetaFunc for ClusteringStatistics {
         let mut block_names = Vec::with_capacity(capacity);
         let mut ranges = Vec::with_capacity(capacity);
         let mut levels = Vec::with_capacity(capacity);
-        let mut pages = Vec::with_capacity(capacity);
 
         let segments_io = SegmentsIO::create(ctx.clone(), tbl.operator.clone(), tbl.schema());
         let schema = tbl.schema();
+        let prepared_cluster_key_exprs = prepare_cluster_key_exprs(&scalar_exprs, schema.as_ref());
 
         let chunk_size = ctx.get_settings().get_max_threads()? as usize * 4;
         let format_vec = |v: &[Scalar]| -> String {
@@ -137,11 +145,10 @@ impl TableMetaFunc for ClusteringStatistics {
                 for block in segment.blocks.iter() {
                     let block = block.as_ref();
                     let (min, max) = get_min_max_stats(
-                        &exprs,
+                        &prepared_cluster_key_exprs,
                         &block.col_stats,
                         block.cluster_stats.as_ref(),
                         Some(cluster_key_id),
-                        schema.as_ref(),
                     );
                     let current_cluster_stats = block
                         .cluster_stats
@@ -151,22 +158,22 @@ impl TableMetaFunc for ClusteringStatistics {
                     segment_names.push(segment_loc.clone());
                     block_names.push(block.location.0.clone());
                     levels.push(current_cluster_stats.map(|v| v.level));
-                    pages.push(
-                        current_cluster_stats.and_then(|v| v.pages.as_ref().map(|v| format_vec(v))),
-                    );
                     ranges.push((min, max));
                 }
             }
         }
 
-        let block_depths = calculate_block_overlap_depths(&ranges, &cluster_key_types)?;
+        let block_depths = if scalar_cluster_key_types.is_empty() {
+            vec![BlockOverlapDepth::default(); ranges.len()]
+        } else {
+            calculate_block_overlap_depths(&ranges, &scalar_cluster_key_types)?
+        };
         let mut segment_name = StringColumnBuilder::with_capacity(output_len);
         let mut block_name = StringColumnBuilder::with_capacity(output_len);
         let mut min = Vec::with_capacity(output_len);
         let mut max = Vec::with_capacity(output_len);
         let mut level = Vec::with_capacity(output_len);
         let mut block_depth = Vec::with_capacity(output_len);
-        let mut output_pages = Vec::with_capacity(output_len);
 
         for row_idx in 0..output_len {
             segment_name.put_and_commit(&segment_names[row_idx]);
@@ -176,7 +183,6 @@ impl TableMetaFunc for ClusteringStatistics {
             max.push(format_vec(&ranges[row_idx].1));
             level.push(levels[row_idx]);
             block_depth.push(block_depths[row_idx].depth as u64);
-            output_pages.push(pages[row_idx].clone());
         }
 
         Ok(DataBlock::new(
@@ -187,7 +193,6 @@ impl TableMetaFunc for ClusteringStatistics {
                 StringType::from_data(max).into(),
                 Int32Type::from_opt_data(level).into(),
                 UInt64Type::from_data(block_depth).into(),
-                StringType::from_opt_data(output_pages).into(),
             ],
             output_len,
         ))

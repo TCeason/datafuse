@@ -43,6 +43,7 @@ use databend_common_pipeline::core::ExecutionInfo;
 use databend_common_pipeline::core::always_callback;
 use databend_common_sql::DefaultExprBinder;
 use databend_common_sql::plans::CreateTablePlan;
+use databend_common_storages_fuse::FUSE_OPT_KEY_AGGRESSIVE_RECLUSTER;
 use databend_common_storages_fuse::FUSE_OPT_KEY_AUTO_COMPACTION_IMPERFECT_BLOCKS_THRESHOLD;
 use databend_common_storages_fuse::FUSE_OPT_KEY_ENABLE_AUTO_ANALYZE;
 use databend_common_storages_fuse::FUSE_OPT_KEY_ENABLE_AUTO_VACUUM;
@@ -68,6 +69,11 @@ use log::info;
 
 use crate::interpreters::InsertInterpreter;
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::table_option_validation::is_valid_analyze_count_min_sketch_error_rate;
+use crate::interpreters::common::table_option_validation::is_valid_analyze_frequency_columns;
+use crate::interpreters::common::table_option_validation::is_valid_analyze_histogram_algorithm;
+use crate::interpreters::common::table_option_validation::is_valid_analyze_histogram_kll_relative_error;
+use crate::interpreters::common::table_option_validation::is_valid_analyze_top_n_size;
 use crate::interpreters::common::table_option_validation::is_valid_approx_distinct_columns;
 use crate::interpreters::common::table_option_validation::is_valid_block_per_segment;
 use crate::interpreters::common::table_option_validation::is_valid_bloom_index_columns;
@@ -438,10 +444,10 @@ impl CreateTableInterpreter {
                 );
             }
         }
-        let storage_format = match options.get(OPT_KEY_STORAGE_FORMAT) {
-            Some(storage_format) => FuseStorageFormat::from_str(storage_format)?,
-            None => FuseStorageFormat::Parquet,
-        };
+        // Validate storage_format; rejects the removed `native` format.
+        if let Some(storage_format) = options.get(OPT_KEY_STORAGE_FORMAT) {
+            FuseStorageFormat::from_str(storage_format)?;
+        }
         if let Some(segment_format) = options.get(OPT_KEY_SEGMENT_FORMAT) {
             FuseSegmentFormat::from_str(segment_format)?;
         }
@@ -471,7 +477,7 @@ impl CreateTableInterpreter {
         // check bloom_index_columns.
         is_valid_bloom_index_columns(&table_meta.options, schema.clone())?;
         is_valid_bloom_index_type(&table_meta.options)?;
-        is_valid_approx_distinct_columns(&table_meta.options, schema)?;
+        is_valid_approx_distinct_columns(&table_meta.options, schema.clone())?;
         is_valid_change_tracking(&table_meta.options)?;
         // check random seed
         is_valid_random_seed(&table_meta.options)?;
@@ -480,14 +486,20 @@ impl CreateTableInterpreter {
         // check enable_parquet_encoding
         is_valid_fuse_parquet_dictionary_opt(&table_meta.options)?;
         // check enable_virtual_column
-        is_valid_fuse_virtual_column_opt(&table_meta.options, storage_format)?;
+        is_valid_fuse_virtual_column_opt(&table_meta.options)?;
         is_valid_data_page_rows(&table_meta.options)?;
         is_valid_data_page_bytes(&table_meta.options)?;
+        is_valid_analyze_histogram_algorithm(&table_meta.options)?;
+        is_valid_analyze_histogram_kll_relative_error(&table_meta.options)?;
+        is_valid_analyze_frequency_columns(&table_meta.options, schema)?;
+        is_valid_analyze_top_n_size(&table_meta.options)?;
+        is_valid_analyze_count_min_sketch_error_rate(&table_meta.options)?;
 
         // Same as settings of FUSE_OPT_KEY_ENABLE_AUTO_VACUUM, expect value type is unsigned integer
         is_valid_option_of_type::<u32>(&table_meta.options, FUSE_OPT_KEY_ENABLE_AUTO_VACUUM)?;
         // check enable auto analyze.
         is_valid_option_of_type::<u32>(&table_meta.options, FUSE_OPT_KEY_ENABLE_AUTO_ANALYZE)?;
+        is_valid_option_of_type::<u32>(&table_meta.options, FUSE_OPT_KEY_AGGRESSIVE_RECLUSTER)?;
         is_valid_option_of_type::<u64>(
             &table_meta.options,
             FUSE_OPT_KEY_AUTO_COMPACTION_IMPERFECT_BLOCKS_THRESHOLD,

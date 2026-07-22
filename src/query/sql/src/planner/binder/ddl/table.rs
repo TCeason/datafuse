@@ -23,7 +23,6 @@ use databend_common_ast::ast::AlterTableStmt;
 use databend_common_ast::ast::AnalyzeTableStmt;
 use databend_common_ast::ast::AttachTableStmt;
 use databend_common_ast::ast::ClusterOption;
-use databend_common_ast::ast::ClusterType as AstClusterType;
 use databend_common_ast::ast::ColumnDefinition;
 use databend_common_ast::ast::ColumnExpr;
 use databend_common_ast::ast::CompactTarget;
@@ -59,6 +58,7 @@ use databend_common_ast::ast::UriLocation;
 use databend_common_ast::ast::VacuumDropTableStmt;
 use databend_common_ast::ast::VacuumTableStmt;
 use databend_common_ast::ast::VacuumTemporaryFiles;
+use databend_common_ast::ast::quote::QuotedIdent;
 use databend_common_ast::ast::quote::QuotedString;
 use databend_common_ast::parser::parse_sql;
 use databend_common_ast::parser::tokenize_sql;
@@ -69,9 +69,11 @@ use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AutoIncrementExpr;
+use databend_common_expression::ColumnRef;
 use databend_common_expression::ComputedExpr;
 use databend_common_expression::DataField;
 use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::Expr;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableField;
 use databend_common_expression::TableSchema;
@@ -81,20 +83,19 @@ use databend_common_expression::infer_schema_type;
 use databend_common_expression::infer_table_schema;
 use databend_common_expression::types::DataType;
 use databend_common_functions::BUILTIN_FUNCTIONS;
-use databend_common_license::license::Feature;
-use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::Constraint;
 use databend_common_meta_app::schema::CreateOption;
 use databend_common_meta_app::schema::TableIndex;
 use databend_common_meta_app::schema::TableIndexType;
 use databend_common_meta_app::storage::StorageParams;
 use databend_common_pipeline::core::SharedLockGuard;
+use databend_common_storage::EndpointPolicyScope;
 use databend_common_storage::check_operator;
-use databend_common_storage::init_operator;
+use databend_common_storage::init_operator_with_policy_scope;
 use databend_common_storages_basic::view_table::QUERY;
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 use databend_common_users::UserApiProvider;
-use databend_storages_common_table_meta::table::OPT_KEY_CLUSTER_TYPE;
+use databend_storages_common_table_meta::meta::VectorDistanceType;
 use databend_storages_common_table_meta::table::OPT_KEY_DATABASE_ID;
 use databend_storages_common_table_meta::table::OPT_KEY_ENGINE_META;
 use databend_storages_common_table_meta::table::OPT_KEY_STORAGE_FORMAT;
@@ -172,6 +173,8 @@ use crate::plans::VacuumTableOption;
 use crate::plans::VacuumTablePlan;
 use crate::plans::VacuumTemporaryFilesPlan;
 
+const FUSE_OPT_KEY_AGGRESSIVE_RECLUSTER: &str = "aggressive_recluster";
+
 pub(in crate::planner::binder) struct AnalyzeCreateTableResult {
     pub(in crate::planner::binder) schema: TableSchemaRef,
     pub(in crate::planner::binder) field_comments: Vec<String>,
@@ -207,10 +210,13 @@ impl Binder {
         let mut select_builder = if stmt.with_history {
             SelectBuilder::from(&format!(
                 "{}.system.tables_with_history",
-                catalog_name.to_lowercase()
+                QuotedIdent(catalog_name.to_lowercase(), '`')
             ))
         } else {
-            SelectBuilder::from(&format!("{}.system.tables", catalog_name.to_lowercase()))
+            SelectBuilder::from(&format!(
+                "{}.system.tables",
+                QuotedIdent(catalog_name.to_lowercase(), '`')
+            ))
         };
 
         if *full {
@@ -233,7 +239,10 @@ impl Binder {
                 .with_column("data_compressed_size")
                 .with_column("index_size");
         } else {
-            select_builder.with_column(format!("name AS `Tables_in_{database}`"));
+            select_builder.with_column(format!(
+                "name AS {}",
+                QuotedIdent(format!("Tables_in_{database}"), '`')
+            ));
             if *with_history {
                 select_builder.with_column("dropped_on AS drop_time");
             };
@@ -346,7 +355,10 @@ impl Binder {
             }
         };
         let catalog = self.ctx.get_catalog(&catalog_name).await?;
-        let mut select_builder = SelectBuilder::from(&format!("{catalog_name}.system.statistics"));
+        let mut select_builder = SelectBuilder::from(&format!(
+            "{}.system.statistics",
+            QuotedIdent(&catalog_name, '`')
+        ));
 
         let database = match database {
             None => self.ctx.get_current_database(),
@@ -421,14 +433,14 @@ impl Binder {
             None => format!(
                 "SELECT {} FROM {}.system.tables WHERE database = {} ORDER BY Name",
                 select_cols,
-                default_catalog,
+                QuotedIdent(&default_catalog, '`'),
                 QuotedString(&database, '\'')
             ),
             Some(ShowLimit::Like { pattern }) => format!(
                 "SELECT * from (SELECT {} FROM {}.system.tables WHERE database = {}) \
             WHERE Name LIKE {} ORDER BY Name",
                 select_cols,
-                default_catalog,
+                QuotedIdent(&default_catalog, '`'),
                 QuotedString(&database, '\''),
                 QuotedString(pattern, '\'')
             ),
@@ -436,7 +448,7 @@ impl Binder {
                 "SELECT * from (SELECT {} FROM {}.system.tables WHERE database = {}) \
             WHERE ({}) ORDER BY Name",
                 select_cols,
-                default_catalog,
+                QuotedIdent(&default_catalog, '`'),
                 QuotedString(&database, '\''),
                 selection
             ),
@@ -458,8 +470,10 @@ impl Binder {
         let default_catalog = self.ctx.get_default_catalog()?.name();
         let database = self.check_database_exist(&None, database).await?;
 
-        let mut select_builder =
-            SelectBuilder::from(&format!("{}.system.tables_with_history", default_catalog));
+        let mut select_builder = SelectBuilder::from(&format!(
+            "{}.system.tables_with_history",
+            QuotedIdent(&default_catalog, '`')
+        ));
 
         select_builder
             .with_column("name AS Tables")
@@ -678,7 +692,7 @@ impl Binder {
                     .await?;
 
                 // create a temporary op to check if params is correct
-                let op = init_operator(&sp)?;
+                let op = init_operator_with_policy_scope(&sp, EndpointPolicyScope::External)?;
                 check_operator(&op, &sp).await?;
 
                 // Verify essential privileges.
@@ -868,13 +882,7 @@ impl Binder {
             if !options.contains_key(OPT_KEY_STORAGE_FORMAT) {
                 let default_storage_format =
                     match config.query.common.default_storage_format.as_str() {
-                        "" | "auto" => {
-                            if is_blocking_fs {
-                                "native"
-                            } else {
-                                "parquet"
-                            }
-                        }
+                        "" | "auto" | "native" => "parquet",
                         _ => config.query.common.default_storage_format.as_str(),
                     };
                 options.insert(
@@ -923,13 +931,12 @@ impl Binder {
         let mut cluster_key = None;
         if let Some(cluster_opt) = cluster_by {
             let keys = self
-                .analyze_cluster_keys(cluster_opt, schema.clone())
+                .analyze_cluster_keys(cluster_opt, schema.clone(), table_indexes.as_ref())
                 .await?;
             if !keys.is_empty() {
-                options.insert(
-                    OPT_KEY_CLUSTER_TYPE.to_owned(),
-                    cluster_opt.cluster_type.to_string().to_lowercase(),
-                );
+                options
+                    .entry(FUSE_OPT_KEY_AGGRESSIVE_RECLUSTER.to_owned())
+                    .or_insert_with(|| "1".to_owned());
                 cluster_key = Some(format!("({})", keys.join(", ")));
             }
         }
@@ -1005,7 +1012,7 @@ impl Binder {
         .await?;
 
         // create a temporary op to check if params is correct
-        let op = init_operator(&sp)?;
+        let op = init_operator_with_policy_scope(&sp, EndpointPolicyScope::External)?;
         check_operator(&op, &sp).await?;
 
         Ok(Plan::CreateTable(Box::new(CreateTablePlan {
@@ -1362,7 +1369,13 @@ impl Binder {
                     .ctx
                     .get_table_with_branch(&catalog, &database, &table, branch.as_deref())
                     .await?;
-                let cluster_keys = self.analyze_cluster_keys(cluster_by, tbl.schema()).await?;
+                let cluster_keys = self
+                    .analyze_cluster_keys(
+                        cluster_by,
+                        tbl.schema(),
+                        Some(&tbl.get_table_info().meta.indexes),
+                    )
+                    .await?;
 
                 Ok(Plan::AlterTableClusterKey(Box::new(
                     AlterTableClusterKeyPlan {
@@ -1372,7 +1385,6 @@ impl Binder {
                         table,
                         branch,
                         cluster_keys,
-                        cluster_type: cluster_by.cluster_type.to_string().to_lowercase(),
                     },
                 )))
             }
@@ -1761,6 +1773,7 @@ impl Binder {
             database,
             table,
             no_scan,
+            histogram_options,
         } = stmt;
 
         let (catalog, database, table) =
@@ -1771,6 +1784,13 @@ impl Binder {
             database,
             table,
             no_scan: *no_scan,
+            histogram_requested: histogram_options.is_some(),
+            histogram_algorithm: histogram_options
+                .as_ref()
+                .and_then(|options| options.algorithm.clone()),
+            histogram_kll_relative_error: histogram_options
+                .as_ref()
+                .and_then(|options| options.error_rate),
         })))
     }
 
@@ -2295,23 +2315,11 @@ impl Binder {
         &mut self,
         cluster_opt: &ClusterOption,
         schema: TableSchemaRef,
+        table_indexes: Option<&BTreeMap<String, TableIndex>>,
     ) -> Result<Vec<String>> {
-        let ClusterOption {
-            cluster_type,
-            cluster_exprs,
-        } = cluster_opt;
+        let ClusterOption { cluster_exprs } = cluster_opt;
 
         let expr_len = cluster_exprs.len();
-        if matches!(cluster_type, AstClusterType::Hilbert) {
-            LicenseManagerSwitch::instance()
-                .check_enterprise_enabled(self.ctx.get_license_key(), Feature::HilbertClustering)?;
-
-            if !(2..=5).contains(&expr_len) {
-                return Err(ErrorCode::InvalidClusterKeys(
-                    "Hilbert clustering requires the dimension to be between 2 and 5",
-                ));
-            }
-        }
 
         // Build a temporary BindContext to resolve the expr
         let mut bind_context = BindContext::new();
@@ -2347,6 +2355,7 @@ impl Binder {
             sql_dialect: self.dialect,
         };
         let mut cluster_keys = Vec::with_capacity(expr_len);
+        let mut vector_cluster_key_num = 0;
         for cluster_expr in cluster_exprs.iter() {
             let (cluster_key, _) = scalar_binder.bind(cluster_expr)?;
             if cluster_key.used_columns().len() != 1 || !cluster_key.evaluable() {
@@ -2365,11 +2374,41 @@ impl Binder {
             }
 
             let data_type = expr.data_type();
-            if !Self::valid_cluster_key_type(data_type) {
+            let (is_valid_type, is_vector_type) = Self::valid_cluster_key_type(data_type);
+            if !is_valid_type {
                 return Err(ErrorCode::InvalidClusterKeys(format!(
                     "Unsupported data type '{}' for cluster by expression `{:#}`",
                     data_type, cluster_expr
                 )));
+            }
+            if is_vector_type {
+                vector_cluster_key_num += 1;
+                if vector_cluster_key_num > 1 {
+                    return Err(ErrorCode::InvalidClusterKeys(
+                        "Only one vector column is supported in cluster by",
+                    ));
+                }
+
+                let Expr::ColumnRef(ColumnRef { id, .. }) = &expr else {
+                    return Err(ErrorCode::InvalidClusterKeys(
+                        "Vector cluster key only supports direct column reference",
+                    ));
+                };
+                let Ok(field) = schema.field_with_name(&id.column_name) else {
+                    return Err(ErrorCode::InvalidClusterKeys(format!(
+                        "Cluster by expression `{:#}` is invalid",
+                        cluster_expr
+                    )));
+                };
+                let distances = table_indexes
+                    .into_iter()
+                    .flat_map(|table_indexes| table_indexes.values())
+                    .filter(|index| {
+                        index.index_type == TableIndexType::Vector
+                            && index.column_ids.contains(&field.column_id())
+                    })
+                    .map(|index| index.options.get("distance").map(String::as_str));
+                VectorDistanceType::from_index_options(field.name(), distances)?;
             }
 
             let mut cluster_expr = cluster_expr.clone();
@@ -2380,9 +2419,9 @@ impl Binder {
         Ok(cluster_keys)
     }
 
-    pub(crate) fn valid_cluster_key_type(data_type: &DataType) -> bool {
+    pub(crate) fn valid_cluster_key_type(data_type: &DataType) -> (bool, bool) {
         let inner_type = data_type.remove_nullable();
-        matches!(
+        let is_valid_type = matches!(
             inner_type,
             DataType::Number(_)
                 | DataType::String
@@ -2390,7 +2429,10 @@ impl Binder {
                 | DataType::Date
                 | DataType::Boolean
                 | DataType::Decimal(_)
-        )
+                | DataType::Vector(_)
+        );
+        let is_vector_type = matches!(inner_type, DataType::Vector(_));
+        (is_valid_type, is_vector_type)
     }
 
     fn is_column_not_null(&self) -> bool {

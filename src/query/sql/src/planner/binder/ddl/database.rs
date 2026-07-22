@@ -26,6 +26,7 @@ use databend_common_ast::ast::ShowDatabasesStmt;
 use databend_common_ast::ast::ShowDropDatabasesStmt;
 use databend_common_ast::ast::ShowLimit;
 use databend_common_ast::ast::UndropDatabaseStmt;
+use databend_common_ast::ast::quote::QuotedIdent;
 use databend_common_ast::ast::quote::QuotedString;
 use databend_common_config::GlobalConfig;
 use databend_common_exception::ErrorCode;
@@ -34,6 +35,7 @@ use databend_common_expression::DataField;
 use databend_common_expression::DataSchemaRefExt;
 use databend_common_expression::types::DataType;
 use databend_common_meta_app::schema::DatabaseMeta;
+use databend_common_storage::EndpointPolicyScope;
 use databend_common_users::UserApiProvider;
 use log::debug;
 
@@ -81,8 +83,10 @@ impl Binder {
             self.ctx.get_current_catalog().to_string()
         };
 
-        let mut select_builder =
-            SelectBuilder::from(&format!("{}.system.databases", ctl.to_lowercase()));
+        let mut select_builder = SelectBuilder::from(&format!(
+            "{}.system.databases",
+            QuotedIdent(ctl.to_lowercase(), '`')
+        ));
 
         select_builder.with_filter(format!("catalog = {}", QuotedString(&ctl, '\'')));
 
@@ -90,7 +94,10 @@ impl Binder {
             select_builder.with_column("catalog AS Catalog");
             select_builder.with_column("owner");
         }
-        select_builder.with_column(format!("name AS `databases_in_{ctl}`"));
+        select_builder.with_column(format!(
+            "name AS {}",
+            QuotedIdent(format!("databases_in_{ctl}"), '`')
+        ));
         select_builder.with_order_by("catalog");
         select_builder.with_order_by("name");
 
@@ -121,7 +128,7 @@ impl Binder {
         let default_catalog = self.ctx.get_default_catalog()?.name();
         let mut select_builder = SelectBuilder::from(&format!(
             "{}.system.databases_with_history",
-            default_catalog
+            QuotedIdent(&default_catalog, '`')
         ));
 
         let ctl = if let Some(ctl) = catalog {
@@ -516,13 +523,16 @@ impl Binder {
 
             // Verify essential privileges for the external storage location
             // Similar to table creation, we test basic storage operations
-            let operator =
-                databend_common_storage::init_operator(&storage_params).map_err(|e| {
-                    ErrorCode::BadArguments(format!(
-                        "Failed to access storage location '{}': {}",
-                        path_prop.value, e
-                    ))
-                })?;
+            let operator = databend_common_storage::init_operator_with_policy_scope(
+                &storage_params,
+                EndpointPolicyScope::External,
+            )
+            .map_err(|e| {
+                ErrorCode::BadArguments(format!(
+                    "Failed to access storage location '{}': {}",
+                    path_prop.value, e
+                ))
+            })?;
 
             // Test storage accessibility with basic operations
             // Reuse the existing verify_external_location_privileges function from table.rs

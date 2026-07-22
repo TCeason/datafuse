@@ -22,6 +22,7 @@ use super::Finder;
 use crate::BindContext;
 use crate::Binder;
 use crate::binder::ExprContext;
+use crate::binder::aggregate::AggregateRewriter;
 use crate::binder::split_conjunctions;
 use crate::optimizer::ir::SExpr;
 use crate::planner::semantic::GroupingChecker;
@@ -50,7 +51,7 @@ impl Binder {
     pub fn bind_having(
         &mut self,
         bind_context: &mut BindContext,
-        having: ScalarExpr,
+        mut having: ScalarExpr,
         child: SExpr,
     ) -> Result<SExpr> {
         bind_context.expr_context = ExprContext::HavingClause;
@@ -65,9 +66,14 @@ impl Binder {
             .set_span(having.span()));
         }
 
+        AggregateRewriter::rewrite_existing_expr(
+            &bind_context.aggregate_info,
+            &mut having,
+            "Invalid aggregate function in HAVING clause",
+        )?;
+
         let scalar = if bind_context.in_grouping {
             // If we are in grouping context, we will perform the grouping check
-            let mut having = having;
             let mut grouping_checker = GroupingChecker::new(bind_context, None);
             grouping_checker.visit(&mut having)?;
             having

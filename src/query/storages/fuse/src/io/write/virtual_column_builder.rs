@@ -17,9 +17,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
-use std::sync::Arc;
 
-use databend_common_catalog::table_context::TableContext;
 use databend_common_column::buffer::Buffer;
 use databend_common_column::types::months_days_micros;
 use databend_common_column::types::timestamp_tz;
@@ -50,9 +48,7 @@ use databend_common_expression::types::array::ArrayColumn;
 use databend_common_expression::types::binary::BinaryColumnBuilder;
 use databend_common_expression::types::i256;
 use databend_common_hashtable::StackHashMap;
-use databend_common_io::constants::DEFAULT_BLOCK_INDEX_BUFFER_SIZE;
-use databend_common_license::license::Feature;
-use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_storages_common_blocks::SerializedParquet;
 use databend_storages_common_blocks::blocks_to_parquet_with_stats;
 use databend_storages_common_index::VirtualColumnNameIndex;
 use databend_storages_common_index::VirtualColumnNode;
@@ -99,7 +95,7 @@ const MIN_PROMOTED_SHARED_PATH_VALUES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct VirtualColumnState {
-    pub data: Vec<u8>,
+    pub data: opendal::Buffer,
     pub draft_virtual_block_meta: DraftVirtualBlockMeta,
 }
 
@@ -118,13 +114,7 @@ pub struct VirtualColumnBuilder {
 }
 
 impl VirtualColumnBuilder {
-    pub fn try_create(
-        ctx: Arc<dyn TableContext>,
-        schema: TableSchemaRef,
-    ) -> Result<VirtualColumnBuilder> {
-        LicenseManagerSwitch::instance()
-            .check_enterprise_enabled(ctx.get_license_key(), Feature::VirtualColumn)?;
-
+    pub fn try_create(schema: TableSchemaRef) -> Result<VirtualColumnBuilder> {
         let mut variant_fields = Vec::new();
         let mut variant_offsets = Vec::new();
         for (i, field) in schema.fields.iter().enumerate() {
@@ -699,7 +689,7 @@ impl VirtualColumnBuilder {
             };
 
             return Ok(VirtualColumnState {
-                data: vec![],
+                data: opendal::Buffer::new(),
                 draft_virtual_block_meta,
             });
         }
@@ -942,11 +932,12 @@ impl VirtualColumnBuilder {
             &std::collections::BTreeMap::new(),
         )?;
 
-        let mut data = Vec::with_capacity(DEFAULT_BLOCK_INDEX_BUFFER_SIZE);
-        let file_meta = blocks_to_parquet_with_stats(
+        let SerializedParquet {
+            payload,
+            metadata: file_meta,
+        } = blocks_to_parquet_with_stats(
             virtual_block_schema.as_ref(),
             vec![virtual_block],
-            &mut data,
             write_settings.table_compression,
             write_settings.enable_parquet_dictionary,
             metadata,
@@ -960,6 +951,7 @@ impl VirtualColumnBuilder {
             virtual_column_names,
             columns_statistics,
         )?;
+        let data = opendal::Buffer::from(payload);
         let data_size = data.len() as u64;
         let virtual_column_location =
             TableMetaLocationGenerator::gen_virtual_block_location(&location.0);
