@@ -33,14 +33,15 @@ impl FromToProto for MVDefinition {
 
     fn from_pb(p: Self::PB) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
-        let schema = p
-            .schema
-            .ok_or_else(|| Incompatible::new("MVDefinition.schema can not be None".to_string()))?;
+        let logical_schema = p.logical_schema.ok_or_else(|| {
+            Incompatible::new("MVDefinition.logical_schema can not be None".to_string())
+        })?;
 
         Ok(Self {
             original_query: p.original_query,
             query: p.query,
-            schema: TableSchema::from_pb(schema)?,
+            logical_schema: TableSchema::from_pb(logical_schema)?,
+            sync_creation: p.sync_creation,
         })
     }
 
@@ -50,7 +51,8 @@ impl FromToProto for MVDefinition {
             min_reader_ver: MIN_READER_VER,
             original_query: self.original_query.clone(),
             query: self.query.clone(),
-            schema: Some(self.schema.to_pb()),
+            logical_schema: Some(self.logical_schema.to_pb()),
+            sync_creation: self.sync_creation,
         }
     }
 }

@@ -65,7 +65,8 @@ impl TableMeta {
 pub struct MVDefinition {
     pub original_query: String,
     pub query: String,
-    pub schema: TableSchema,
+    pub logical_schema: TableSchema,
+    pub sync_creation: bool,
 }
 
 /// Complete metadata needed to use one materialized view.

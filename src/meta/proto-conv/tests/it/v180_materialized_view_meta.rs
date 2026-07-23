@@ -31,16 +31,18 @@ fn test_decode_v180_materialized_view_definition() -> anyhow::Result<()> {
         100, 41, 26, 19, 154, 2, 9, 34, 0, 160, 6, 180, 1, 168, 6, 24, 160, 6, 180, 1, 168, 6, 24,
         160, 6, 180, 1, 168, 6, 24, 10, 41, 10, 9, 99, 111, 117, 110, 116, 40, 105, 100, 41, 26,
         19, 154, 2, 9, 34, 0, 160, 6, 180, 1, 168, 6, 24, 160, 6, 180, 1, 168, 6, 24, 32, 1, 160,
-        6, 180, 1, 168, 6, 24, 24, 2, 160, 6, 180, 1, 168, 6, 24, 160, 6, 180, 1, 168, 6, 24,
+        6, 180, 1, 168, 6, 24, 24, 2, 160, 6, 180, 1, 168, 6, 24, 32, 1, 160, 6, 180, 1, 168, 6,
+        24,
     ];
 
     let want = || MVDefinition {
         original_query: "SELECT id FROM t".to_string(),
         query: "SELECT id FROM default.default.t".to_string(),
-        schema: TableSchema::new(vec![
+        logical_schema: TableSchema::new(vec![
             TableField::new("sum(id)", TableDataType::Number(NumberDataType::UInt64)),
             TableField::new("count(id)", TableDataType::Number(NumberDataType::UInt64)),
         ]),
+        sync_creation: true,
     };
 
     common::test_pb_from_to(func_name!(), want())?;

@@ -34,10 +34,17 @@ message MVDefinition {
   // Columns and types returned when querying the materialized view. For example,
   // if orders.amount is a non-null Float64:
   // SELECT AVG(amount) AS avg_amount FROM orders
-  // this schema is [avg_amount: Float64]. The materialized-view TableMeta.schema
-  // is [avg_amount: Tuple(Float64, UInt64)]. The Fuse table stores this mergeable
-  // AVG state (sum and count), which is finalized as avg_amount when queried.
-  DataSchema schema = 3;
+  // this logical schema is [avg_amount: Float64]. The materialized-view
+  // TableMeta.schema is [avg_amount: Tuple(Float64, UInt64)]. The Fuse table
+  // stores this mergeable AVG state (sum and count), which is finalized as
+  // avg_amount when queried.
+  DataSchema logical_schema = 3;
+
+  // Whether source-table writes maintain the MV synchronously.
+  // CREATE MATERIALIZED VIEW explicitly sets this to true; CREATE ASYNC
+  // MATERIALIZED VIEW sets it to false and scheduled tasks refresh the MV.
+  // This mode is immutable after publication; recreate the MV to change it.
+  bool sync_creation = 4;
 }
 
 // MV table ids that depend on one source table.

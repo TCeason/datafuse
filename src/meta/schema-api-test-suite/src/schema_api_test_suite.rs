@@ -1688,7 +1688,8 @@ impl SchemaApiTestSuite {
         let new_definition = |source_table_name: &str| MVDefinition {
             original_query: format!("SELECT number FROM {source_table_name}"),
             query: format!("SELECT number FROM default.{db_name}.{source_table_name}"),
-            schema: TableSchema::empty(),
+            logical_schema: TableSchema::empty(),
+            sync_creation: true,
         };
         let definition = new_definition(&source_table_name);
         let replacement_definition = new_definition(replacement_source_name);

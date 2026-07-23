@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Materialized view metadata uses a source-table reverse index to coordinate
-//! MV lifecycle changes with source-table writes.
+//! MV lifecycle changes with synchronous source-table writes and asynchronous
+//! scheduled refreshes.
 //!
 //! Key-value layout:
 //! - `__fd_materialized_view_definition/<tenant>/<mv_table_id>` ->
@@ -22,9 +23,13 @@
 //!   [`SourceTableMVIds`](databend_common_meta_app::schema::SourceTableMVIds)
 //! - `__fd_table_by_id/<mv_table_id>` -> `TableMeta`; an MV reuses ordinary
 //!   table metadata and storage, and its table ID is also its MV ID.
+//! - [`MVDefinition::sync_creation`] selects the immutable maintenance mode.
+//!   It is true for MVs maintained by source-table writes and false for MVs
+//!   maintained by scheduled refreshes. Changing it requires recreating the MV.
 //! - `SourceTableMVIds` is both the reverse index for a source table and the
-//!   list of MVs that are currently valid for that source table. Its KV
-//!   sequence is the consistency version used by source-table writes.
+//!   list of all synchronous and asynchronous MVs that are currently valid for
+//!   that source table. Its KV sequence is the consistency version for data
+//!   operations based on this list.
 //!
 //! MV table publication and drop algorithm:
 //! 1. Build the MV as a hidden table and store its definition without adding
@@ -42,11 +47,12 @@
 //!
 //! Source-table write algorithm:
 //! 1. Read the source-table index and record its sequence.
-//! 2. Fetch the definition and `TableMeta` for every listed MV table, then plan
-//!    one multi-table operation that writes the source table and all of those MV
-//!    tables.
-//! 3. Commit the operation with the source-table-index sequence as a condition.
-//! 4. A concurrent MV-table create, drop, or replacement changes the sequence,
+//! 2. Fetch the definition and `TableMeta` for every listed MV table.
+//! 3. Plan one multi-table operation that writes the source table and every
+//!    synchronous MV table. Asynchronous MVs are excluded because scheduled
+//!    refreshes maintain them.
+//! 4. Commit the operation with the source-table-index sequence as a condition.
+//! 5. A concurrent MV-table create, drop, or replacement changes the sequence,
 //!    so the commit fails and the write is planned again with the new MV list.
 //!
 //! Source-table DDL invalidation and recovery:
@@ -54,11 +60,14 @@
 //!    the source table or changing its columns, clears the source-table index in
 //!    the same transaction as the source-table change while retaining the empty
 //!    value.
-//! 2. Future writes no longer update those MV tables, an in-progress write fails
-//!    its sequence condition, and querying an MV absent from the source-table
-//!    index reports it as invalid. An MV table staged against the old
-//!    source-table definition also fails validation before publication.
-//! 3. To recover, recreate the MV from the current source-table definition. The
+//! 2. Future source-table writes no longer update synchronous MVs, and scheduled
+//!    refreshes must not update asynchronous MVs absent from the source-table
+//!    index.
+//! 3. An in-progress data operation based on the old index fails its sequence
+//!    condition, querying an MV absent from the index reports it as invalid, and
+//!    an MV table staged against the old source-table definition fails validation
+//!    before publication.
+//! 4. To recover, recreate the MV from the current source-table definition. The
 //!    new MV becomes valid when its table ID is published in the source-table
 //!    index.
 
@@ -99,13 +108,18 @@ where
         self.get_pb(&ident).await
     }
 
-    /// Get the MVs that depend on a source table and the source index sequence.
+    /// Get the MVs that depend on a source table and the source-index sequence.
     ///
-    /// Each [`MVInfo`] contains the definition and `TableMeta` needed for a
-    /// multi-table write. The caller must use
-    /// [`SourceTableMVs::source_table_mvs_index_seq`] as a transaction condition
-    /// so that a concurrent MV create, drop, or replacement invalidates the
-    /// write. The sequence is 0 when the source index does not exist.
+    /// The result includes both synchronous and asynchronous MVs. Each [`MVInfo`]
+    /// contains its definition and `TableMeta`. A source-table write includes
+    /// only MVs whose [`MVDefinition::sync_creation`] is true; scheduled
+    /// refreshes maintain those for which it is false.
+    ///
+    /// A caller that commits data based on this result must use
+    /// [`SourceTableMVs::source_table_mvs_index_seq`] as a transaction condition.
+    /// A concurrent MV create, drop, replacement, or invalidation changes the
+    /// sequence and invalidates the operation. The sequence is 0 when the
+    /// source-table index does not exist.
     ///
     /// Definitions and table metadata are fetched in one `mget_kv` request.
     /// Incomplete MVs are omitted with a warning.
