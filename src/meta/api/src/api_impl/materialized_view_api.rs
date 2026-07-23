@@ -12,70 +12,90 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Materialized view metadata uses a source-table reverse index to coordinate
-//! MV lifecycle changes with synchronous source-table writes and asynchronous
-//! scheduled refreshes.
+//! Materialized-view metadata reuses the ordinary table lifecycle and adds an
+//! immutable definition plus a versioned source-table reverse index.
 //!
 //! Key-value layout:
 //! - `__fd_materialized_view_definition/<tenant>/<mv_table_id>` ->
 //!   [`MVDefinition`]
 //! - `__fd_materialized_view_by_source/<tenant>/<source_table_id>` ->
-//!   [`SourceTableMVIds`](databend_common_meta_app::schema::SourceTableMVIds)
+//!   `SourceTableMVIds [mv_table_id, ...]`
 //! - `__fd_table_by_id/<mv_table_id>` -> `TableMeta`; an MV reuses ordinary
 //!   table metadata and storage, and its table ID is also its MV ID.
+//! - `TableMeta.options["materialized_view_source_table_id"]` stores the
+//!   immutable source-table ID. It is not a source snapshot location.
 //! - [`MVDefinition::sync_creation`] selects the immutable maintenance mode.
-//!   It is true for MVs maintained by source-table writes and false for MVs
-//!   maintained by scheduled refreshes. Changing it requires recreating the MV.
-//! - `SourceTableMVIds` is both the reverse index for a source table and the
-//!   list of all synchronous and asynchronous MVs that are currently valid for
-//!   that source table. Its KV sequence is the consistency version for data
-//!   operations based on this list.
+//!   Changing it requires recreating the MV.
 //!
-//! MV table publication and drop algorithm:
-//! 1. Build the MV as a hidden table and store its definition without adding
-//!    the MV table ID to the source-table index.
-//! 2. Before publishing the MV table, validate its staged definition against
-//!    the current source-table definition and use the source table's `TableMeta`
-//!    sequence as a commit condition.
-//! 3. Publish the MV table and add its ID to the source-table index in one
-//!    transaction. `CREATE OR REPLACE` also removes the previous MV table ID,
-//!    including from a different source-table index.
-//! 4. Dropping an MV table removes its definition and source-table-index
-//!    membership in the same transaction that marks the MV table as dropped.
-//!    An empty source-table index is retained so its sequence advances;
-//!    source-table GC owns its final deletion.
+//! CREATE and source-DDL concurrency:
+//! - Query-layer integration is a follow-up. While binding the definition, the
+//!   Binder must read the source index through `TableContext`/`Catalog`, not by
+//!   depending on this Meta API directly. The catalog implementation calls
+//!   `MaterializedViewApi::get_source_table_mv_ids`, and the bound plan records
+//!   the returned `SeqV::seq`.
+//! - The CREATE interpreter copies that bound sequence into
+//!   `CreateMaterializedViewMeta { definition, source_index_seq }`; it must not
+//!   fetch a new sequence after binding, because doing so would miss a source
+//!   DDL committed between binding and interpretation. V1 requires the MV and
+//!   source to use the same database.
+//! - `TableApi::create_table` gets the source table ID from `TableMeta.options`
+//!   and checks that its `TableMeta` is present and not dropped.
+//! - `publish_mv_to_source_table_index` requires the current reverse-index
+//!   sequence to equal the bound plan's `source_index_seq`, updates the complete
+//!   `SourceTableMVIds`, and adds it through `txn_replace_exact`.
+//! - The reverse-index condition is committed with the MV `TableMeta`,
+//!   `MVDefinition`, and table-name mappings in one transaction. Source
+//!   `TableMeta` seq is deliberately not a condition: ordinary INSERT advances
+//!   it without invalidating the definition. CREATE publishes a visible empty
+//!   MV and records no source snapshot.
+//! - Source-DDL invalidation is a required follow-up contract, not implemented
+//!   in this module. RENAME and ADD/DROP/MODIFY/RENAME COLUMN must replace
+//!   `SourceTableMVIdsIdent(tenant, source_table_id)` with a retained empty
+//!   `SourceTableMVIds` through `txn_replace_exact` in the same transaction as
+//!   the source change. The advanced sequence rejects a CREATE bound before
+//!   such a DDL, even if Meta receives CREATE after the DDL has committed.
+//! - If CREATE changes the index after DDL reads it, the DDL transaction fails
+//!   its exact-sequence condition and must rebuild after rereading the index;
+//!   its retry then applies the DDL result to the newly created relationship.
+//!   RENAME and column DDL leave the index empty. Query and refresh must treat
+//!   an MV absent from this index as invalid; renaming the source back does not
+//!   restore the relationship.
+//! - DROP source does not rewrite the index. The source and MV to
+//!   share a database: `create_table` and `drop_table_by_id` both condition on
+//!   and update that database's `DatabaseId` KV, so an overlapping transaction
+//!   retries and then observes the source `TableMeta::drop_on`. Keeping the
+//!   index unchanged preserves the relationships for UNDROP.
 //!
-//! Source-table write algorithm:
-//! 1. Read the source-table index and record its sequence.
-//! 2. Fetch the definition and `TableMeta` for every listed MV table.
-//! 3. Plan one multi-table operation that writes the source table and every
-//!    synchronous MV table. Asynchronous MVs are excluded because scheduled
-//!    refreshes maintain them.
-//! 4. Commit the operation with the source-table-index sequence as a condition.
-//! 5. A concurrent MV-table create, drop, or replacement changes the sequence,
-//!    so the commit fails and the write is planned again with the new MV list.
+//! Replacement, DROP, and GC:
+//! - CREATE OR REPLACE first calls `construct_drop_table_txn_operations` with
+//!   `remove_mv_source_index = false`. It deletes the old `MVDefinition` and
+//!   marks the old MV dropped. `publish_mv_to_source_table_index` then removes
+//!   the old MV ID and adds the new ID in the same CREATE transaction, including
+//!   when the source table changes.
+//! - DROP MV calls `construct_drop_table_txn_operations` with
+//!   `remove_mv_source_index = true`; the same transaction deletes its
+//!   definition, removes its ID from `SourceTableMVIds`, and marks it dropped.
+//! - DROP source table retains `SourceTableMVIds`, so UNDROP restores the same
+//!   relationships. Source-table GC deletes the reverse-index key.
+//! - Table GC deletes ordinary table metadata. When the table engine is
+//!   `MATERIALIZED_VIEW`, it also idempotently deletes `MVDefinition`, because
+//!   database GC may bypass the per-table DROP path.
 //!
-//! Source-table DDL invalidation and recovery:
-//! 1. A source-table DDL that can invalidate an MV definition, such as renaming
-//!    the source table or changing its columns, clears the source-table index in
-//!    the same transaction as the source-table change while retaining the empty
-//!    value.
-//! 2. Future source-table writes no longer update synchronous MVs, and scheduled
-//!    refreshes must not update asynchronous MVs absent from the source-table
-//!    index.
-//! 3. An in-progress data operation based on the old index fails its sequence
-//!    condition, querying an MV absent from the index reports it as invalid, and
-//!    an MV table staged against the old source-table definition fails validation
-//!    before publication.
-//! 4. To recover, recreate the MV from the current source-table definition. The
-//!    new MV becomes valid when its table ID is published in the source-table
-//!    index.
+//! Source writes:
+//! - `mget_mvs_by_source_table_id` reads `SourceTableMVIds`, then fetches every
+//!   listed `MVDefinition` and MV `TableMeta`. Writers select synchronous MVs
+//!   and commit the already-planned source and MV targets with
+//!   `TableApi::update_multi_table_meta`.
+//! - Source writes intentionally do not condition their commit on the index
+//!   sequence: an MV created after planning is not included, while a dropped or
+//!   replaced MV may receive the in-progress write, matching ordinary
+//!   multi-table INSERT behavior while dropped `TableMeta` remains available.
 
 use databend_common_meta_app::schema::MVDefinition;
 use databend_common_meta_app::schema::MVDefinitionIdent;
 use databend_common_meta_app::schema::MVInfo;
+use databend_common_meta_app::schema::SourceTableMVIds;
 use databend_common_meta_app::schema::SourceTableMVIdsIdent;
-use databend_common_meta_app::schema::SourceTableMVs;
 use databend_common_meta_app::schema::TableId;
 use databend_common_meta_app::tenant::Tenant;
 use databend_meta_client::kvapi;
@@ -108,42 +128,50 @@ where
         self.get_pb(&ident).await
     }
 
-    /// Get the MVs that depend on a source table and the source-index sequence.
+    /// Get the complete source-to-MV index with its KV sequence.
+    ///
+    /// Query-layer integration should expose this through `TableContext` or
+    /// `Catalog`. The Binder stores the returned sequence in the bound plan,
+    /// and the CREATE interpreter later copies it to
+    /// `CreateMaterializedViewMeta::source_index_seq`. A missing index is
+    /// represented as sequence 0 with an empty [`SourceTableMVIds`].
+    #[logcall::logcall]
+    #[fastrace::trace]
+    async fn get_source_table_mv_ids(
+        &self,
+        tenant: &Tenant,
+        source_table_id: u64,
+    ) -> Result<SeqV<SourceTableMVIds>, MetaError> {
+        let ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
+        Ok(self
+            .get_pb(&ident)
+            .await?
+            .unwrap_or_else(|| SeqV::new(0, SourceTableMVIds::default())))
+    }
+
+    /// Get the MVs that depend on a source table.
     ///
     /// The result includes both synchronous and asynchronous MVs. Each [`MVInfo`]
     /// contains its definition and `TableMeta`. A source-table write includes
     /// only MVs whose [`MVDefinition::sync_creation`] is true; scheduled
     /// refreshes maintain those for which it is false.
     ///
-    /// A caller that commits data based on this result must use
-    /// [`SourceTableMVs::source_table_mvs_index_seq`] as a transaction condition.
-    /// A concurrent MV create, drop, replacement, or invalidation changes the
-    /// sequence and invalidates the operation. The sequence is 0 when the
-    /// source-table index does not exist.
-    ///
-    /// Definitions and table metadata are fetched in one `mget_kv` request.
-    /// Incomplete MVs are omitted with a warning.
+    /// Definitions and table metadata are fetched in one `mget_kv` request;
+    /// incomplete MVs are omitted with a warning. The query binding path should
+    /// use the narrower source-index API through its catalog abstraction.
     #[logcall::logcall]
     #[fastrace::trace]
     async fn mget_mvs_by_source_table_id(
         &self,
         tenant: &Tenant,
         source_table_id: u64,
-    ) -> Result<SourceTableMVs, MetaError> {
-        let source_ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
-        let Some(source_mv_ids) = self.get_pb(&source_ident).await? else {
-            return Ok(SourceTableMVs {
-                source_table_mvs_index_seq: 0,
-                mvs: vec![],
-            });
-        };
-        let source_index_seq = source_mv_ids.seq;
+    ) -> Result<Vec<MVInfo>, MetaError> {
+        let source_mv_ids = self
+            .get_source_table_mv_ids(tenant, source_table_id)
+            .await?;
         let mv_ids = source_mv_ids.data.mv_ids();
         if mv_ids.is_empty() {
-            return Ok(SourceTableMVs {
-                source_table_mvs_index_seq: source_index_seq,
-                mvs: vec![],
-            });
+            return Ok(vec![]);
         }
 
         let mut keys = Vec::with_capacity(mv_ids.len() * 2);
@@ -190,10 +218,7 @@ where
             });
         }
 
-        Ok(SourceTableMVs {
-            source_table_mvs_index_seq: source_index_seq,
-            mvs,
-        })
+        Ok(mvs)
     }
 }
 

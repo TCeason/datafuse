@@ -775,13 +775,18 @@ async fn remove_data_for_dropped_table(
     //     warn!("{}", err);
     //     return Ok(Err(err));
     // }
+    // DROP TABLE normally deletes the MV definition. Database GC may collect
+    // tables without first running the per-table DROP path, so keep this
+    // deletion idempotent here as well.
     if is_materialized_view_engine(&seq_meta.data.engine) {
-        let def_ident = MVDefinitionIdent::new(tenant, table_id.table_id);
-        txn.if_then.push(txn_del(&def_ident));
+        txn.if_then
+            .push(txn_del(&MVDefinitionIdent::new(tenant, table_id.table_id)));
     }
 
-    let source_table_mv_ids_ident = SourceTableMVIdsIdent::new(tenant, table_id.table_id);
-    txn.if_then.push(txn_del(&source_table_mv_ids_ident));
+    txn.if_then.push(txn_del(&SourceTableMVIdsIdent::new(
+        tenant,
+        table_id.table_id,
+    )));
 
     txn_delete_exact(txn, table_id, seq_meta.seq);
 

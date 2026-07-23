@@ -204,6 +204,12 @@ fn validate_create_table_request(req: &CreateTableReq) -> Result<(), KVAppError>
             AppError::CreateAsDropTableWithoutDropTime(CreateAsDropTableWithoutDropTime::new(name)),
         ));
     }
+    let is_mv = is_materialized_view_engine(&req.table_meta.engine);
+    if is_mv != req.materialized_view.is_some() || (is_mv && req.as_dropped) {
+        return Err(KVAppError::AppError(
+            InvalidMaterializedView::new("invalid materialized view create request").into(),
+        ));
+    }
     Ok(())
 }
 
@@ -368,6 +374,7 @@ where
                                     *seq_db_id.data,
                                     true,
                                     false,
+                                    req.materialized_view.is_none(),
                                     &mut txn,
                                 )
                                 .await?;
@@ -428,7 +435,7 @@ where
                 // append new table_id into list
                 tb_id_list.append(table_id);
                 let dbid_tbname_seq = seq_table_id.seq;
-
+                let previous_table_id = (dbid_tbname_seq > 0).then_some(seq_table_id.data);
                 txn.condition.extend(vec![
                     // db has not to change, i.e., no new table is created.
                     // Renaming db is OK and does not affect the seq of db_meta.
@@ -450,9 +457,42 @@ where
                     txn_put_pb(&key_table_id_to_name, &key_dbid_tbname), /* __fd_table_id_to_name/db_id/table_name -> DBIdTableName */
                 ]);
 
-                if let Some(ref def) = req.mv_definition {
+                if let Some(ref mv) = req.materialized_view {
                     let def_ident = MVDefinitionIdent::new(req.tenant(), table_id);
-                    txn.if_then.push(txn_put_pb(&def_ident, def));
+                    txn.if_then.push(txn_put_pb(&def_ident, &mv.definition));
+
+                    let source_table_id = req.table_meta.materialized_view_source_table_id()?;
+                    let source_table_ident = TableId::new(source_table_id);
+                    let source_table_meta =
+                        self.get_pb(&source_table_ident).await?.ok_or_else(|| {
+                            KVAppError::AppError(
+                                InvalidMaterializedView::new(format!(
+                                    "source table id {} does not exist",
+                                    source_table_id
+                                ))
+                                .into(),
+                            )
+                        })?;
+                    if source_table_meta.drop_on.is_some() {
+                        return Err(KVAppError::AppError(
+                            InvalidMaterializedView::new(format!(
+                                "source table id {} is dropped",
+                                source_table_id
+                            ))
+                            .into(),
+                        ));
+                    }
+
+                    publish_mv_to_source_table_index(
+                        self,
+                        &mut txn,
+                        req.tenant(),
+                        source_table_id,
+                        table_id,
+                        previous_table_id,
+                        mv.source_index_seq,
+                    )
+                    .await?;
                 }
 
                 if req.as_dropped {
@@ -544,6 +584,7 @@ where
                 table_id,
                 req.db_id,
                 req.if_exists,
+                true,
                 true,
                 &mut txn,
             )
@@ -1103,41 +1144,6 @@ where
                 tb_meta.drop_on = None;
 
                 let mut txn_req = TxnRequest::default();
-                if is_materialized_view_engine(&tb_meta.engine) {
-                    let source_table_id = tb_meta.materialized_view_source_table_id()?;
-                    let source_table_ident = TableId::new(source_table_id);
-                    let (source_table_meta_seq, source_table_meta_opt) =
-                        self.get_pb_seq_and_value(&source_table_ident).await?;
-                    let source_table_meta = source_table_meta_opt.ok_or_else(|| {
-                        KVAppError::AppError(
-                            InvalidMaterializedView::new(format!(
-                                "source table id {source_table_id} does not exist"
-                            ))
-                            .into(),
-                        )
-                    })?;
-                    if source_table_meta.drop_on.is_some() {
-                        return Err(KVAppError::AppError(
-                            InvalidMaterializedView::new(format!(
-                                "source table id {source_table_id} is dropped"
-                            ))
-                            .into(),
-                        ));
-                    }
-                    txn_req
-                        .condition
-                        .push(txn_cond_eq_seq(&source_table_ident, source_table_meta_seq));
-
-                    publish_mv_to_source_table_index(
-                        self,
-                        &mut txn_req,
-                        &tenant_dbname_tbname.tenant,
-                        source_table_id,
-                        table_id,
-                        req.prev_table_id,
-                    )
-                    .await?;
-                }
 
                 txn_req.condition.extend([
                     // db has not to change, i.e., no new table is created.

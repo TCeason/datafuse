@@ -159,7 +159,7 @@ impl StreamHandler for RealStreamHandler {
                 ..Default::default()
             },
             as_dropped: false,
-            mv_definition: None,
+            materialized_view: None,
             table_properties: None,
             table_partition: None,
         };

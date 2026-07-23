@@ -28,7 +28,7 @@ pub use source_table_mv_ids_ident::SourceTableMVIdsIdent;
 pub use source_table_mv_ids_ident::SourceTableMVIdsResource;
 
 pub const MATERIALIZED_VIEW_ENGINE: &str = "MATERIALIZED_VIEW";
-/// Internal table option set when a hidden materialized view is created.
+/// Internal table option containing the source table ID of a materialized view.
 pub const OPT_KEY_MATERIALIZED_VIEW_SOURCE_TABLE_ID: &str = "materialized_view_source_table_id";
 
 pub fn is_materialized_view_engine(engine: &str) -> bool {
@@ -69,6 +69,27 @@ pub struct MVDefinition {
     pub sync_creation: bool,
 }
 
+/// Materialized-view metadata supplied only while creating a table.
+///
+/// `definition` is persisted as [`MVDefinition`]. `source_index_seq` binds that
+/// definition to the source metadata observed while binding and is used as a
+/// transaction condition; it is not persisted in the MV `TableMeta`.
+/// A source `TableMeta` sequence is intentionally not carried here because
+/// ordinary source-table writes advance it without invalidating the bound
+/// schema. `create_table` reads the current source `TableMeta` itself to reject
+/// a missing or dropped source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateMaterializedViewMeta {
+    pub definition: MVDefinition,
+    /// Sequence of [`SourceTableMVIds`] observed while binding the definition.
+    ///
+    /// `txn_replace_exact` protects changes after `create_table` reads the
+    /// index. This sequence additionally covers the earlier binding-to-Meta
+    /// window: a definition-changing source DDL clears the index and advances
+    /// its sequence, rejecting a definition bound before the DDL.
+    pub source_index_seq: u64,
+}
+
 /// Complete metadata needed to use one materialized view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MVInfo {
@@ -77,15 +98,12 @@ pub struct MVInfo {
     pub table_meta: SeqV<TableMeta>,
 }
 
-/// Materialized views associated with one source table.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceTableMVs {
-    /// Sequence of the [`SourceTableMVIds`] KV, or 0 if it does not exist.
-    pub source_table_mvs_index_seq: u64,
-    pub mvs: Vec<MVInfo>,
-}
-
 /// Reverse index from a source table to its dependent materialized-view table IDs.
+///
+/// All relationships for one source are stored in one value so its KV sequence
+/// detects concurrent membership changes and source-DDL invalidation. With one
+/// key per relationship, a relationship inserted after a prefix scan would not
+/// change any key observed by that scan.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceTableMVIds {
     mv_ids: Vec<u64>,
@@ -105,11 +123,9 @@ impl SourceTableMVIds {
     }
 
     pub fn add(&mut self, mv_id: u64) {
-        if self.mv_ids.contains(&mv_id) {
-            return;
+        if !self.mv_ids.contains(&mv_id) {
+            self.mv_ids.push(mv_id);
         }
-
-        self.mv_ids.push(mv_id);
     }
 
     pub fn remove(&mut self, mv_id: u64) {

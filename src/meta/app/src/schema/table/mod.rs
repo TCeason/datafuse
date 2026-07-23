@@ -42,7 +42,7 @@ use super::DatabaseId;
 use super::MarkedDeletedIndexMeta;
 use crate::schema::constraint::Constraint;
 use crate::schema::database_name_ident::DatabaseNameIdent;
-use crate::schema::materialized_view::MVDefinition;
+use crate::schema::materialized_view::CreateMaterializedViewMeta;
 use crate::schema::table_niv::TableNIV;
 use crate::storage::StorageParams;
 use crate::tenant::Tenant;
@@ -528,12 +528,12 @@ pub struct CreateTableReq {
     /// currently used in atomic CTAS.
     pub as_dropped: bool,
 
-    /// The defining query to persist for a materialized-view table.
+    /// Definition and source binding for a materialized-view table.
     ///
-    /// When set, `create_table` stores it under the newly allocated table ID in
-    /// the same transaction as `table_meta`. It is `None` for
-    /// non-materialized-view tables.
-    pub mv_definition: Option<MVDefinition>,
+    /// `create_table` persists only the definition. The source-index sequence
+    /// validates that the definition is still bound to the source metadata
+    /// recorded in the CREATE plan. It is `None` for non-MV tables.
+    pub materialized_view: Option<CreateMaterializedViewMeta>,
 
     /// Iceberg table properties
     pub table_properties: Option<BTreeMap<String, String>>,

@@ -21,6 +21,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use databend_common_meta_app::app_error::AppError;
 use databend_common_meta_app::app_error::DropTableWithDropTime;
+use databend_common_meta_app::app_error::InvalidMaterializedView;
 use databend_common_meta_app::app_error::UndropTableAlreadyExists;
 use databend_common_meta_app::app_error::UndropTableHasNoHistory;
 use databend_common_meta_app::app_error::UndropTableRetentionGuard;
@@ -171,9 +172,10 @@ pub async fn get_history_table_metas(
     Ok(tb_metas)
 }
 
-/// Fill in transaction conditions and operations to remove an MV from its source table index.
+/// Add operations that remove one MV from its source-table index.
 ///
-/// This function does not submit the transaction.
+/// The empty index value is retained so a later source DDL can advance its KV
+/// sequence and invalidate definitions bound before that DDL.
 async fn remove_mv_from_source_table_index(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     txn: &mut TxnRequest,
@@ -181,31 +183,23 @@ async fn remove_mv_from_source_table_index(
     source_table_id: u64,
     mv_table_id: u64,
 ) -> Result<(), KVAppError> {
-    let source_table_mv_ids_ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
-    let (source_table_mv_ids_seq, source_mv_ids_opt) = kv_api
-        .get_pb_seq_and_value(&source_table_mv_ids_ident)
-        .await?;
-    let Some(mut source_mv_ids) = source_mv_ids_opt else {
+    let index_ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
+    let (index_seq, source_mv_ids) = kv_api.get_pb_seq_and_value(&index_ident).await?;
+    let Some(mut source_mv_ids) = source_mv_ids else {
         return Ok(());
     };
 
-    // Keep the index even when empty; source table GC owns its deletion.
     source_mv_ids.remove(mv_table_id);
-
-    txn_replace_exact(
-        txn,
-        &source_table_mv_ids_ident,
-        source_table_mv_ids_seq,
-        &source_mv_ids,
-    )?;
-
+    txn_replace_exact(txn, &index_ident, index_seq, &source_mv_ids)?;
     Ok(())
 }
 
-/// Fill in transaction conditions and operations to publish an MV in its source table index.
+/// Add operations that publish an MV in its source-table index.
 ///
-/// For CREATE OR REPLACE, this also removes the previous MV from its source table index.
-/// This function does not submit the transaction.
+/// `expected_source_index_seq` is the index sequence stored in the bound CREATE
+/// plan. It protects the binding-to-Meta window: source DDL clears the same
+/// index and advances its sequence before `create_table` can publish a
+/// definition bound to the old source.
 pub(crate) async fn publish_mv_to_source_table_index(
     kv_api: &(impl kvapi::KVApi<Error = MetaError> + ?Sized),
     txn: &mut TxnRequest,
@@ -213,12 +207,17 @@ pub(crate) async fn publish_mv_to_source_table_index(
     source_table_id: u64,
     mv_table_id: u64,
     previous_table_id: Option<u64>,
+    expected_source_index_seq: u64,
 ) -> Result<(), KVAppError> {
-    let source_table_mv_ids_ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
-    let (source_table_mv_ids_seq, source_mv_ids_opt) = kv_api
-        .get_pb_seq_and_value(&source_table_mv_ids_ident)
-        .await?;
-    let mut source_mv_ids = source_mv_ids_opt.unwrap_or_default();
+    let index_ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
+    let (index_seq, source_mv_ids) = kv_api.get_pb_seq_and_value(&index_ident).await?;
+    if index_seq != expected_source_index_seq {
+        return Err(KVAppError::AppError(
+            InvalidMaterializedView::new("source table changed while binding materialized view")
+                .into(),
+        ));
+    }
+    let mut source_mv_ids = source_mv_ids.unwrap_or_default();
 
     if let Some(previous_table_id) = previous_table_id {
         let (_, previous_table_meta) = kv_api
@@ -246,13 +245,7 @@ pub(crate) async fn publish_mv_to_source_table_index(
     }
 
     source_mv_ids.add(mv_table_id);
-    txn_replace_exact(
-        txn,
-        &source_table_mv_ids_ident,
-        source_table_mv_ids_seq,
-        &source_mv_ids,
-    )?;
-
+    txn_replace_exact(txn, &index_ident, index_seq, &source_mv_ids)?;
     Ok(())
 }
 
@@ -265,6 +258,7 @@ pub async fn construct_drop_table_txn_operations(
     db_id: u64,
     if_exists: bool,
     if_delete: bool,
+    remove_mv_source_index: bool,
     txn: &mut TxnRequest,
 ) -> Result<(u64, u64), KVAppError> {
     let tbid = TableId { table_id };
@@ -373,7 +367,10 @@ pub async fn construct_drop_table_txn_operations(
         let source_table_id = tb_meta.materialized_view_source_table_id()?;
         let def_ident = MVDefinitionIdent::new(tenant, table_id);
         txn.if_then.push(txn_del(&def_ident));
-        remove_mv_from_source_table_index(kv_api, txn, tenant, source_table_id, table_id).await?;
+        if remove_mv_source_index {
+            remove_mv_from_source_table_index(kv_api, txn, tenant, source_table_id, table_id)
+                .await?;
+        }
     }
 
     // There must NOT be concurrent txn(b) that list-then-delete tables:
