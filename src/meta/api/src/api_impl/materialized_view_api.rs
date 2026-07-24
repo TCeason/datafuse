@@ -12,94 +12,156 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Materialized-view metadata reuses the ordinary table lifecycle and adds an
-//! immutable definition plus a versioned source-table reverse index.
+//! An MV reuses ordinary `TableMeta`; its table ID is also its MV ID.
 //!
-//! Key-value layout:
-//! - `__fd_materialized_view_definition/<tenant>/<mv_table_id>` ->
-//!   [`MVDefinition`]
-//! - `__fd_materialized_view_by_source/<tenant>/<source_table_id>` ->
-//!   `SourceTableMVIds [mv_table_id, ...]`
-//! - `__fd_table_by_id/<mv_table_id>` -> `TableMeta`; an MV reuses ordinary
-//!   table metadata and storage, and its table ID is also its MV ID.
-//! - `TableMeta.options["materialized_view_source_table_id"]` stores the
-//!   immutable source-table ID. It is not a source snapshot location.
-//! - [`MVDefinition::sync_creation`] selects the immutable maintenance mode.
-//!   Changing it requires recreating the MV.
+//! ```text
+//! __fd_table_by_id/<mv_id>
+//!     -> TableMeta
+//!        options["materialized_view_source_table_id"] = <source_id>
+//! __fd_materialized_view_definition/<tenant>/<mv_id>
+//!     -> MVDefinition
+//! __fd_materialized_view_by_source/<tenant>/<source_id>/<mv_id>
+//!     -> EmptyProto
+//! __fd_materialized_view_source_binding_version/<tenant>/<source_id>
+//!     -> EmptyProto
+//! ```
 //!
-//! CREATE and source-DDL concurrency:
-//! - Query-layer integration is a follow-up. While binding the definition, the
-//!   Binder must read the source index through `TableContext`/`Catalog`, not by
-//!   depending on this Meta API directly. The catalog implementation calls
-//!   `MaterializedViewApi::get_source_table_mv_ids`, and the bound plan records
-//!   the returned `SeqV::seq`.
-//! - The CREATE interpreter copies that bound sequence into
-//!   `CreateMaterializedViewMeta { definition, source_index_seq }`; it must not
-//!   fetch a new sequence after binding, because doing so would miss a source
-//!   DDL committed between binding and interpretation. V1 requires the MV and
-//!   source to use the same database.
-//! - `TableApi::create_table` gets the source table ID from `TableMeta.options`
-//!   and checks that its `TableMeta` is present and not dropped.
-//! - `publish_mv_to_source_table_index` requires the current reverse-index
-//!   sequence to equal the bound plan's `source_index_seq`, updates the complete
-//!   `SourceTableMVIds`, and adds it through `txn_replace_exact`.
-//! - The reverse-index condition is committed with the MV `TableMeta`,
-//!   `MVDefinition`, and table-name mappings in one transaction. Source
-//!   `TableMeta` seq is deliberately not a condition: ordinary INSERT advances
-//!   it without invalidating the definition. CREATE publishes a visible empty
-//!   MV and records no source snapshot.
-//! - Source-DDL invalidation is a required follow-up contract, not implemented
-//!   in this module. RENAME and ADD/DROP/MODIFY/RENAME COLUMN must replace
-//!   `SourceTableMVIdsIdent(tenant, source_table_id)` with a retained empty
-//!   `SourceTableMVIds` through `txn_replace_exact` in the same transaction as
-//!   the source change. The advanced sequence rejects a CREATE bound before
-//!   such a DDL, even if Meta receives CREATE after the DDL has committed.
-//! - If CREATE changes the index after DDL reads it, the DDL transaction fails
-//!   its exact-sequence condition and must rebuild after rereading the index;
-//!   its retry then applies the DDL result to the newly created relationship.
-//!   RENAME and column DDL leave the index empty. Query and refresh must treat
-//!   an MV absent from this index as invalid; renaming the source back does not
-//!   restore the relationship.
-//! - DROP source does not rewrite the index. The source and MV to
-//!   share a database: `create_table` and `drop_table_by_id` both condition on
-//!   and update that database's `DatabaseId` KV, so an overlapping transaction
-//!   retries and then observes the source `TableMeta::drop_on`. Keeping the
-//!   index unchanged preserves the relationships for UNDROP.
+//! CREATE/DROP MV only puts/deletes
+//! `SourceTableMVIdent(tenant, source_id, mv_id)`. RENAME and schema-changing
+//! source-table DDL delete every `SourceTableMVIdent` under the source-table
+//! relationship prefix and
+//! rewrite `MVSourceBindingVersionIdent(tenant, source_id)` to advance its KV
+//! sequence.
 //!
-//! Replacement, DROP, and GC:
-//! - CREATE OR REPLACE first calls `construct_drop_table_txn_operations` with
-//!   `remove_mv_source_index = false`. It deletes the old `MVDefinition` and
-//!   marks the old MV dropped. `publish_mv_to_source_table_index` then removes
-//!   the old MV ID and adds the new ID in the same CREATE transaction, including
-//!   when the source table changes.
-//! - DROP MV calls `construct_drop_table_txn_operations` with
-//!   `remove_mv_source_index = true`; the same transaction deletes its
-//!   definition, removes its ID from `SourceTableMVIds`, and marks it dropped.
-//! - DROP source table retains `SourceTableMVIds`, so UNDROP restores the same
-//!   relationships. Source-table GC deletes the reverse-index key.
-//! - Table GC deletes ordinary table metadata. When the table engine is
-//!   `MATERIALIZED_VIEW`, it also idempotently deletes `MVDefinition`, because
-//!   database GC may bypass the per-table DROP path.
+//! Query binding must return a `TableInfo` and binding-version sequence from one
+//! stable read window. Query-layer integration is a follow-up; its
+//! `TableContext`/`Catalog` implementation follows this read/check loop:
 //!
-//! Source writes:
-//! - `mget_mvs_by_source_table_id` reads `SourceTableMVIds`, then fetches every
-//!   listed `MVDefinition` and MV `TableMeta`. Writers select synchronous MVs
-//!   and commit the already-planned source and MV targets with
-//!   `TableApi::update_multi_table_meta`.
-//! - Source writes intentionally do not condition their commit on the index
-//!   sequence: an MV created after planning is not included, while a dropped or
-//!   replaced MV may receive the in-progress write, matching ordinary
-//!   multi-table INSERT behavior while dropped `TableMeta` remains available.
+//! ```text
+//! loop {
+//!     (name_seq_1, source_id_1) = get(source_name_ident);
+//!     version_seq_1 = get_seq(MVSourceBindingVersionIdent(source_id_1));
+//!     source_meta = get(TableId(source_id_1));
+//!     (name_seq_2, source_id_2) = get(source_name_ident);
+//!     version_seq_2 = get_seq(MVSourceBindingVersionIdent(source_id_1));
+//!
+//!     if name_seq_1 == name_seq_2
+//!         && source_id_1 == source_id_2
+//!         && version_seq_1 == version_seq_2
+//!     {
+//!         return (source_meta, version_seq_1);
+//!     }
+//! }
+//! ```
+//!
+//! The CREATE interpreter stores that sequence in
+//! `CreateMaterializedViewMeta::source_binding_version_seq`. `create_table`
+//! verifies that the source table exists and is not dropped, then appends:
+//!
+//! ```text
+//! txn.condition.push(txn_cond_eq_seq(
+//!     &MVSourceBindingVersionIdent::new(tenant, source_id),
+//!     source_binding_version_seq,
+//! ));
+//! txn.if_then.push(txn_put_pb(
+//!     &SourceTableMVIdent::new_generic(
+//!         tenant,
+//!         SourceTableMV::new(source_id, mv_id),
+//!     ),
+//!     &EmptyProto {},
+//! ));
+//! // The same txn creates TableMeta, MVDefinition, and table-name mappings.
+//! ```
+//!
+//! CREATE publishes a visible empty MV and records no source-table snapshot.
+//! The source-table `TableMeta` seq is not the binding token because INSERT also
+//! advances it.
+//!
+//! Source-table DDL invalidation is a follow-up. RENAME and
+//! ADD/DROP/MODIFY/RENAME COLUMN append the following operations to the
+//! source-table change transaction:
+//!
+//! ```text
+//! loop {
+//!     prefix = DirName(SourceTableMVIdent(tenant, source_id, 0));
+//!     relationships = list_pb_vec(prefix);
+//!     (version_seq, _) = get_pb_seq_and_value(
+//!         MVSourceBindingVersionIdent(source_id),
+//!     ); // version_seq is 0 when the key is missing.
+//!
+//!     txn.condition.push(txn_cond_eq_keys_with_prefix(prefix, relationships.len()));
+//!     for relationship in relationships {
+//!         txn_delete_exact(txn, relationship.key, relationship.seqv.seq);
+//!     }
+//!     txn_replace_exact(
+//!         txn,
+//!         MVSourceBindingVersionIdent(source_id),
+//!         version_seq,
+//!         EmptyProto {},
+//!     );
+//!     // The same txn changes the source-table TableMeta or its name mappings.
+//!
+//!     if send_txn(txn).success {
+//!         break;
+//!     }
+//!     // Retry from list_pb_vec() and get_pb_seq_and_value().
+//! }
+//! ```
+//!
+//! Query and refresh use
+//! `get_pb(SourceTableMVIdent(tenant, source_id, mv_id)).is_some()` as the MV
+//! validity check. Renaming the source table back does not put this relationship
+//! key, so an invalidated MV remains invalid.
+//!
+//! ```text
+//! CREATE MV txn:
+//!     txn_put_pb(TableId(new_mv_id), new_mv_table_meta)
+//!     txn_put_pb(MVDefinitionIdent(tenant, new_mv_id), definition)
+//!     txn_put_pb(SourceTableMVIdent(tenant, source_id, new_mv_id), EmptyProto {})
+//!
+//! REPLACE MV txn:
+//!     txn_put_pb(TableId(old_mv_id), old_mv_table_meta_with_drop_on)
+//!     txn_del(MVDefinitionIdent(tenant, old_mv_id))
+//!     txn_del(SourceTableMVIdent(tenant, old_source_id, old_mv_id))
+//!     // Append the CREATE MV operations for new_mv_id.
+//!
+//! DROP MV txn:
+//!     txn_put_pb(TableId(mv_id), mv_table_meta_with_drop_on)
+//!     txn_del(MVDefinitionIdent(tenant, mv_id))
+//!     txn_del(SourceTableMVIdent(tenant, source_id, mv_id))
+//!
+//! DROP source table txn:
+//!     // Do not delete SourceTableMVIdent(tenant, source_id, *).
+//!     // Do not delete MVSourceBindingVersionIdent(tenant, source_id).
+//!     // Source UNDROP therefore sees the same relationships and version key.
+//!
+//! GC MV txn:
+//!     // Delete TableId(mv_id) and the other ordinary table-GC metadata.
+//!     txn_del(MVDefinitionIdent(tenant, mv_id)) // idempotent for database GC
+//!     if let Ok(source_table_id) = table_meta.materialized_view_source_table_id() {
+//!         txn_del(SourceTableMVIdent(tenant, source_table_id, mv_id))
+//!     } else {
+//!         warn // Do not block GC for a malformed MV TableMeta.
+//!     }
+//!
+//! GC source table txn:
+//!     for relationship in list(SourceTableMVIdent(tenant, source_id, *)) {
+//!         txn_del(relationship)
+//!     }
+//!     txn_del(MVSourceBindingVersionIdent(tenant, source_id))
+//! ```
 
 use databend_common_meta_app::schema::MVDefinition;
 use databend_common_meta_app::schema::MVDefinitionIdent;
 use databend_common_meta_app::schema::MVInfo;
-use databend_common_meta_app::schema::SourceTableMVIds;
-use databend_common_meta_app::schema::SourceTableMVIdsIdent;
+use databend_common_meta_app::schema::SourceTableMV;
+use databend_common_meta_app::schema::SourceTableMVIdent;
 use databend_common_meta_app::schema::TableId;
 use databend_common_meta_app::tenant::Tenant;
 use databend_meta_client::kvapi;
+use databend_meta_client::kvapi::DirName;
 use databend_meta_client::kvapi::KvApiExt;
+use databend_meta_client::kvapi::ListOptions;
 use databend_meta_client::kvapi::StructKey;
 use databend_meta_client::types::MetaError;
 use databend_meta_client::types::SeqV;
@@ -128,48 +190,39 @@ where
         self.get_pb(&ident).await
     }
 
-    /// Get the complete source-to-MV index with its KV sequence.
+    /// List the MVs that depend on a source table.
     ///
-    /// Query-layer integration should expose this through `TableContext` or
-    /// `Catalog`. The Binder stores the returned sequence in the bound plan,
-    /// and the CREATE interpreter later copies it to
-    /// `CreateMaterializedViewMeta::source_index_seq`. A missing index is
-    /// represented as sequence 0 with an empty [`SourceTableMVIds`].
+    /// ```text
+    /// list SourceTableMVIdent(tenant, source_table_id, *) -> mv_table_ids
+    /// mget MVDefinitionIdent(mv_table_id) + TableId(mv_table_id) -> MVInfo
+    /// ```
+    ///
+    /// The result contains both maintenance modes.
+    /// INSERT should selects `MVDefinition::sync_creation = true`;
+    /// scheduled refresh selects `false`.
+    /// No collection version is returned. An MV created after the relationship
+    /// list is a new empty table, so the current INSERT does not write it. An MV
+    /// dropped after the list may still receive the current INSERT while its
+    /// dropped `TableMeta` is retained for GC. A definition or `TableMeta`
+    /// missing between the list and mget is omitted with a warning.
     #[logcall::logcall]
     #[fastrace::trace]
-    async fn get_source_table_mv_ids(
-        &self,
-        tenant: &Tenant,
-        source_table_id: u64,
-    ) -> Result<SeqV<SourceTableMVIds>, MetaError> {
-        let ident = SourceTableMVIdsIdent::new(tenant, source_table_id);
-        Ok(self
-            .get_pb(&ident)
-            .await?
-            .unwrap_or_else(|| SeqV::new(0, SourceTableMVIds::default())))
-    }
-
-    /// Get the MVs that depend on a source table.
-    ///
-    /// The result includes both synchronous and asynchronous MVs. Each [`MVInfo`]
-    /// contains its definition and `TableMeta`. A source-table write includes
-    /// only MVs whose [`MVDefinition::sync_creation`] is true; scheduled
-    /// refreshes maintain those for which it is false.
-    ///
-    /// Definitions and table metadata are fetched in one `mget_kv` request;
-    /// incomplete MVs are omitted with a warning. The query binding path should
-    /// use the narrower source-index API through its catalog abstraction.
-    #[logcall::logcall]
-    #[fastrace::trace]
-    async fn mget_mvs_by_source_table_id(
+    async fn list_mvs_by_source_table_id(
         &self,
         tenant: &Tenant,
         source_table_id: u64,
     ) -> Result<Vec<MVInfo>, MetaError> {
-        let source_mv_ids = self
-            .get_source_table_mv_ids(tenant, source_table_id)
+        let source_mv_prefix = DirName::new(SourceTableMVIdent::new_generic(
+            tenant,
+            SourceTableMV::new(source_table_id, 0),
+        ));
+        let source_mvs = self
+            .list_pb_vec(ListOptions::unlimited(&source_mv_prefix))
             .await?;
-        let mv_ids = source_mv_ids.data.mv_ids();
+        let mv_ids = source_mvs
+            .iter()
+            .map(|(ident, _)| ident.name().mv_table_id)
+            .collect::<Vec<_>>();
         if mv_ids.is_empty() {
             return Ok(vec![]);
         }

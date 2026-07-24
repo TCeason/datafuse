@@ -14,9 +14,7 @@
 
 use databend_common_expression::TableSchema;
 use databend_common_meta_app::schema::MVDefinition;
-use databend_common_meta_app::schema::SourceTableMVIds;
 use databend_common_protos::pb::MvDefinition as PbMVDefinition;
-use databend_common_protos::pb::SourceTableMvIds as PbSourceTableMVIds;
 
 use crate::FromToProto;
 use crate::Incompatible;
@@ -53,27 +51,6 @@ impl FromToProto for MVDefinition {
             query: self.query.clone(),
             logical_schema: Some(self.logical_schema.to_pb()),
             sync_creation: self.sync_creation,
-        }
-    }
-}
-
-impl FromToProto for SourceTableMVIds {
-    type PB = PbSourceTableMVIds;
-
-    fn get_pb_ver(p: &Self::PB) -> u64 {
-        p.ver
-    }
-
-    fn from_pb(p: Self::PB) -> Result<Self, Incompatible> {
-        reader_check_msg(p.ver, p.min_reader_ver)?;
-        Ok(Self::from_ids(p.mv_ids))
-    }
-
-    fn to_pb(&self) -> Self::PB {
-        PbSourceTableMVIds {
-            ver: VER,
-            min_reader_ver: MIN_READER_VER,
-            mv_ids: self.mv_ids().to_vec(),
         }
     }
 }

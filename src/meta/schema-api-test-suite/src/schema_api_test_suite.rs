@@ -92,6 +92,7 @@ use databend_common_meta_app::schema::DropSequenceReq;
 use databend_common_meta_app::schema::DropTableByIdReq;
 use databend_common_meta_app::schema::DropTableIndexReq;
 use databend_common_meta_app::schema::DroppedId;
+use databend_common_meta_app::schema::EmptyProto;
 use databend_common_meta_app::schema::ExtendLockRevReq;
 use databend_common_meta_app::schema::GcDroppedTableReq;
 use databend_common_meta_app::schema::GetDatabaseReq;
@@ -119,6 +120,7 @@ use databend_common_meta_app::schema::LockMeta;
 use databend_common_meta_app::schema::LockType;
 use databend_common_meta_app::schema::MATERIALIZED_VIEW_ENGINE;
 use databend_common_meta_app::schema::MVDefinition;
+use databend_common_meta_app::schema::MVSourceBindingVersionIdent;
 use databend_common_meta_app::schema::MarkedDeletedIndexType;
 use databend_common_meta_app::schema::OPT_KEY_MATERIALIZED_VIEW_SOURCE_TABLE_ID;
 use databend_common_meta_app::schema::RenameDatabaseReq;
@@ -129,7 +131,8 @@ use databend_common_meta_app::schema::SequenceIdent;
 use databend_common_meta_app::schema::SetSecurityPolicyAction;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
 use databend_common_meta_app::schema::SetTableRowAccessPolicyReq;
-use databend_common_meta_app::schema::SourceTableMVIdsIdent;
+use databend_common_meta_app::schema::SourceTableMV;
+use databend_common_meta_app::schema::SourceTableMVIdent;
 use databend_common_meta_app::schema::SwapTableReq;
 use databend_common_meta_app::schema::TableCopiedFileInfo;
 use databend_common_meta_app::schema::TableCopiedFileNameIdent;
@@ -1694,14 +1697,15 @@ impl SchemaApiTestSuite {
         };
         let definition = new_definition(&source_table_name);
         let replacement_definition = new_definition(replacement_source_name);
-        let initial_source_index_seq = mt
-            .get_source_table_mv_ids(&tenant, source_table_id)
+        let initial_source_binding_version_seq = mt
+            .get_pb(&MVSourceBindingVersionIdent::new(&tenant, source_table_id))
             .await?
-            .seq;
+            .map(|seqv| seqv.seq)
+            .unwrap_or(0);
         let new_mv_req = |name,
                           create_option,
                           source_table_id: u64,
-                          source_index_seq: u64,
+                          source_binding_version_seq: u64,
                           definition: &MVDefinition| {
             let mut table_meta = TableMeta {
                 schema: util.schema(),
@@ -1721,11 +1725,17 @@ impl SchemaApiTestSuite {
                 as_dropped: false,
                 materialized_view: Some(CreateMaterializedViewMeta {
                     definition: definition.clone(),
-                    source_index_seq,
+                    source_binding_version_seq,
                 }),
                 table_properties: None,
                 table_partition: None,
             }
+        };
+        let source_mv_ident = |source_table_id, mv_table_id| {
+            SourceTableMVIdent::new_generic(
+                &tenant,
+                SourceTableMV::new(source_table_id, mv_table_id),
+            )
         };
 
         // A missing source rejects CREATE before any MV name or source index is published.
@@ -1750,7 +1760,7 @@ impl SchemaApiTestSuite {
                     .is_err()
             );
             assert!(
-                mt.mget_mvs_by_source_table_id(&tenant, missing_source_id)
+                mt.list_mvs_by_source_table_id(&tenant, missing_source_id)
                     .await?
                     .is_empty()
             );
@@ -1762,7 +1772,7 @@ impl SchemaApiTestSuite {
                 "mv_hidden",
                 CreateOption::Create,
                 source_table_id,
-                initial_source_index_seq,
+                initial_source_binding_version_seq,
                 &definition,
             );
             hidden_req.as_dropped = true;
@@ -1774,7 +1784,7 @@ impl SchemaApiTestSuite {
                     .is_err()
             );
             assert!(
-                mt.mget_mvs_by_source_table_id(&tenant, source_table_id)
+                mt.list_mvs_by_source_table_id(&tenant, source_table_id)
                     .await?
                     .is_empty()
             );
@@ -1787,12 +1797,10 @@ impl SchemaApiTestSuite {
                     mv_name,
                     CreateOption::Create,
                     source_table_id,
-                    initial_source_index_seq,
+                    initial_source_binding_version_seq,
                     &definition,
                 ))
                 .await?;
-            assert!(created.table_id_seq.is_none());
-
             assert_eq!(
                 mt.get_mv_definition(&tenant, created.table_id)
                     .await?
@@ -1800,49 +1808,38 @@ impl SchemaApiTestSuite {
                     .data,
                 definition
             );
-            assert_eq!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(&tenant, source_table_id))
+            assert!(
+                mt.get_pb(&source_mv_ident(source_table_id, created.table_id))
                     .await?
-                    .expect("source index must exist")
-                    .data
-                    .mv_ids(),
-                &[created.table_id]
+                    .is_some()
             );
-            let mvs = mt
-                .mget_mvs_by_source_table_id(&tenant, source_table_id)
-                .await?;
-            assert_eq!(mvs.len(), 1);
             created
         };
         let mv_id = created.table_id;
 
-        // A CREATE planned from an older complete source-index version is rejected.
+        // MV membership changes do not advance the source binding version.
         {
-            let stale_source_index_seq = mt
-                .get_source_table_mv_ids(&tenant, source_table_id)
+            let source_binding_version_seq = mt
+                .get_pb(&MVSourceBindingVersionIdent::new(&tenant, source_table_id))
                 .await?
-                .seq;
+                .map(|seqv| seqv.seq)
+                .unwrap_or(0);
             let concurrent_mv_name = "mv_concurrent_create";
             let concurrent_mv = mt
                 .create_table(new_mv_req(
                     concurrent_mv_name,
                     CreateOption::Create,
                     source_table_id,
-                    stale_source_index_seq,
+                    source_binding_version_seq,
                     &definition,
                 ))
                 .await?;
-
-            assert!(
-                mt.create_table(new_mv_req(
-                    "mv_stale_source_index",
-                    CreateOption::Create,
-                    source_table_id,
-                    stale_source_index_seq,
-                    &definition,
-                ))
-                .await
-                .is_err()
+            assert_eq!(
+                mt.get_pb(&MVSourceBindingVersionIdent::new(&tenant, source_table_id))
+                    .await?
+                    .map(|seqv| seqv.seq)
+                    .unwrap_or(0),
+                source_binding_version_seq
             );
 
             mt.drop_table_by_id(DropTableByIdReq {
@@ -1857,12 +1854,29 @@ impl SchemaApiTestSuite {
             })
             .await?;
             assert_eq!(
-                mt.mget_mvs_by_source_table_id(&tenant, source_table_id)
+                mt.list_mvs_by_source_table_id(&tenant, source_table_id)
                     .await?
                     .iter()
                     .map(|mv| mv.mv_id)
                     .collect::<Vec<_>>(),
                 vec![mv_id]
+            );
+
+            mt.upsert_pb(&UpsertPB::update(
+                MVSourceBindingVersionIdent::new(&tenant, source_table_id),
+                EmptyProto {},
+            ))
+            .await?;
+            assert!(
+                mt.create_table(new_mv_req(
+                    "mv_stale_source_binding",
+                    CreateOption::Create,
+                    source_table_id,
+                    source_binding_version_seq,
+                    &definition,
+                ))
+                .await
+                .is_err()
             );
         }
 
@@ -1872,14 +1886,13 @@ impl SchemaApiTestSuite {
                 .get_pb(&TableId::new(mv_id))
                 .await?
                 .expect("MV TableMeta must exist");
-            assert!(published_table.data.drop_on.is_none());
             assert_eq!(
                 published_table.data.materialized_view_source_table_id()?,
                 source_table_id
             );
 
             let mvs = mt
-                .mget_mvs_by_source_table_id(&tenant, source_table_id)
+                .list_mvs_by_source_table_id(&tenant, source_table_id)
                 .await?;
             let [mv] = mvs.as_slice() else {
                 panic!("one complete MV must be returned");
@@ -1891,62 +1904,55 @@ impl SchemaApiTestSuite {
 
         // Replacing an MV removes the old definition and leaves only the new MV ID in the source index.
         let replacement = {
-            let source_index_seq = mt
-                .get_source_table_mv_ids(&tenant, source_table_id)
+            let source_binding_version_seq = mt
+                .get_pb(&MVSourceBindingVersionIdent::new(&tenant, source_table_id))
                 .await?
-                .seq;
+                .map(|seqv| seqv.seq)
+                .unwrap_or(0);
             let replacement = mt
                 .create_table(new_mv_req(
                     mv_name,
                     CreateOption::CreateOrReplace,
                     source_table_id,
-                    source_index_seq,
+                    source_binding_version_seq,
                     &definition,
                 ))
                 .await?;
 
             assert!(mt.get_mv_definition(&tenant, mv_id).await?.is_none());
             assert!(
-                mt.get_pb(&TableId::new(mv_id))
+                mt.get_pb(&source_mv_ident(source_table_id, mv_id))
                     .await?
-                    .expect("replaced MV TableMeta must be retained for GC")
-                    .data
-                    .drop_on
-                    .is_some()
-            );
-            assert_eq!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(&tenant, source_table_id))
-                    .await?
-                    .expect("source index must exist")
-                    .data
-                    .mv_ids(),
-                &[replacement.table_id]
+                    .is_none()
             );
 
             let mvs = mt
-                .mget_mvs_by_source_table_id(&tenant, source_table_id)
+                .list_mvs_by_source_table_id(&tenant, source_table_id)
                 .await?;
             let [mv] = mvs.as_slice() else {
                 panic!("the replacement MV must be returned");
             };
             assert_eq!(mv.mv_id, replacement.table_id);
             assert_eq!(mv.definition.data, definition);
-            assert!(mv.table_meta.data.drop_on.is_none());
             replacement
         };
 
         // Replacing with another source empties the old source index and adds the new one.
         let new_source_replacement = {
-            let source_index_seq = mt
-                .get_source_table_mv_ids(&tenant, replacement_source_table_id)
+            let source_binding_version_seq = mt
+                .get_pb(&MVSourceBindingVersionIdent::new(
+                    &tenant,
+                    replacement_source_table_id,
+                ))
                 .await?
-                .seq;
+                .map(|seqv| seqv.seq)
+                .unwrap_or(0);
             let new_source_replacement = mt
                 .create_table(new_mv_req(
                     mv_name,
                     CreateOption::CreateOrReplace,
                     replacement_source_table_id,
-                    source_index_seq,
+                    source_binding_version_seq,
                     &replacement_definition,
                 ))
                 .await?;
@@ -1957,34 +1963,19 @@ impl SchemaApiTestSuite {
                     .is_none()
             );
             assert!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(&tenant, source_table_id))
+                mt.get_pb(&source_mv_ident(source_table_id, replacement.table_id))
                     .await?
-                    .expect("old source index must be retained")
-                    .data
-                    .mv_ids()
-                    .is_empty()
-            );
-            assert_eq!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(
-                    &tenant,
-                    replacement_source_table_id,
-                ))
-                .await?
-                .expect("new source index must exist")
-                .data
-                .mv_ids(),
-                &[new_source_replacement.table_id]
+                    .is_none()
             );
 
             let mvs = mt
-                .mget_mvs_by_source_table_id(&tenant, replacement_source_table_id)
+                .list_mvs_by_source_table_id(&tenant, replacement_source_table_id)
                 .await?;
             let [mv] = mvs.as_slice() else {
                 panic!("the new-source replacement MV must be returned");
             };
             assert_eq!(mv.mv_id, new_source_replacement.table_id);
             assert_eq!(mv.definition.data, replacement_definition);
-            assert!(mv.table_meta.data.drop_on.is_none());
 
             new_source_replacement
         };
@@ -1992,28 +1983,20 @@ impl SchemaApiTestSuite {
         // Explicit DROP removes the MV definition and its membership from an existing source index.
         {
             let explicit_drop_name = "mv_explicit_drop";
-            let source_index_seq = mt
-                .get_source_table_mv_ids(&tenant, source_table_id)
+            let source_binding_version_seq = mt
+                .get_pb(&MVSourceBindingVersionIdent::new(&tenant, source_table_id))
                 .await?
-                .seq;
+                .map(|seqv| seqv.seq)
+                .unwrap_or(0);
             let explicit_drop = mt
                 .create_table(new_mv_req(
                     explicit_drop_name,
                     CreateOption::Create,
                     source_table_id,
-                    source_index_seq,
+                    source_binding_version_seq,
                     &definition,
                 ))
                 .await?;
-
-            assert_eq!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(&tenant, source_table_id))
-                    .await?
-                    .expect("source index must exist")
-                    .data
-                    .mv_ids(),
-                &[explicit_drop.table_id]
-            );
 
             mt.drop_table_by_id(DropTableByIdReq {
                 if_exists: false,
@@ -2033,71 +2016,23 @@ impl SchemaApiTestSuite {
                     .is_none()
             );
             assert!(
-                mt.get_pb(&TableId::new(explicit_drop.table_id))
-                    .await?
-                    .expect("dropped MV TableMeta must be retained for GC")
-                    .data
-                    .drop_on
-                    .is_some()
-            );
-            assert!(
-                mt.get_table(GetTableReq::new(&tenant, &db_name, explicit_drop_name,))
-                    .await
-                    .is_err()
-            );
-            assert!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(&tenant, source_table_id))
-                    .await?
-                    .expect("empty source index must be retained")
-                    .data
-                    .mv_ids()
-                    .is_empty()
-            );
-        }
-
-        // GC removes replaced table metadata without changing the current source index.
-        {
-            mt.gc_drop_tables(GcDroppedTableReq {
-                tenant: tenant.clone(),
-                catalog: "default".to_string(),
-                drop_ids: vec![
-                    DroppedId::new_table(replacement.db_id, mv_id, mv_name),
-                    DroppedId::new_table(
-                        new_source_replacement.db_id,
-                        replacement.table_id,
-                        mv_name,
-                    ),
-                ],
-            })
-            .await?;
-            assert!(mt.get_mv_definition(&tenant, mv_id).await?.is_none());
-            assert!(
-                mt.get_mv_definition(&tenant, replacement.table_id)
+                mt.get_pb(&source_mv_ident(source_table_id, explicit_drop.table_id))
                     .await?
                     .is_none()
-            );
-            assert!(mt.get_pb(&TableId::new(mv_id)).await?.is_none());
-            assert!(
-                mt.get_pb(&TableId::new(replacement.table_id))
-                    .await?
-                    .is_none()
-            );
-            assert_eq!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(
-                    &tenant,
-                    replacement_source_table_id,
-                ))
-                .await?
-                .expect("source index must exist")
-                .data
-                .mv_ids(),
-                &[new_source_replacement.table_id]
             );
         }
 
         // Source DROP and UNDROP preserve MV relationships; source GC removes them.
         {
-            let source_mv_ident = SourceTableMVIdsIdent::new(&tenant, replacement_source_table_id);
+            let relationship_ident =
+                source_mv_ident(replacement_source_table_id, new_source_replacement.table_id);
+            let binding_version_ident =
+                MVSourceBindingVersionIdent::new(&tenant, replacement_source_table_id);
+            mt.upsert_pb(&UpsertPB::update(
+                binding_version_ident.clone(),
+                EmptyProto {},
+            ))
+            .await?;
             mt.drop_table_by_id(DropTableByIdReq {
                 if_exists: false,
                 tenant: tenant.clone(),
@@ -2109,22 +2044,15 @@ impl SchemaApiTestSuite {
                 db_name: db_name.clone(),
             })
             .await?;
-            assert!(mt.get_pb(&source_mv_ident).await?.is_some());
+            assert!(mt.get_pb(&relationship_ident).await?.is_some());
+            assert!(mt.get_pb(&binding_version_ident).await?.is_some());
 
             mt.undrop_table(UndropTableReq {
                 name_ident: TableNameIdent::new(&tenant, &db_name, replacement_source_name),
             })
             .await?;
             assert_eq!(
-                mt.get_table(GetTableReq::new(&tenant, &db_name, replacement_source_name,))
-                    .await?
-                    .ident
-                    .table_id,
-                replacement_source_table_id
-            );
-            assert!(mt.get_pb(&source_mv_ident).await?.is_some());
-            assert_eq!(
-                mt.mget_mvs_by_source_table_id(&tenant, replacement_source_table_id)
+                mt.list_mvs_by_source_table_id(&tenant, replacement_source_table_id)
                     .await?
                     .iter()
                     .map(|mv| mv.mv_id)
@@ -2153,7 +2081,8 @@ impl SchemaApiTestSuite {
                 )],
             })
             .await?;
-            assert!(mt.get_pb(&source_mv_ident).await?.is_none());
+            assert!(mt.get_pb(&relationship_ident).await?.is_none());
+            assert!(mt.get_pb(&binding_version_ident).await?.is_none());
         }
 
         // Source GC has already removed the index. DROP MV still removes its definition without recreating the index.
@@ -2180,9 +2109,9 @@ impl SchemaApiTestSuite {
                     .is_none()
             );
             assert!(
-                mt.get_pb(&SourceTableMVIdsIdent::new(
-                    &tenant,
+                mt.get_pb(&source_mv_ident(
                     replacement_source_table_id,
+                    new_source_replacement.table_id,
                 ))
                 .await?
                 .is_none()

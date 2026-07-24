@@ -58,6 +58,7 @@ use databend_common_meta_app::schema::DatabaseType;
 use databend_common_meta_app::schema::DropTableByIdReq;
 use databend_common_meta_app::schema::DropTableReply;
 use databend_common_meta_app::schema::DroppedId;
+use databend_common_meta_app::schema::EmptyProto;
 use databend_common_meta_app::schema::GetTableCopiedFileReply;
 use databend_common_meta_app::schema::GetTableCopiedFileReq;
 use databend_common_meta_app::schema::GetTableReq;
@@ -69,8 +70,11 @@ use databend_common_meta_app::schema::ListTableCopiedFileReply;
 use databend_common_meta_app::schema::ListTableReq;
 use databend_common_meta_app::schema::MATERIALIZED_VIEW_ENGINE;
 use databend_common_meta_app::schema::MVDefinitionIdent;
+use databend_common_meta_app::schema::MVSourceBindingVersionIdent;
 use databend_common_meta_app::schema::RenameTableReply;
 use databend_common_meta_app::schema::RenameTableReq;
+use databend_common_meta_app::schema::SourceTableMV;
+use databend_common_meta_app::schema::SourceTableMVIdent;
 use databend_common_meta_app::schema::SwapTableReply;
 use databend_common_meta_app::schema::SwapTableReq;
 use databend_common_meta_app::schema::TableCopiedFileNameIdent;
@@ -128,7 +132,6 @@ use super::schema_api::construct_drop_table_txn_operations;
 use super::schema_api::get_db_by_id_or_err;
 use super::schema_api::get_history_table_metas;
 use super::schema_api::handle_undrop_table;
-use super::schema_api::publish_mv_to_source_table_index;
 use crate::DEFAULT_MGET_SIZE;
 use crate::assert_table_exist;
 use crate::deserialize_struct;
@@ -374,7 +377,6 @@ where
                                     *seq_db_id.data,
                                     true,
                                     false,
-                                    req.materialized_view.is_none(),
                                     &mut txn,
                                 )
                                 .await?;
@@ -435,7 +437,6 @@ where
                 // append new table_id into list
                 tb_id_list.append(table_id);
                 let dbid_tbname_seq = seq_table_id.seq;
-                let previous_table_id = (dbid_tbname_seq > 0).then_some(seq_table_id.data);
                 txn.condition.extend(vec![
                     // db has not to change, i.e., no new table is created.
                     // Renaming db is OK and does not affect the seq of db_meta.
@@ -483,16 +484,26 @@ where
                         ));
                     }
 
-                    publish_mv_to_source_table_index(
-                        self,
-                        &mut txn,
-                        req.tenant(),
-                        source_table_id,
-                        table_id,
-                        previous_table_id,
-                        mv.source_index_seq,
-                    )
-                    .await?;
+                    let version_ident =
+                        MVSourceBindingVersionIdent::new(req.tenant(), source_table_id);
+                    let (version_seq, _) = self.get_pb_seq_and_value(&version_ident).await?;
+                    if version_seq != mv.source_binding_version_seq {
+                        return Err(KVAppError::AppError(
+                            InvalidMaterializedView::new(
+                                "source table changed while create materialized view",
+                            )
+                            .into(),
+                        ));
+                    }
+                    txn.condition
+                        .push(txn_cond_eq_seq(&version_ident, version_seq));
+                    txn.if_then.push(txn_put_pb(
+                        &SourceTableMVIdent::new_generic(
+                            req.tenant(),
+                            SourceTableMV::new(source_table_id, table_id),
+                        ),
+                        &EmptyProto {},
+                    ));
                 }
 
                 if req.as_dropped {
@@ -584,7 +595,6 @@ where
                 table_id,
                 req.db_id,
                 req.if_exists,
-                true,
                 true,
                 &mut txn,
             )

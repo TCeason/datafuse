@@ -46,13 +46,3 @@ message MVDefinition {
   // This mode is immutable after publication; recreate the MV to change it.
   bool sync_creation = 4;
 }
-
-// MV table ids that depend on one source table.
-// Key is __fd_materialized_view_by_source/<tenant>/<source_table_id>;
-// source_table_id is only in the key, not in this value.
-message SourceTableMVIds {
-  uint64 ver = 100;
-  uint64 min_reader_ver = 101;
-
-  repeated uint64 mv_ids = 1;
-}

@@ -12,32 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::schema::SourceTableMVIds;
+use crate::schema::EmptyProto;
 use crate::tenant_key::ident::TIdent;
 use crate::tenant_key::resource::TenantResource;
 
-/// `__fd_materialized_view_by_source/<tenant>/<source_table_id>` -> [`SourceTableMVIds`]
-pub type SourceTableMVIdsIdent = TIdent<SourceTableMVIdsResource, u64>;
+/// `__fd_materialized_view_source_binding_version/<tenant>/<source_table_id>`
+/// -> [`EmptyProto`]
+pub type MVSourceBindingVersionIdent = TIdent<MVSourceBindingVersionResource, u64>;
 
-pub struct SourceTableMVIdsResource;
+pub struct MVSourceBindingVersionResource;
 
-impl TenantResource for SourceTableMVIdsResource {
-    const PREFIX: &'static str = "__fd_materialized_view_by_source";
-    const TYPE: &'static str = "SourceTableMVIdsIdent";
+impl TenantResource for MVSourceBindingVersionResource {
+    const PREFIX: &'static str = "__fd_materialized_view_source_binding_version";
+    const TYPE: &'static str = "MVSourceBindingVersionIdent";
     const HAS_TENANT: bool = true;
-    type ValueType = SourceTableMVIds;
+    type ValueType = EmptyProto;
 }
 
 #[cfg(test)]
 mod tests {
     use databend_meta_client::kvapi::testing::assert_round_trip;
 
-    use super::SourceTableMVIdsIdent;
+    use super::MVSourceBindingVersionIdent;
     use crate::tenant::Tenant;
 
     #[test]
-    fn test_source_table_mv_ids_ident() {
-        let ident = SourceTableMVIdsIdent::new(Tenant::new_literal("tenant1"), 42);
-        assert_round_trip(ident, "__fd_materialized_view_by_source/tenant1/42");
+    fn test_mv_source_binding_version_ident() {
+        let ident = MVSourceBindingVersionIdent::new(Tenant::new_literal("tenant1"), 42);
+        assert_round_trip(
+            ident,
+            "__fd_materialized_view_source_binding_version/tenant1/42",
+        );
     }
 }
