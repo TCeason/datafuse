@@ -21,6 +21,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use databend_common_meta_app::app_error::AppError;
 use databend_common_meta_app::app_error::DropTableWithDropTime;
+use databend_common_meta_app::app_error::InvalidMaterializedView;
 use databend_common_meta_app::app_error::UndropTableAlreadyExists;
 use databend_common_meta_app::app_error::UndropTableHasNoHistory;
 use databend_common_meta_app::app_error::UndropTableRetentionGuard;
@@ -180,6 +181,7 @@ pub async fn construct_drop_table_txn_operations(
     db_id: u64,
     if_exists: bool,
     if_delete: bool,
+    replacement_engine: Option<&str>,
     txn: &mut TxnRequest,
 ) -> Result<(u64, u64), KVAppError> {
     let tbid = TableId { table_id };
@@ -233,6 +235,9 @@ pub async fn construct_drop_table_txn_operations(
     );
 
     let mut tb_meta = tb_meta.unwrap();
+    if let Some(replacement_engine) = replacement_engine {
+        validate_replacement_engine(&table_name, &tb_meta.engine, replacement_engine)?;
+    }
     // drop a table with drop_on time
     if tb_meta.drop_on.is_some() {
         return if if_exists {
@@ -383,6 +388,26 @@ pub async fn construct_drop_table_txn_operations(
     }
 
     Ok((tb_id_seq, table_id))
+}
+
+pub(super) fn validate_replacement_engine(
+    table_name: &str,
+    existing_engine: &str,
+    replacement_engine: &str,
+) -> Result<(), KVAppError> {
+    if is_materialized_view_engine(existing_engine)
+        != is_materialized_view_engine(replacement_engine)
+    {
+        return Err(KVAppError::AppError(
+            InvalidMaterializedView::new(format!(
+                "cannot replace '{}' with engine '{}' by engine '{}': materialized views and non-materialized objects cannot replace each other",
+                table_name, existing_engine, replacement_engine
+            ))
+            .into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Returns (db_meta_seq, db_meta)

@@ -31,6 +31,7 @@ use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::interpreter_table_add_column::commit_table_meta;
 use crate::pipelines::PipelineBuildResult;
 use crate::sessions::QueryContext;
@@ -72,6 +73,7 @@ impl Interpreter for ModifyTableConnectionInterpreter {
 
         // check mutability
         table.check_mutable()?;
+        check_not_materialized_view(table.as_ref(), db_name)?;
 
         let table_info = table.get_table_info();
         let engine = table.engine();

@@ -36,6 +36,7 @@ drop role if exists 'test-role2';
 create user 'test-user' IDENTIFIED BY '$TEST_USER_PASSWORD';
 create role \`test-role1\`;
 create role \`test-role2\`;
+drop materialized view if exists mv_priv_access;
 drop table if exists t20_0012;
 create table t20_0012(c int not null);
 "
@@ -50,6 +51,7 @@ echo "show databases" | $TEST_USER_CONNECT
 ## insert data - test permission denied first
 echo "select 'test -- insert'" | $TEST_USER_CONNECT
 echo "insert into t20_0012 values(1),(2)" | $TEST_USER_CONNECT
+echo "create materialized view mv_priv_access as select c from t20_0012" | $TEST_USER_CONNECT
 
 ## grant user privileges via role
 run_root_sql "
@@ -106,6 +108,12 @@ select * from t20_0012 order by c;
 ## optimize table - test permission denied
 echo "select 'test -- optimize table'" | $TEST_USER_CONNECT
 echo "optimize table t20_0012 all" | $TEST_USER_CONNECT
+
+## MV DDL only checks the defining query; the MV itself needs no privilege.
+echo "create materialized view mv_priv_access as select c from t20_0012" | $TEST_USER_CONNECT
+echo "show create materialized view mv_priv_access" | $TEST_USER_CONNECT >/dev/null
+echo "drop materialized view mv_priv_access" | $TEST_USER_CONNECT
+echo "select 'test -- materialized view ddl without object privilege'" | $TEST_USER_CONNECT
 
 ## grant user privilege and test optimize
 run_root_sql "GRANT Super ON *.* TO 'test-user';"

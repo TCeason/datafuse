@@ -18,6 +18,7 @@ use databend_meta_client::types::SeqV;
 use super::TableMeta;
 use crate::app_error::AppError;
 use crate::app_error::InvalidMaterializedView;
+use crate::tenant::Tenant;
 
 mod mv_definition_ident;
 mod mv_source_binding_version_ident;
@@ -38,7 +39,7 @@ pub const MATERIALIZED_VIEW_ENGINE: &str = "MATERIALIZED_VIEW";
 pub const OPT_KEY_MATERIALIZED_VIEW_SOURCE_TABLE_ID: &str = "materialized_view_source_table_id";
 
 pub fn is_materialized_view_engine(engine: &str) -> bool {
-    engine == MATERIALIZED_VIEW_ENGINE
+    engine.eq_ignore_ascii_case(MATERIALIZED_VIEW_ENGINE)
 }
 
 impl TableMeta {
@@ -98,12 +99,37 @@ pub struct CreateMaterializedViewMeta {
     pub expected_source_generation: u64,
 }
 
+/// Request an atomic source-binding update that invalidates existing materialized views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateMVSourceBindingReq {
+    pub tenant: Tenant,
+    pub source_table_id: u64,
+}
+
+impl UpdateMVSourceBindingReq {
+    pub fn new(tenant: Tenant, source_table_id: u64) -> Self {
+        Self {
+            tenant,
+            source_table_id,
+        }
+    }
+}
+
 /// Complete metadata needed to use one materialized view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MVInfo {
     pub mv_id: u64,
     pub definition: SeqV<MVDefinition>,
     pub table_meta: SeqV<TableMeta>,
+}
+
+/// A consistent view of the active MV bindings for one source table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MVSourceBindingSnapshot {
+    /// Binding generation at which `materialized_views` was collected.
+    pub generation: u64,
+    /// Empty when the generation changed while MV metadata was being collected.
+    pub materialized_views: Vec<MVInfo>,
 }
 
 #[cfg(test)]

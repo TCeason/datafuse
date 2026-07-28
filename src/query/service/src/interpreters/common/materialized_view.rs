@@ -12,29 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod account;
-mod catalog;
-mod column;
-mod connection;
-mod data_mask;
-pub mod database;
-mod dictionary;
-mod dynamic_table;
-pub(crate) mod index;
-mod materialized_view;
-mod network_policy;
-mod notification;
-mod password_policy;
-mod procedure;
-mod role;
-mod row_access_policy;
-mod sequence;
-mod stage;
-mod stream;
-pub mod table;
-mod tag;
-mod task;
-mod view;
-mod warehouse;
-mod worker;
-mod workload;
+use databend_common_catalog::table::Table;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::is_materialized_view_engine;
+
+pub fn check_not_materialized_view(table: &dyn Table, db_name: &str) -> Result<()> {
+    if is_materialized_view_engine(table.engine()) {
+        return Err(ErrorCode::TableEngineNotSupported(format!(
+            "Cannot modify materialized view `{}`.`{}`",
+            db_name,
+            table.name()
+        )));
+    }
+    Ok(())
+}

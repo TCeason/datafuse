@@ -1093,7 +1093,7 @@ impl Table for FuseTable {
             ctx,
             pipeline,
             copied_files,
-            update_stream_meta,
+            update_stream_meta.into(),
             overwrite,
             prev_snapshot_id,
             deduplicated_label,

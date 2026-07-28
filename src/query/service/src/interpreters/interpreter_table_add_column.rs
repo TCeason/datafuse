@@ -25,7 +25,10 @@ use databend_common_license::license::Feature::ComputedColumn;
 use databend_common_license::license_manager::LicenseManagerSwitch;
 use databend_common_meta_app::schema::DatabaseType;
 use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::UpdateMVSourceBindingReq;
+use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
 use databend_common_meta_app::schema::UpdateTableMetaReq;
+use databend_common_meta_app::tenant::Tenant;
 use databend_common_sql::DefaultExprBinder;
 use databend_common_sql::Planner;
 use databend_common_sql::plans::AddColumnOption;
@@ -34,6 +37,7 @@ use databend_common_sql::plans::Mutation;
 use databend_common_sql::plans::Plan;
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 use databend_common_storages_fuse::FuseTable;
+use databend_common_storages_fuse::operations::CommitMetaUpdates;
 use databend_common_storages_stream::stream_table::STREAM_ENGINE;
 use databend_meta_client::types::MatchSeq;
 use databend_storages_common_table_meta::meta::TableSnapshot;
@@ -45,6 +49,7 @@ use log::info;
 use crate::interpreters::Interpreter;
 use crate::interpreters::MutationInterpreter;
 use crate::interpreters::common::QueryFinishHooks;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::interpreter_table_create::is_valid_column;
 use crate::interpreters::interpreter_table_modify_column::build_select_insert_plan;
 use crate::pipelines::PipelineBuildResult;
@@ -91,6 +96,8 @@ impl Interpreter for AddTableColumnInterpreter {
             .await?;
         // check mutability
         tbl.check_mutable()?;
+
+        check_not_materialized_view(tbl.as_ref(), db_name)?;
 
         let mut table_info = tbl.get_table_info().clone();
         let engine = table_info.engine();
@@ -190,6 +197,7 @@ impl Interpreter for AddTableColumnInterpreter {
                 new_schema.into(),
                 prev_snapshot_id,
                 table_meta_timestamps,
+                CommitMetaUpdates::default(),
             )
             .await;
         }
@@ -300,7 +308,7 @@ where
             new_snapshot_location = Some(new_snapshot_loc);
         }
         new_table_meta.updated_on = Utc::now();
-        update_table_meta(fuse_tbl, &new_table_meta, catalog).await?;
+        update_table_meta(fuse_tbl, &new_table_meta, catalog, ctx.get_tenant()).await?;
 
         if let Some(new_snapshot_location) = new_snapshot_location {
             FuseTable::write_last_snapshot_hint(
@@ -320,6 +328,7 @@ pub(crate) async fn update_table_meta(
     fuse_tbl: &FuseTable,
     new_table_meta: &TableMeta,
     catalog: Arc<dyn Catalog>,
+    tenant: Tenant,
 ) -> Result<()> {
     let mut table_info = fuse_tbl.get_table_info().clone();
     let table_id = table_info.ident.table_id;
@@ -331,7 +340,29 @@ pub(crate) async fn update_table_meta(
         base_snapshot_location: fuse_tbl.snapshot_loc(),
         lvt_check: None,
     };
+    let invalidates_mv_bindings = invalidates_mv_source_bindings(&table_info.meta, new_table_meta);
     table_info.meta = new_table_meta.clone();
-    catalog.update_single_table_meta(req, &table_info).await?;
+    if invalidates_mv_bindings {
+        catalog
+            .update_multi_table_meta(UpdateMultiTableMetaReq {
+                update_table_metas: vec![(req, table_info)],
+                update_mv_source_bindings: vec![UpdateMVSourceBindingReq::new(tenant, table_id)],
+                ..Default::default()
+            })
+            .await?;
+    } else {
+        catalog.update_single_table_meta(req, &table_info).await?;
+    }
     Ok(())
+}
+
+fn invalidates_mv_source_bindings(old_meta: &TableMeta, new_meta: &TableMeta) -> bool {
+    old_meta.schema.fields().iter().any(|old_field| {
+        new_meta
+            .schema
+            .fields()
+            .iter()
+            .find(|new_field| new_field.column_id == old_field.column_id)
+            != Some(old_field)
+    })
 }

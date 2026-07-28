@@ -27,6 +27,7 @@ use databend_common_storages_basic::view_table::QUERY;
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::util::check_view_circular_dependency;
 use crate::pipelines::PipelineBuildResult;
 use crate::sessions::QueryContext;
@@ -57,6 +58,16 @@ impl Interpreter for CreateViewInterpreter {
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
         let tenant = self.ctx.get_tenant();
+        if self.plan.create_option.is_overriding() {
+            match catalog
+                .get_table(&tenant, &self.plan.database, &self.plan.view_name)
+                .await
+            {
+                Ok(table) => check_not_materialized_view(table.as_ref(), &self.plan.database)?,
+                Err(error) if error.code() == ErrorCode::UNKNOWN_TABLE => {}
+                Err(error) => return Err(error),
+            }
+        }
         let table_function = catalog.list_table_functions();
         let mut options = BTreeMap::new();
         let mut planner = Planner::new(self.ctx.clone());

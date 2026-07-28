@@ -31,8 +31,9 @@ pub type MVSourceBindingVersionIdent = TIdent<MVSourceBindingVersionResource, u6
 ///
 /// A missing record is logically generation 0. Once created, this record is
 /// retained for the lifetime of the source table to prevent generation ABA.
-/// Source DDL defined to invalidate existing MVs advances it; ADD COLUMN,
-/// table rename, and table DROP/UNDROP leave it unchanged.
+/// RENAME/DROP/MODIFY COLUMN advances it after confirming that the source has
+/// no MV relationships; ADD COLUMN, table rename, and table DROP/UNDROP leave
+/// it unchanged.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MVSourceBindingVersion {
     pub current_source_generation: u64,

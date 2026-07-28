@@ -69,6 +69,7 @@ use log::info;
 
 use crate::interpreters::InsertInterpreter;
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::table_option_validation::is_valid_analyze_count_min_sketch_error_rate;
 use crate::interpreters::common::table_option_validation::is_valid_analyze_frequency_columns;
 use crate::interpreters::common::table_option_validation::is_valid_analyze_histogram_algorithm;
@@ -129,6 +130,17 @@ impl Interpreter for CreateTableInterpreter {
 
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
+        self.validate_create().await?;
+
+        match &self.plan.as_select {
+            Some(select_plan_node) => self.create_table_as_select(select_plan_node.clone()).await,
+            None => self.create_table().await,
+        }
+    }
+}
+
+impl CreateTableInterpreter {
+    pub(crate) async fn validate_create(&self) -> Result<()> {
         let tenant = &self.plan.tenant;
 
         let has_computed_column = self
@@ -146,6 +158,16 @@ impl Interpreter for CreateTableInterpreter {
         let quota = quota_api.get_quota(MatchSeq::GE(0)).await?.data;
         let engine = self.plan.engine;
         let catalog = self.ctx.get_catalog(self.plan.catalog.as_str()).await?;
+        if self.plan.create_option.is_overriding() && engine != Engine::MaterializedView {
+            match catalog
+                .get_table(tenant, &self.plan.database, &self.plan.table)
+                .await
+            {
+                Ok(table) => check_not_materialized_view(table.as_ref(), &self.plan.database)?,
+                Err(error) if error.code() == ErrorCode::UNKNOWN_TABLE => {}
+                Err(error) => return Err(error),
+            }
+        }
         if quota.max_tables_per_database > 0 {
             // Note:
             // max_tables_per_database is a config quota. Default is 0.
@@ -179,14 +201,8 @@ impl Interpreter for CreateTableInterpreter {
             }
         }
 
-        match &self.plan.as_select {
-            Some(select_plan_node) => self.create_table_as_select(select_plan_node.clone()).await,
-            None => self.create_table().await,
-        }
+        Ok(())
     }
-}
-
-impl CreateTableInterpreter {
     #[async_backtrace::framed]
     async fn create_table_as_select(&self, select_plan: Box<Plan>) -> Result<PipelineBuildResult> {
         assert!(
@@ -403,7 +419,10 @@ impl CreateTableInterpreter {
     ///
     /// - Rebuild `DataSchema` with default exprs.
     /// - Update cluster key of table meta.
-    fn build_request(&self, statistics: Option<TableStatistics>) -> Result<CreateTableReq> {
+    pub(crate) fn build_request(
+        &self,
+        statistics: Option<TableStatistics>,
+    ) -> Result<CreateTableReq> {
         let fields = self.plan.schema.fields().clone();
         let mut default_expr_binder = DefaultExprBinder::try_new(self.ctx.clone())?;
         for field in fields.iter() {

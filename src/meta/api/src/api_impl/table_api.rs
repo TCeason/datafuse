@@ -133,6 +133,7 @@ use super::schema_api::construct_drop_table_txn_operations;
 use super::schema_api::get_db_by_id_or_err;
 use super::schema_api::get_history_table_metas;
 use super::schema_api::handle_undrop_table;
+use super::schema_api::validate_replacement_engine;
 use crate::DEFAULT_MGET_SIZE;
 use crate::assert_table_exist;
 use crate::deserialize_struct;
@@ -215,6 +216,345 @@ fn validate_create_table_request(req: &CreateTableReq) -> Result<(), KVAppError>
         ));
     }
     Ok(())
+}
+
+struct PreparedMVSourceBindingUpdate {
+    generation_ident: MVSourceBindingVersionIdent,
+    expected_generation_kv_seq: u64,
+    next_generation: u64,
+}
+
+type MismatchedTableMetas = Vec<(u64, u64, TableMeta)>;
+
+enum UpdateMultiTableMetaAttempt {
+    Committed(UpdateTableMetaReply),
+    TableMetaChanged(MismatchedTableMetas),
+    MVSourceBindingCASConflict,
+}
+
+async fn try_update_multi_table_meta_once<KV>(
+    kv_api: &KV,
+    req: UpdateMultiTableMetaReq,
+    txn_sender: &IdempotentKVTxnSender,
+) -> Result<UpdateMultiTableMetaAttempt, KVAppError>
+where
+    KV: kvapi::KVApi<Error = MetaError> + ?Sized,
+{
+    let UpdateMultiTableMetaReq {
+        mut update_table_metas,
+        update_mv_source_bindings,
+        copied_files,
+        update_stream_metas,
+        deduplicated_labels,
+        update_temp_tables: _,
+    } = req;
+
+    let mut tbl_seqs = HashMap::new();
+    let mut txn = TxnRequest::default();
+    let mut mismatched_tbs = vec![];
+    let tid_vec = update_table_metas
+        .iter()
+        .map(|req| {
+            TableId {
+                table_id: req.0.table_id,
+            }
+            .to_string_key()
+        })
+        .collect::<Vec<_>>();
+    let mut tb_meta_vec: Vec<(u64, Option<TableMeta>)> = mget_pb_values(kv_api, &tid_vec).await?;
+    for ((req, _), (tb_meta_seq, table_meta)) in
+        update_table_metas.iter().zip(tb_meta_vec.iter_mut())
+    {
+        let req_seq = req.seq;
+
+        if *tb_meta_seq == 0 || table_meta.is_none() {
+            return Err(KVAppError::AppError(AppError::UnknownTableId(
+                UnknownTableId::new(req.table_id, "update_multi_table_meta"),
+            )));
+        }
+        if req_seq.match_seq(tb_meta_seq).is_err() {
+            mismatched_tbs.push((
+                req.table_id,
+                *tb_meta_seq,
+                std::mem::take(table_meta).unwrap(),
+            ));
+        }
+    }
+
+    if !mismatched_tbs.is_empty() {
+        return Ok(UpdateMultiTableMetaAttempt::TableMetaChanged(
+            mismatched_tbs,
+        ));
+    }
+
+    let mut prepared_mv_source_binding_updates =
+        Vec::with_capacity(update_mv_source_bindings.len());
+    for update in update_mv_source_bindings {
+        if !update_table_metas
+            .iter()
+            .any(|(req, _)| req.table_id == update.source_table_id)
+        {
+            return Err(KVAppError::AppError(
+                InvalidMaterializedView::new(format!(
+                    "MV source binding update for source {} has no matching table metadata update",
+                    update.source_table_id
+                ))
+                .into(),
+            ));
+        }
+
+        let generation_ident =
+            MVSourceBindingVersionIdent::new(&update.tenant, update.source_table_id);
+        let (generation_kv_seq, generation_record) =
+            kv_api.get_pb_seq_and_value(&generation_ident).await?;
+        let current_generation = generation_record
+            .map(|record| record.current_source_generation)
+            .unwrap_or(0);
+
+        let next_generation = current_generation.checked_add(1).ok_or_else(|| {
+            KVAppError::AppError(
+                InvalidMaterializedView::new(format!(
+                    "source table {} binding generation overflow",
+                    update.source_table_id
+                ))
+                .into(),
+            )
+        })?;
+        prepared_mv_source_binding_updates.push(PreparedMVSourceBindingUpdate {
+            generation_ident,
+            expected_generation_kv_seq: generation_kv_seq,
+            next_generation,
+        });
+    }
+
+    for ((req, _), (tb_meta_seq, _)) in update_table_metas.iter_mut().zip(tb_meta_vec.iter()) {
+        let tbid = TableId {
+            table_id: req.table_id,
+        };
+
+        let new_table_meta = req.new_table_meta.clone();
+
+        tbl_seqs.insert(req.table_id, *tb_meta_seq);
+        txn.condition.push(txn_cond_seq(&tbid, Eq, *tb_meta_seq));
+
+        // Add LVT check if provided
+        if let Some(check) = req.lvt_check.as_ref() {
+            let lvt_ident = LeastVisibleTimeIdent::new(&check.tenant, req.table_id);
+            let res = kv_api.get_pb(&lvt_ident).await?;
+            let (seq, current_lvt) = match res {
+                Some(v) => (v.seq, Some(v.data)),
+                None => (0, None),
+            };
+            if let Some(current_lvt) = current_lvt {
+                if current_lvt.time > check.time {
+                    return Err(KVAppError::AppError(AppError::TableSnapshotExpired(
+                        TableSnapshotExpired::new(
+                            req.table_id,
+                            format!(
+                                "snapshot timestamp {:?} is older than the table's least visible time {:?}",
+                                check.time, current_lvt.time
+                            ),
+                        ),
+                    )));
+                }
+            }
+            // no other one has updated LVT since we read it
+            txn.condition.push(txn_cond_seq(&lvt_ident, Eq, seq));
+        }
+
+        txn.if_then.push(txn_put_pb(&tbid, &new_table_meta));
+        txn.else_then.push(TxnOp {
+            request: Some(Request::Get(TxnGetRequest::new(tbid.to_string_key()))),
+        });
+    }
+
+    for update in &prepared_mv_source_binding_updates {
+        txn.condition.push(txn_cond_eq_seq(
+            &update.generation_ident,
+            update.expected_generation_kv_seq,
+        ));
+        txn.if_then.push(txn_put_pb(
+            &update.generation_ident,
+            &MVSourceBindingVersion {
+                current_source_generation: update.next_generation,
+            },
+        ));
+        // A failed transaction does not identify which CAS condition changed.
+        // Read the generation key in the else branch so failure handling can
+        // distinguish a retryable binding race from a stale TableMeta update.
+        txn.else_then.push(txn_get(&update.generation_ident));
+    }
+
+    // `remove_table_copied_files` and `upsert_table_copied_file_info`
+    // all modify `TableCopiedFileInfo`,
+    // so there used to has `TableCopiedFileLockKey` in these two functions
+    // to protect TableCopiedFileInfo modification.
+    // In issue: https://github.com/datafuselabs/databend/issues/8897,
+    // there is chance that if copy files concurrently, `upsert_table_copied_file_info`
+    // may return `TxnRetryMaxTimes`.
+    // So now, in case that `TableCopiedFileInfo` has expire time, remove `TableCopiedFileLockKey`
+    // in each function. In this case there is chance that some `TableCopiedFileInfo` may not be
+    // removed in `remove_table_copied_files`, but these data can be purged in case of expire time.
+
+    let insert_if_not_exists_table_ids = copied_files
+        .iter()
+        .filter(|(_, req)| req.insert_if_not_exists)
+        .map(|(table_id, _)| *table_id)
+        .collect::<Vec<_>>();
+
+    for (table_id, req) in copied_files {
+        let tbid = TableId { table_id };
+
+        let table_meta_seq = tbl_seqs[&tbid.table_id];
+        txn.condition.push(txn_cond_eq_seq(&tbid, table_meta_seq));
+
+        for (file_name, file_info) in req.file_info {
+            let key = TableCopiedFileNameIdent {
+                table_id: tbid.table_id,
+                file: file_name,
+            };
+
+            if req.insert_if_not_exists {
+                txn.condition.push(txn_cond_eq_seq(&key, 0));
+            }
+            txn.if_then
+                .push(txn_put_pb_with_ttl(&key, &file_info, req.ttl))
+        }
+    }
+
+    let sid_vec = update_stream_metas
+        .iter()
+        .map(|req| {
+            TableId {
+                table_id: req.stream_id,
+            }
+            .to_string_key()
+        })
+        .collect::<Vec<_>>();
+    let stream_meta_vec: Vec<(u64, Option<TableMeta>)> = mget_pb_values(kv_api, &sid_vec).await?;
+    for (req, (stream_meta_seq, stream_meta)) in
+        update_stream_metas.iter().zip(stream_meta_vec.into_iter())
+    {
+        let stream_id = TableId {
+            table_id: req.stream_id,
+        };
+
+        if stream_meta_seq == 0 || stream_meta.is_none() {
+            return Err(KVAppError::AppError(AppError::UnknownStreamId(
+                UnknownStreamId::new(req.stream_id, "update_multi_table_meta"),
+            )));
+        }
+
+        if req.seq.match_seq(&stream_meta_seq).is_err() {
+            return Err(KVAppError::AppError(AppError::from(
+                StreamVersionMismatched::new(
+                    req.stream_id,
+                    req.seq,
+                    stream_meta_seq,
+                    "update_multi_table_meta",
+                ),
+            )));
+        }
+
+        let mut new_stream_meta = stream_meta.unwrap();
+        new_stream_meta.options = req.options.clone();
+        new_stream_meta.updated_on = Utc::now();
+
+        txn.condition
+            .push(txn_cond_seq(&stream_id, Eq, stream_meta_seq));
+        txn.if_then.push(txn_put_pb(&stream_id, &new_stream_meta));
+    }
+
+    for deduplicated_label in deduplicated_labels {
+        txn.if_then
+            .push(build_upsert_table_deduplicated_label(deduplicated_label));
+    }
+
+    let txn_response = txn_sender.send_txn(kv_api, txn).await?;
+
+    let else_branch_op_responses = match txn_response {
+        IdempotentKVTxnResponse::Success(_) => {
+            return Ok(UpdateMultiTableMetaAttempt::Committed(
+                UpdateTableMetaReply {},
+            ));
+        }
+        IdempotentKVTxnResponse::AlreadyCommitted => {
+            info!(
+                "Transaction ID {} exists, the corresponding update_multi_table_meta transaction has been executed successfully",
+                txn_sender.get_txn_id()
+            );
+            return Ok(UpdateMultiTableMetaAttempt::Committed(
+                UpdateTableMetaReply {},
+            ));
+        }
+        IdempotentKVTxnResponse::Failed(op_responses) => op_responses,
+    };
+
+    let (table_meta_responses, mv_source_binding_update_responses) =
+        else_branch_op_responses.split_at(update_table_metas.len());
+    let mut mismatched_tbs = vec![];
+    for (resp, req) in table_meta_responses.iter().zip(update_table_metas.iter()) {
+        let Some(Response::Get(get_resp)) = &resp.response else {
+            unreachable!(
+                "internal error: expect some TxnGetResponseGet, but got {:?}",
+                resp.response
+            )
+        };
+        // deserialize table version info
+        let (tb_meta_seq, table_meta): (_, TableMeta) = if let Some(seq_v) = &get_resp.value {
+            (seq_v.seq, deserialize_struct(&seq_v.data)?)
+        } else {
+            return Err(KVAppError::AppError(AppError::UnknownTableId(
+                UnknownTableId::new(req.0.table_id, "update_multi_table_meta"),
+            )));
+        };
+
+        // check table version
+        if req.0.seq.match_seq(&tb_meta_seq).is_err() {
+            mismatched_tbs.push((req.0.table_id, tb_meta_seq, table_meta));
+        }
+    }
+
+    if !mismatched_tbs.is_empty() {
+        // The new TableMeta was prepared from stale state. Return the current
+        // metadata to the caller so it can rebuild the operation safely.
+        return Ok(UpdateMultiTableMetaAttempt::TableMetaChanged(
+            mismatched_tbs,
+        ));
+    }
+
+    let mut binding_generation_mismatched = false;
+    for (resp, update) in mv_source_binding_update_responses
+        .iter()
+        .zip(prepared_mv_source_binding_updates.iter())
+    {
+        let Some(Response::Get(get_resp)) = &resp.response else {
+            unreachable!(
+                "internal error: expect binding generation Get response, but got {:?}",
+                resp.response
+            )
+        };
+        let current_seq = get_resp.value.as_ref().map(|seqv| seqv.seq).unwrap_or(0);
+        if current_seq != update.expected_generation_kv_seq {
+            binding_generation_mismatched = true;
+        }
+    }
+
+    // The prepared TableMeta is still current, so a binding-only CAS conflict
+    // is safe to retry with a freshly read generation.
+    if binding_generation_mismatched {
+        return Ok(UpdateMultiTableMetaAttempt::MVSourceBindingCASConflict);
+    } else if !insert_if_not_exists_table_ids.is_empty() {
+        // If insert_if_not_exists is true and transaction failed, it's likely due to duplicated files
+        return Err(KVAppError::AppError(AppError::from(
+            DuplicatedUpsertFiles::new(insert_if_not_exists_table_ids, "update_multi_table_meta"),
+        )));
+    } else {
+        // if all table version does match, but tx failed, we don't know why, just return error
+        return Err(KVAppError::AppError(AppError::from(
+            MultiStmtTxnCommitFailed::new("update_multi_table_meta"),
+        )));
+    }
 }
 
 /// TableApi defines APIs for table lifecycle and metadata management.
@@ -362,6 +702,28 @@ where
                         }
                         CreateOption::CreateOrReplace => {
                             if req.as_dropped {
+                                // Atomic CTAS stages the replacement as a dropped table and does
+                                // not call `construct_drop_table_txn_operations`, where regular
+                                // replacements validate the existing and replacement engines.
+                                // Perform the same validation explicitly for this staging path.
+                                let old_tbid = TableId::new(*id.data);
+                                let (_, old_meta) = self.get_pb_seq_and_value(&old_tbid).await?;
+                                let old_meta = old_meta.ok_or_else(|| {
+                                    KVAppError::AppError(AppError::UnknownTableId(
+                                        UnknownTableId::new(
+                                            *id.data,
+                                            "create_table failed to find existing table meta",
+                                        ),
+                                    ))
+                                })?;
+                                validate_replacement_engine(
+                                    &req.name_ident.table_name,
+                                    &old_meta.engine,
+                                    &req.table_meta.engine,
+                                )?;
+                                // The name-mapping CAS below keeps this old table ID current.
+                                // An object's engine is immutable for the lifetime of its ID.
+
                                 // If the table is being created as a dropped table, we do not
                                 // need to combine with drop_table_txn operations, just return
                                 // the sequence number associated with the value part of
@@ -378,6 +740,7 @@ where
                                     *seq_db_id.data,
                                     true,
                                     false,
+                                    Some(&req.table_meta.engine),
                                     &mut txn,
                                 )
                                 .await?;
@@ -484,12 +847,13 @@ where
                             .into(),
                         ));
                     }
-                    let version_ident =
+                    let generation_ident =
                         MVSourceBindingVersionIdent::new(req.tenant(), source_table_id);
-                    let (version_seq, version) = self.get_pb_seq_and_value(&version_ident).await?;
-                    let current_source_generation = version
+                    let (generation_kv_seq, generation_record) =
+                        self.get_pb_seq_and_value(&generation_ident).await?;
+                    let current_source_generation = generation_record
                         .as_ref()
-                        .map(|version| version.current_source_generation)
+                        .map(|record| record.current_source_generation)
                         .unwrap_or(0);
                     if current_source_generation != mv.expected_source_generation {
                         return Err(KVAppError::AppError(
@@ -501,15 +865,15 @@ where
                         ));
                     }
                     txn.condition
-                        .push(txn_cond_eq_seq(&version_ident, version_seq));
-                    if version.is_none() {
+                        .push(txn_cond_eq_seq(&generation_ident, generation_kv_seq));
+                    if generation_record.is_none() {
                         // A missing version record is semantic generation 0.
                         // Initialize it in the same transaction that publishes
                         // the first MV, so a failed CREATE leaves no record.
                         // Its resulting KV seq is deliberately not the MV
                         // generation; that seq is only a transaction CAS token.
                         txn.if_then.push(txn_put_pb(
-                            &version_ident,
+                            &generation_ident,
                             &MVSourceBindingVersion::default(),
                         ));
                     }
@@ -614,6 +978,7 @@ where
                 req.db_id,
                 req.if_exists,
                 true,
+                None,
                 &mut txn,
             )
             .await?;
@@ -1236,239 +1601,18 @@ where
         req: UpdateMultiTableMetaReq,
         txn_sender: &IdempotentKVTxnSender,
     ) -> Result<UpdateMultiTableMetaResult, KVAppError> {
-        let UpdateMultiTableMetaReq {
-            mut update_table_metas,
-            copied_files,
-            update_stream_metas,
-            deduplicated_labels,
-            update_temp_tables: _,
-        } = req;
+        let mut trials = txn_backoff(None, func_name!());
 
-        let mut tbl_seqs = HashMap::new();
-        let mut txn = TxnRequest::default();
-        let mut mismatched_tbs = vec![];
-        let tid_vec = update_table_metas
-            .iter()
-            .map(|req| {
-                TableId {
-                    table_id: req.0.table_id,
+        loop {
+            trials.next().unwrap()?.await;
+
+            match try_update_multi_table_meta_once(self, req.clone(), txn_sender).await? {
+                UpdateMultiTableMetaAttempt::Committed(reply) => return Ok(Ok(reply)),
+                UpdateMultiTableMetaAttempt::TableMetaChanged(mismatched) => {
+                    return Ok(Err(mismatched));
                 }
-                .to_string_key()
-            })
-            .collect::<Vec<_>>();
-        let mut tb_meta_vec: Vec<(u64, Option<TableMeta>)> = mget_pb_values(self, &tid_vec).await?;
-        for ((req, _), (tb_meta_seq, table_meta)) in
-            update_table_metas.iter().zip(tb_meta_vec.iter_mut())
-        {
-            let req_seq = req.seq;
-
-            if *tb_meta_seq == 0 || table_meta.is_none() {
-                return Err(KVAppError::AppError(AppError::UnknownTableId(
-                    UnknownTableId::new(req.table_id, "update_multi_table_meta"),
-                )));
+                UpdateMultiTableMetaAttempt::MVSourceBindingCASConflict => continue,
             }
-            if req_seq.match_seq(tb_meta_seq).is_err() {
-                mismatched_tbs.push((
-                    req.table_id,
-                    *tb_meta_seq,
-                    std::mem::take(table_meta).unwrap(),
-                ));
-            }
-        }
-
-        if !mismatched_tbs.is_empty() {
-            return Ok(Err(mismatched_tbs));
-        }
-
-        let mut new_table_meta_map: BTreeMap<u64, TableMeta> = BTreeMap::new();
-        for ((req, _), (tb_meta_seq, _)) in update_table_metas.iter_mut().zip(tb_meta_vec.iter()) {
-            let tbid = TableId {
-                table_id: req.table_id,
-            };
-
-            let new_table_meta = req.new_table_meta.clone();
-
-            tbl_seqs.insert(req.table_id, *tb_meta_seq);
-            txn.condition.push(txn_cond_seq(&tbid, Eq, *tb_meta_seq));
-
-            // Add LVT check if provided
-            if let Some(check) = req.lvt_check.as_ref() {
-                let lvt_ident = LeastVisibleTimeIdent::new(&check.tenant, req.table_id);
-                let res = self.get_pb(&lvt_ident).await?;
-                let (seq, current_lvt) = match res {
-                    Some(v) => (v.seq, Some(v.data)),
-                    None => (0, None),
-                };
-                if let Some(current_lvt) = current_lvt {
-                    if current_lvt.time > check.time {
-                        return Err(KVAppError::AppError(AppError::TableSnapshotExpired(
-                            TableSnapshotExpired::new(
-                                req.table_id,
-                                format!(
-                                    "snapshot timestamp {:?} is older than the table's least visible time {:?}",
-                                    check.time, current_lvt.time
-                                ),
-                            ),
-                        )));
-                    }
-                }
-                // no other one has updated LVT since we read it
-                txn.condition.push(txn_cond_seq(&lvt_ident, Eq, seq));
-            }
-
-            txn.if_then.push(txn_put_pb(&tbid, &new_table_meta));
-            txn.else_then.push(TxnOp {
-                request: Some(Request::Get(TxnGetRequest::new(tbid.to_string_key()))),
-            });
-
-            new_table_meta_map.insert(req.table_id, new_table_meta);
-        }
-
-        // `remove_table_copied_files` and `upsert_table_copied_file_info`
-        // all modify `TableCopiedFileInfo`,
-        // so there used to has `TableCopiedFileLockKey` in these two functions
-        // to protect TableCopiedFileInfo modification.
-        // In issue: https://github.com/datafuselabs/databend/issues/8897,
-        // there is chance that if copy files concurrently, `upsert_table_copied_file_info`
-        // may return `TxnRetryMaxTimes`.
-        // So now, in case that `TableCopiedFileInfo` has expire time, remove `TableCopiedFileLockKey`
-        // in each function. In this case there is chance that some `TableCopiedFileInfo` may not be
-        // removed in `remove_table_copied_files`, but these data can be purged in case of expire time.
-
-        let insert_if_not_exists_table_ids = copied_files
-            .iter()
-            .filter(|(_, req)| req.insert_if_not_exists)
-            .map(|(table_id, _)| *table_id)
-            .collect::<Vec<_>>();
-
-        for (table_id, req) in copied_files {
-            let tbid = TableId { table_id };
-
-            let table_meta_seq = tbl_seqs[&tbid.table_id];
-            txn.condition.push(txn_cond_eq_seq(&tbid, table_meta_seq));
-
-            for (file_name, file_info) in req.file_info {
-                let key = TableCopiedFileNameIdent {
-                    table_id: tbid.table_id,
-                    file: file_name,
-                };
-
-                if req.insert_if_not_exists {
-                    txn.condition.push(txn_cond_eq_seq(&key, 0));
-                }
-                txn.if_then
-                    .push(txn_put_pb_with_ttl(&key, &file_info, req.ttl))
-            }
-        }
-
-        let sid_vec = update_stream_metas
-            .iter()
-            .map(|req| {
-                TableId {
-                    table_id: req.stream_id,
-                }
-                .to_string_key()
-            })
-            .collect::<Vec<_>>();
-        let stream_meta_vec: Vec<(u64, Option<TableMeta>)> = mget_pb_values(self, &sid_vec).await?;
-        for (req, (stream_meta_seq, stream_meta)) in
-            update_stream_metas.iter().zip(stream_meta_vec.into_iter())
-        {
-            let stream_id = TableId {
-                table_id: req.stream_id,
-            };
-
-            if stream_meta_seq == 0 || stream_meta.is_none() {
-                return Err(KVAppError::AppError(AppError::UnknownStreamId(
-                    UnknownStreamId::new(req.stream_id, "update_multi_table_meta"),
-                )));
-            }
-
-            if req.seq.match_seq(&stream_meta_seq).is_err() {
-                return Err(KVAppError::AppError(AppError::from(
-                    StreamVersionMismatched::new(
-                        req.stream_id,
-                        req.seq,
-                        stream_meta_seq,
-                        "update_multi_table_meta",
-                    ),
-                )));
-            }
-
-            let mut new_stream_meta = stream_meta.unwrap();
-            new_stream_meta.options = req.options.clone();
-            new_stream_meta.updated_on = Utc::now();
-
-            txn.condition
-                .push(txn_cond_seq(&stream_id, Eq, stream_meta_seq));
-            txn.if_then.push(txn_put_pb(&stream_id, &new_stream_meta));
-        }
-
-        for deduplicated_label in deduplicated_labels {
-            txn.if_then
-                .push(build_upsert_table_deduplicated_label(deduplicated_label));
-        }
-
-        let txn_response = txn_sender.send_txn(self, txn).await?;
-
-        let else_branch_op_responses = match txn_response {
-            IdempotentKVTxnResponse::Success(_) => {
-                return Ok(Ok(UpdateTableMetaReply {}));
-            }
-            IdempotentKVTxnResponse::AlreadyCommitted => {
-                info!(
-                    "Transaction ID {} exists, the corresponding update_multi_table_meta transaction has been executed successfully",
-                    txn_sender.get_txn_id()
-                );
-                return Ok(Ok(UpdateTableMetaReply {}));
-            }
-            IdempotentKVTxnResponse::Failed(op_responses) => op_responses,
-        };
-
-        let mut mismatched_tbs = vec![];
-        for (resp, req) in else_branch_op_responses
-            .iter()
-            .zip(update_table_metas.iter())
-        {
-            let Some(Response::Get(get_resp)) = &resp.response else {
-                unreachable!(
-                    "internal error: expect some TxnGetResponseGet, but got {:?}",
-                    resp.response
-                )
-            };
-            // deserialize table version info
-            let (tb_meta_seq, table_meta): (_, TableMeta) = if let Some(seq_v) = &get_resp.value {
-                (seq_v.seq, deserialize_struct(&seq_v.data)?)
-            } else {
-                return Err(KVAppError::AppError(AppError::UnknownTableId(
-                    UnknownTableId::new(req.0.table_id, "update_multi_table_meta"),
-                )));
-            };
-
-            // check table version
-            if req.0.seq.match_seq(&tb_meta_seq).is_err() {
-                mismatched_tbs.push((req.0.table_id, tb_meta_seq, table_meta));
-            }
-        }
-
-        if mismatched_tbs.is_empty() {
-            if !insert_if_not_exists_table_ids.is_empty() {
-                // If insert_if_not_exists is true and transaction failed, it's likely due to duplicated files
-                Err(KVAppError::AppError(AppError::from(
-                    DuplicatedUpsertFiles::new(
-                        insert_if_not_exists_table_ids,
-                        "update_multi_table_meta",
-                    ),
-                )))
-            } else {
-                // if all table version does match, but tx failed, we don't know why, just return error
-                Err(KVAppError::AppError(AppError::from(
-                    MultiStmtTxnCommitFailed::new("update_multi_table_meta"),
-                )))
-            }
-        } else {
-            // up layer will retry
-            Ok(Err(mismatched_tbs))
         }
     }
 

@@ -20,6 +20,7 @@ use databend_common_exception::Result;
 use databend_common_sql::plans::RevertTablePlan;
 
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::pipelines::PipelineBuildResult;
 use crate::sessions::QueryContext;
 use crate::sessions::TableContextTableAccess;
@@ -56,6 +57,7 @@ impl Interpreter for RevertTableInterpreter {
 
         // check mutability
         table.check_mutable()?;
+        check_not_materialized_view(table.as_ref(), &self.plan.database)?;
 
         let navigation_descriptor = NavigationDescriptor {
             database_name: self.plan.database.clone(),

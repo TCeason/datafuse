@@ -39,6 +39,7 @@ use databend_common_meta_app::schema::SetSecurityPolicyAction;
 use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
 use databend_common_meta_app::schema::TableInfo;
 use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::UpdateMVSourceBindingReq;
 use databend_common_sql::ApproxDistinctColumns;
 use databend_common_sql::BloomIndexColumns;
 use databend_common_sql::DefaultExprBinder;
@@ -52,6 +53,7 @@ use databend_common_sql::plans::Plan;
 use databend_common_sql::resolve_type_name_by_str;
 use databend_common_storages_basic::view_table::VIEW_ENGINE;
 use databend_common_storages_fuse::FuseTable;
+use databend_common_storages_fuse::operations::CommitMetaUpdates;
 use databend_common_storages_stream::stream_table::STREAM_ENGINE;
 use databend_common_users::UserApiProvider;
 use databend_enterprise_data_mask_feature::get_datamask_handler;
@@ -66,6 +68,7 @@ use databend_storages_common_table_meta::table::OPT_KEY_APPROX_DISTINCT_COLUMNS;
 use databend_storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
 
 use crate::interpreters::Interpreter;
+use crate::interpreters::common::check_not_materialized_view;
 use crate::interpreters::common::check_referenced_computed_columns;
 use crate::interpreters::common::cluster_key_referenced_columns;
 use crate::interpreters::interpreter_table_add_column::commit_table_meta;
@@ -619,6 +622,9 @@ impl ModifyTableColumnInterpreter {
         };
         let sql = format!("SELECT {} FROM {}", query_fields, table_ref);
         table_info.meta.schema = new_schema;
+        let commit_meta_updates = CommitMetaUpdates::default().with_mv_source_binding_update(
+            UpdateMVSourceBindingReq::new(self.ctx.get_tenant(), table.get_id()),
+        );
 
         build_select_insert_plan(
             self.ctx.clone(),
@@ -627,6 +633,7 @@ impl ModifyTableColumnInterpreter {
             new_schema_without_computed_fields.into(),
             prev_snapshot_id,
             table_meta_timestamps,
+            commit_meta_updates,
         )
         .await
     }
@@ -792,6 +799,8 @@ impl Interpreter for ModifyTableColumnInterpreter {
 
         table.check_mutable()?;
 
+        check_not_materialized_view(table.as_ref(), db_name)?;
+
         let table_info = table.get_table_info();
         let engine = table.engine();
         if matches!(engine, VIEW_ENGINE | STREAM_ENGINE) {
@@ -886,6 +895,7 @@ pub(crate) async fn build_select_insert_plan(
     new_schema: TableSchemaRef,
     prev_snapshot_id: Option<SnapshotId>,
     table_meta_timestamps: TableMetaTimestamps,
+    commit_meta_updates: CommitMetaUpdates,
 ) -> Result<PipelineBuildResult> {
     // 1. build plan by sql
     let mut planner = Planner::new(ctx.clone());
@@ -933,11 +943,11 @@ pub(crate) async fn build_select_insert_plan(
     let mut build_res = build_query_pipeline_without_render_result_set(&ctx, &insert_plan).await?;
 
     // 5. commit new meta schema and snapshots
-    new_table.commit_insertion(
+    FuseTable::try_from_table(new_table.as_ref())?.do_commit(
         ctx.clone(),
         &mut build_res.main_pipeline,
         None,
-        vec![],
+        commit_meta_updates,
         true,
         prev_snapshot_id,
         None,
