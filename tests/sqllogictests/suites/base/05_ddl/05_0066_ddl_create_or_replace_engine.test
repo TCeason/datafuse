@@ -1,0 +1,64 @@
+statement ok
+DROP VIEW IF EXISTS replace_engine_view
+
+statement ok
+DROP TABLE IF EXISTS replace_engine_table
+
+statement ok
+DROP TABLE IF EXISTS replace_engine_source
+
+statement ok
+CREATE TABLE replace_engine_source (a INT)
+
+statement ok
+CREATE TABLE replace_engine_table (a INT) ENGINE = FUSE
+
+# CREATE OR REPLACE cannot change an existing object's engine.
+statement error 1302
+CREATE OR REPLACE TABLE replace_engine_table (a INT) ENGINE = NULL
+
+query T
+SELECT engine FROM system.tables WHERE database = 'default' AND name = 'replace_engine_table'
+----
+FUSE
+
+# A VIEW cannot replace a TABLE with the same name.
+statement error 1302
+CREATE OR REPLACE VIEW replace_engine_table AS SELECT a FROM replace_engine_source
+
+query T
+SELECT engine FROM system.tables WHERE database = 'default' AND name = 'replace_engine_table'
+----
+FUSE
+
+statement ok
+CREATE VIEW replace_engine_view AS SELECT a FROM replace_engine_source
+
+# A regular CREATE OR REPLACE TABLE cannot replace a VIEW.
+statement error 1302
+CREATE OR REPLACE TABLE replace_engine_view (a INT)
+
+# CTAS uses a staged replacement path and must enforce the same check.
+statement error 1302
+CREATE OR REPLACE TABLE replace_engine_view AS SELECT a FROM replace_engine_source
+
+query T
+SELECT engine FROM system.tables WHERE database = 'default' AND name = 'replace_engine_view'
+----
+VIEW
+
+# Replacing an object with the same engine remains supported.
+statement ok
+CREATE OR REPLACE TABLE replace_engine_table (a BIGINT) ENGINE = FUSE
+
+statement ok
+CREATE OR REPLACE VIEW replace_engine_view AS SELECT a + 1 AS a FROM replace_engine_source
+
+statement ok
+DROP VIEW replace_engine_view
+
+statement ok
+DROP TABLE replace_engine_table
+
+statement ok
+DROP TABLE replace_engine_source

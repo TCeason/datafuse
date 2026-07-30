@@ -133,6 +133,7 @@ use super::schema_api::construct_drop_table_txn_operations;
 use super::schema_api::get_db_by_id_or_err;
 use super::schema_api::get_history_table_metas;
 use super::schema_api::handle_undrop_table;
+use super::schema_api::validate_replacement_engine;
 use crate::DEFAULT_MGET_SIZE;
 use crate::assert_table_exist;
 use crate::deserialize_struct;
@@ -362,6 +363,28 @@ where
                         }
                         CreateOption::CreateOrReplace => {
                             if req.as_dropped {
+                                // Atomic CTAS stages the replacement as a dropped table and does
+                                // not call `construct_drop_table_txn_operations`, where regular
+                                // replacements validate the existing and replacement engines.
+                                // Perform the same validation explicitly for this staging path.
+                                let old_tbid = TableId::new(*id.data);
+                                let (_, old_meta) = self.get_pb_seq_and_value(&old_tbid).await?;
+                                let old_meta = old_meta.ok_or_else(|| {
+                                    KVAppError::AppError(AppError::UnknownTableId(
+                                        UnknownTableId::new(
+                                            *id.data,
+                                            "create_table failed to find existing table meta",
+                                        ),
+                                    ))
+                                })?;
+                                validate_replacement_engine(
+                                    &req.name_ident.table_name,
+                                    &old_meta.engine,
+                                    &req.table_meta.engine,
+                                )?;
+                                // The name-mapping CAS below keeps this old table ID current.
+                                // An object's engine is immutable for the lifetime of its ID.
+
                                 // If the table is being created as a dropped table, we do not
                                 // need to combine with drop_table_txn operations, just return
                                 // the sequence number associated with the value part of
@@ -378,6 +401,7 @@ where
                                     *seq_db_id.data,
                                     true,
                                     false,
+                                    Some(&req.table_meta.engine),
                                     &mut txn,
                                 )
                                 .await?;
@@ -614,6 +638,7 @@ where
                 req.db_id,
                 req.if_exists,
                 true,
+                None,
                 &mut txn,
             )
             .await?;

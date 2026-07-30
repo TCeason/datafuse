@@ -196,6 +196,30 @@ impl TableAlreadyExists {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "TableEngineMismatch: cannot replace '{table_name}' with engine '{existing_engine}' by engine '{replacement_engine}'"
+)]
+pub struct TableEngineMismatch {
+    table_name: String,
+    existing_engine: String,
+    replacement_engine: String,
+}
+
+impl TableEngineMismatch {
+    pub fn new(
+        table_name: impl Into<String>,
+        existing_engine: impl Into<String>,
+        replacement_engine: impl Into<String>,
+    ) -> Self {
+        Self {
+            table_name: table_name.into(),
+            existing_engine: existing_engine.into(),
+            replacement_engine: replacement_engine.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ViewAlreadyExists: {view_name} while {context}")]
 pub struct ViewAlreadyExists {
     view_name: String,
@@ -896,6 +920,9 @@ pub enum AppError {
     TableAlreadyExists(#[from] TableAlreadyExists),
 
     #[error(transparent)]
+    TableEngineMismatch(#[from] TableEngineMismatch),
+
+    #[error(transparent)]
     ViewAlreadyExists(#[from] ViewAlreadyExists),
 
     #[error(transparent)]
@@ -1199,6 +1226,8 @@ impl AppErrorMessage for TableAlreadyExists {
     }
 }
 
+impl AppErrorMessage for TableEngineMismatch {}
+
 impl AppErrorMessage for ViewAlreadyExists {
     fn message(&self) -> String {
         format!("'{}' as view Already Exists", self.view_name)
@@ -1412,6 +1441,7 @@ impl From<AppError> for ErrorCode {
                 ErrorCode::MaterializedViewAlreadyExists(err.message())
             }
             AppError::TableAlreadyExists(err) => ErrorCode::TableAlreadyExists(err.message()),
+            AppError::TableEngineMismatch(err) => ErrorCode::TableEngineNotSupported(err.message()),
             AppError::ViewAlreadyExists(err) => ErrorCode::ViewAlreadyExists(err.message()),
             AppError::CreateTableWithDropTime(err) => {
                 ErrorCode::CreateTableWithDropTime(err.message())
